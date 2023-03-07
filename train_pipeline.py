@@ -8,7 +8,7 @@ import datasets
 import deepspeed
 
 from minimal_llama.model import LLAMA_CONFIG_DICT
-from minimal_llama.pipeline_model import PipelineLLaMA
+from minimal_llama.deepspeed_pipeline_model import PipelineLLaMA
 
 
 def main():
