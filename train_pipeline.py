@@ -14,7 +14,7 @@ from minimal_llama.pipeline_model import PipelineLLaMA
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_size",
-                        choices=["7B", "13B", "30B", "65B"])
+                        choices=["debug", "7B", "13B", "30B", "65B"])
     parser.add_argument("--dataset_path",
                         type=str,
                         help="Folder to save model. Should restore from checkpoints.")

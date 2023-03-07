@@ -20,10 +20,10 @@ class ModelArgs:
 
 
 DEBUG_CONFIG = ModelArgs(
-    dim=16,
-    n_layers=2,
-    n_heads=2,
-    vocab_size=10,
+    dim=32,
+    n_layers=10,
+    n_heads=4,
+    vocab_size=32000,
 )
 LLAMA_7B_CONFIG = ModelArgs(
     dim=4096,
