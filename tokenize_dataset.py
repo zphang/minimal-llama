@@ -37,9 +37,10 @@ def main():
     ]
 
     truncated_tokens = all_tokens[:(len(all_tokens) // args.max_seq_length) * args.max_seq_length]
-    arr = np.array(truncated_tokens)
-    ds = datasets.Dataset.from_dict({"input_ids": arr.reshape(-1, args.max_seq_length)})
+    arr = np.array(truncated_tokens).reshape(-1, args.max_seq_length)
+    ds = datasets.Dataset.from_dict({"input_ids": arr})
     ds.save_to_disk(args.save_path)
+    print(f"Generated {arr.shape[0]} samples.")
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ This repo contains a random assortment of code for running and fine-tuning LLaMA
 - [Tokenize datasets](#tokenize-datasets)
 - [PEFT Fine-tuning with 8-bit](#peft-fine-tuning-with-8-bit)
 - [Fine-tuning with Naive Pipeline Parallel](#fine-tuning-with-naive-pipeline-parallel)
+- (New) [PEFT Fine-tuning with 8-bit and Pipeline Parallel](#peft-fine-tuning-with-8-bit-and-pipeline-parallel)
 - [Misc notes](#misc-notes)
 
 This code was fairly quickly thrown together and may contains many, many bugs. Feedback is welcome!
@@ -94,11 +95,35 @@ python finetune_pp.py \
     --save_dir /path/to/save \
     --batch_size 4 \
     --gradient_accumulation_steps 2 \
-    --save_interval 50 \
-    --num_train_steps 100
+    --save_interval 2000 \
+    --num_train_steps 20000
 ```
 
 The above configuration uses about 30-35GB of RAM per GPU across 8 GPUs.
+
+## PEFT Fine-tuning with 8-bit and Pipeline Parallel
+
+*Requires using the **Transformers** PR [here](https://github.com/huggingface/transformers/pull/21955/), based on the fork [here](https://github.com/zphang/transformers/tree/llama_push). Model weights need to be converted to HF format using the weight conversion script in the PR.*
+
+*Requires using the **PEFT** PR [here](https://github.com/huggingface/peft/pull/160), based on the fork [here](https://github.com/zphang/peft/tree/llama).*
+
+Here, we combine PEFT training with pipeline parallel to train with large models. See [PEFT Fine-tuning with 8-bit](#peft-fine-tuning-with-8-bit) for more details.
+
+```bash
+python finetune_pp_peft.py \
+    --model_path /path/to/llama-30b/ \
+    --dataset_path /path/to/tokenized_dataset \
+    --save_dir /path/to/save \
+    --batch_size 4 \
+    --learning_rate 5e-5 \
+    --gradient_accumulation_steps 1 \
+    --save_interval 2000 \
+    --num_train_steps 20000 \
+    --peft_mode lora \
+    --lora_rank 8
+```
+
+For instance, you can fine-tune LoRA on 65B LLaMA with about 120GB of memory in total (e.g. 15GB each on 8 GPUs) with batch size=1 and sequence length = 512.
 
 ## Misc Notes
 
