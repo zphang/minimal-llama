@@ -30,7 +30,7 @@ python tokenize_dataset.py \
 *Requires using the **PEFT** PR [here](https://github.com/huggingface/peft/pull/160), based on the fork [here](https://github.com/zphang/peft/tree/llama).*
 
 
-We can fine-tune using the [PEFT](https://github.com/huggingface/peft) library, with the model converted to 8-bit.
+We can fine-tune using the [PEFT](https://github.com/huggingface/peft) library, with the model converted to 8-bit. This is based on the guide [here](https://github.com/huggingface/peft#int8-training-of-large-models-in-colab-using-peft-lora-and-bits_and_bytes).
 
 ```bash
 python finetune_peft.py \
