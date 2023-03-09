@@ -5,7 +5,7 @@ This repo contains a random assortment of code for running and fine-tuning LLaMA
 - [Tokenize datasets](#tokenize-datasets)
 - [PEFT Fine-tuning with 8-bit](#peft-fine-tuning-with-8-bit)
 - [Fine-tuning with Naive Pipeline Parallel](#fine-tuning-with-naive-pipeline-parallel)
-- [Misc notes](#misc notes)
+- [Misc notes](#misc-notes)
 
 This code was fairly quickly thrown together and may contains many, many bugs. Feedback is welcome!
 
