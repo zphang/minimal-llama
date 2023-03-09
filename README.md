@@ -85,7 +85,7 @@ print(tokenizer.decode(out[0]))
 *Requires using the **Transformers** PR [here](https://github.com/huggingface/transformers/pull/21955/), based on the fork [here](https://github.com/zphang/transformers/tree/llama_push). Model weights need to be converted to HF format using the weight conversion script in the PR.*
 
 
-For larger models, we can use a (very naively implemented version of) pipeline parallelism. This is preferable for larger models that won't fit on a single GPU.
+For *fully* fine-tuning (larger) models, we can use a (very naively implemented version of) pipeline parallelism. This is preferable for larger models that won't fit on a single GPU.
 
 ```bash
 python finetune_pp.py \
