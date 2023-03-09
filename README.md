@@ -48,7 +48,7 @@ python finetune_peft.py \
     --output_dir /path/to/save
 ```
 
-The above configuration uses about 20GB of RAM on a single GPU.
+The above configuration (with `max_seq_length=512`) uses about 20GB of RAM on a single GPU. (With bs=1 and `max_seq_length=256`, this gets down to about 12 GB.)
 
 You can generate using the trained PEFT params using something like the following:
 
