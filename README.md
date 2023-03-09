@@ -123,7 +123,7 @@ python finetune_pp_peft.py \
     --lora_rank 8
 ```
 
-For instance, you can fine-tune LoRA on 65B LLaMA with about 120GB of memory in total (e.g. 15GB each on 8 GPUs) with batch size=1 and sequence length = 512.
+For instance, you can fine-tune LoRA on 65B LLaMA with about 120GB of memory in total (e.g. 15GB each on 8 GPUs, or 60GB on 2 GPUs) with batch size=1 and sequence length = 512.
 
 ## Misc Notes
 
