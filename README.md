@@ -1,10 +1,13 @@
 # Minimal LLaMA
 
-This repo contains a random assortment of code for running and fine-tuning LLaMA. Many parts are still work in progress. There ought to be more efficient methods of tuning than the ones presented here, but folks may find this useful already.
+This repo contains a random assortment of code for running and fine-tuning LLaMA. Many parts are still work in progress. There ought to be more efficient methods of tuning (DeepSpeed / ZeRO, NeoX) than the ones presented here, but folks may find this useful already.
 
 - [Tokenize datasets](#tokenize-datasets)
 - [PEFT Fine-tuning with 8-bit](#peft-fine-tuning-with-8-bit)
 - [Fine-tuning with Naive Pipeline Parallel](#fine-tuning-with-naive-pipeline-parallel)
+- [Misc notes](#misc notes)
+
+This code was fairly quickly thrown together and may contains many, many bugs. Feedback is welcome!
 
 ## Tokenize datasets
 
@@ -56,18 +59,25 @@ from peft import get_peft_model
 
 model_path = ...
 peft_path = ...
-batch = ...
+tokenizer_path = ...
 
+torch.set_default_tensor_type(torch.cuda.HalfTensor)
 model = transformers.LLaMAForCausalLM.from_pretrained(model_path)
 peft_config = get_peft_config(peft_args=PEFTArguments(peft_mode="lora"))
 model = get_peft_model(model, peft_config)
 model.load_state_dict(torch.load(peft_path), strict=False)
+torch.set_default_tensor_type(torch.cuda.FloatTensor)
+
+tokenizer = transformers.LLaMATokenizer.from_pretrained(tokenizer_path)
+batch = tokenizer("The LLaMA language model is", return_tensors="pt")
 
 with torch.no_grad():
     out = model.generate(
         input_ids=batch["input_ids"],
         attention_mask=torch.ones_like(batch["input_ids"]),
+        max_length=200,
     )
+print(tokenizer.decode(out[0]))
 ```
 
 ## Fine-tuning with Naive Pipeline Parallel
@@ -89,3 +99,8 @@ python finetune_pp.py \
 ```
 
 The above configuration uses about 30-35GB of RAM per GPU across 8 GPUs.
+
+## Misc Notes
+
+- I have no idea what hyperparameters are best for fine-tuning.
+- Aside from model parameters + gradients + optimizer states, the hidden activations also take up a big chunk of memory. Shortening the `max_sequence_length` is a good way of reducing memory consumption. I don't really know how much that affects fine-tuning performance either.
