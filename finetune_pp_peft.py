@@ -22,8 +22,12 @@ from peft import (
 )
 
 
+def write_json(x, path):
+    with open(path, "w") as f:
+        f.write(json.dumps(x))
+
+
 def read_json(path):
-    # Manually open because .splitlines is different from iterating over lines
     with open(path, "r") as f:
         return json.load(f)
 
@@ -59,6 +63,7 @@ def main():
 
     args = parser.parse_args()
     os.makedirs(args.save_dir, exist_ok=True)
+    latest_path = os.path.join(args.save_dir, "latest.json")
 
     print("Setup Data")
     dataset = datasets.load_from_disk(args.dataset_path)
@@ -109,12 +114,26 @@ def main():
     model = get_peft_model(model, peft_config)
 
     print("Setup optimizer")
-    opt = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+    opt = torch.optim.AdamW([
+        p
+        for p in model.parameters()
+        if p.requires_grad
+    ], lr=args.learning_rate)
+
+    # Restart progress
+    if os.path.exists(latest_path):
+        start = read_json(latest_path)["latest_step"]
+        model.load_state_dict(
+            torch.load(os.path.join(os.path.join(args.save_dir, f"model-{start + 1:06d}.p"))), strict=False)
+        opt.load_state_dict(
+            torch.load(os.path.join(os.path.join(args.save_dir, f"opt-{start + 1:06d}.p"))))
+    else:
+        start = 0
 
     # Train (maybe can replace with Trainer? I think Trainer might mess up the device mappings though.)
     print("Start training")
     generator = iter(dataloader)
-    for step in tqdm.trange(args.num_train_steps):
+    for step in tqdm.trange(args.num_train_steps, initial=start):
         input_ids, labels = next(generator)
         logits = model_forward(model, input_ids)
         loss = F.cross_entropy(
@@ -125,11 +144,18 @@ def main():
         opt.step()
 
         actual_step = step + 1
+
+        if step % 10 == 0:
+            print(f"Loss={loss.item():.3f}")
+
         if actual_step % args.gradient_accumulation_steps == 0:
             opt.zero_grad()
 
-        if actual_step % args.save_interval == 0 and actual_step != args.num_train_steps:
+        if actual_step % args.save_interval == 0:
             save_tunable_parameters(model, os.path.join(args.save_dir, f"params-{actual_step:06d}.p"))
+            save_tunable_parameters(opt.state_dict(), os.path.join(args.save_dir, f"opt-{actual_step:06d}.p"))
+            write_json({"latest_step": step}, latest_path)
+
     save_tunable_parameters(model, os.path.join(args.save_dir, "params-last.p"))
 
 

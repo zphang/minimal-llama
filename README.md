@@ -103,6 +103,8 @@ The above configuration uses about 30-35GB of RAM per GPU across 8 GPUs.
 
 ## PEFT Fine-tuning with 8-bit and Pipeline Parallel
 
+**Seems buggy, don't use this yet.**
+
 *Requires using the **Transformers** PR [here](https://github.com/huggingface/transformers/pull/21955/), based on the fork [here](https://github.com/zphang/transformers/tree/llama_push). Model weights need to be converted to HF format using the weight conversion script in the PR.*
 
 *Requires using the **PEFT** PR [here](https://github.com/huggingface/peft/pull/160), based on the fork [here](https://github.com/zphang/peft/tree/llama).*
