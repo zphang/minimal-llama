@@ -12,7 +12,7 @@ This code was fairly quickly thrown together and may contains many, many bugs. F
 
 ## Tokenize datasets
 
-First, we tokenize the data so we never have to worry about the tokenizer again. The tokenization script takes in a JSONL (each row containing the key `"text"` for the document text), and effectively concatenates, tokenizes, and slices into `max_seq_length` chunks.
+*Requires using the **Transformers** PR [here](https://github.com/huggingface/transformers/pull/21955/), based on the fork [here](https://github.com/zphang/transformers/tree/llama_push). First, we tokenize the data so we never have to worry about the tokenizer again. The tokenization script takes in a JSONL (each row containing the key `"text"` for the document text), and effectively concatenates, tokenizes, and slices into `max_seq_length` chunks.
 
 (This is a quick and dirty script that loads the whole dataset into memory.)
 
