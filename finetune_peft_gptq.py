@@ -41,13 +41,12 @@ class PEFTArguments:
     mapping_hidden_dim: int = field(default=1024)
 
 
-def get_peft_config(peft_args: PEFTArguments, dtype):
+def get_peft_config(peft_args: PEFTArguments):
     if peft_args.peft_mode == "lora":
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM, inference_mode=False,
             r=peft_args.lora_rank,
-            lora_alpha=32, lora_dropout=0.1,
-            dtype=dtype,
+            lora_alpha=32, lora_dropout=0.1
         )
     elif peft_args.peft_mode == "prefix":
         peft_config = PrefixTuningConfig(
@@ -55,20 +54,17 @@ def get_peft_config(peft_args: PEFTArguments, dtype):
             num_virtual_tokens=peft_args.num_virtual_tokens,
             encoder_hidden_size=peft_args.mapping_hidden_dim,
             prefix_projection=True,
-            dtype=dtype,
         )
     elif peft_args.peft_mode == "ptuning":
         peft_config = PromptEncoderConfig(
             task_type=TaskType.CAUSAL_LM,
             num_virtual_tokens=peft_args.num_virtual_tokens,
             encoder_hidden_size=peft_args.mapping_hidden_dim,
-            dtype=dtype,
         )
     elif peft_args.peft_mode == "prompt":
         peft_config = PromptTuningConfig(
             task_type=TaskType.CAUSAL_LM,
             num_virtual_tokens=peft_args.num_virtual_tokens,
-            dtype=dtype,
         )
     else:
         raise KeyError(peft_args.peft_mode)
@@ -91,15 +87,11 @@ def only_tunable_params(model):
 class ModifiedTrainer(Trainer):
 
     def compute_loss(self, model, inputs, return_outputs=False):
-        model_out = model(
+        return model(
             input_ids=inputs["input_ids"],
             attention_mask=torch.ones_like(inputs["input_ids"]),
             labels=inputs["input_ids"],  # HF model does the slicing for us
-        )
-        if return_outputs:
-            return model_out.loss, model_out
-        else:
-            return model_out.loss
+        ).loss
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         # If we are executing this function, we are the process zero, so we don't check for that.
@@ -143,10 +135,36 @@ def main():
     dataset = datasets.load_from_disk(finetune_args.dataset_path)
 
     print("Setup Model")
-    model = transformers.LlamaForCausalLM.from_pretrained(
+
+    import json
+    def read_json(path):
+        with open(path, "r") as f:
+            return json.load(f)
+
+    device_id = int(os.environ["LOCAL_RANK"])
+    num_layers = read_json(os.path.join(finetune_args.model_path, "config.json"))["num_hidden_layers"]
+    device_map = {
+        "model.embed_tokens": device_id,
+        "model.norm.weight": device_id,
+        "lm_head": device_id
+    }
+    for layer_i in range(num_layers):
+        device_map[f"model.layers.{layer_i}.self_attn.q_proj.weight"] = device_id
+        device_map[f"model.layers.{layer_i}.self_attn.k_proj.weight"] = device_id
+        device_map[f"model.layers.{layer_i}.self_attn.v_proj.weight"] = device_id
+        device_map[f"model.layers.{layer_i}.self_attn.o_proj.weight"] = device_id
+        device_map[f"model.layers.{layer_i}.mlp.gate_proj.weight"] = device_id
+        device_map[f"model.layers.{layer_i}.mlp.down_proj.weight"] = device_id
+        device_map[f"model.layers.{layer_i}.mlp.up_proj.weight"] = device_id
+        device_map[f"model.layers.{layer_i}.input_layernorm.weight"] = device_id
+        device_map[f"model.layers.{layer_i}.post_attention_layernorm.weight"] = device_id
+        device_map[f"model.layers.{layer_i}.self_attn.rotary_emb.inv_freq"] = device_id
+
+
+    model = transformers.LLaMAForCausalLM.from_pretrained(
         finetune_args.model_path,
         load_in_8bit=True,
-        device_map="auto",
+        device_map=device_map,
     )
     model.gradient_checkpointing_enable()
     model.enable_input_require_grads()
@@ -154,9 +172,9 @@ def main():
     model.config.use_cache = False  # silence the warnings. Please re-enable for inference!
 
     print("Setup PEFT")
-    peft_config = get_peft_config(peft_args=peft_args, dtype=torch.float16)
+    peft_config = get_peft_config(peft_args=peft_args)
     model = get_peft_model(model, peft_config)
-    model = model.cuda()
+    model.to(f"cuda:{device_id}")
 
     print("Train")
     trainer = ModifiedTrainer(
