@@ -8,10 +8,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import bitsandbytes as bnb
 from accelerate import init_empty_weights
-from typing import Union
 
 import proj_shared.io_utils as io_utils
 from transformers.utils.bitsandbytes import set_module_8bit_tensor_to_device
+
+import proj9_generic_data.modeling.peft as peft
 
 
 @dataclasses.dataclass
@@ -27,11 +28,26 @@ class LLaMAConfig:
     eos_token_id: int = 2
     use_8bit: bool = False
 
-    num_prefix_tokens: int = 16
-
     @property
     def head_dim(self):
         return self.dim // self.n_heads
+
+    def to_dict(self):
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass
+class ModelContext:
+    """
+    module:
+    submodule:
+    """
+    layer: int = None
+    module: str = None
+    submodule: str = None
+
+    def update(self, **kwargs):
+        return dataclasses.replace(self, **kwargs)
 
 
 LLAMA_7B_CONFIG = LLaMAConfig(
@@ -45,36 +61,47 @@ LLAMA_CONFIG_DICT = {
 }
 
 
-class LLaMAModel(nn.Module):
-    def __init__(self, config: LLaMAConfig):
+class DownstreamLLaMAModel(nn.Module):
+    def __init__(self, config: LLaMAConfig, peft_config: peft.PeftConfig):
         super().__init__()
         self.config = config
-        self.model = LLaMAInnerModel(config)
+        self.peft_config = peft_config
+
+        self.model = LLaMAInnerModel(config, peft_config=peft_config)
         self.lm_head = NoInitLinear(config.dim, config.vocab_size, bias=False, dtype=config.dtype)
 
     def forward(self,
                 input_ids,
-                peft_params=None,
-                compress=False):
+                peft_params):
         """Forward pass (with full decode sequence, intended for training or loss-scoring)
 
         :param input_ids: [batch_size, seq_len]
-        :param peft_params
-        :param compress
+        :param peft_params:
         :return: logits [batch_size, seq_len]
         """
         # 1) Create masks
         # decoder mask
         # [batch_size, num_heads=1, q_len=seq_len, kv_len=seq_len]
         attention_mask = create_attention_mask(input_ids=input_ids, dtype=self.config.dtype)
-        if peft_params:
+
+        if self.peft_config.peft_mode in (
+            peft.PEFT_PREFIX, peft.PEFT_PREFIX_LORA, peft.PEFT_PREFIX_SHARED_LORA,
+            peft.PEFT_SHARED_PREFIX, peft.PEFT_PREFIX_MLP_V2,
+            peft.PEFT_PREFIX_LAYERWISE_V1, peft.PEFT_PREFIX_LAYERWISE_V2,
+        ):
+            num_prefix_tokens = self.peft_config.num_prefix_tokens
+            # [batch_size, num_heads=1, q_len=seq_len, kv_len=num_prefix_tokens + dec_seq_len]
             attention_mask = torch.cat([
-                zeros_like([1, 1, input_ids.shape[1], self.config.num_prefix_tokens], tensor=attention_mask),
+                zeros_like([1, 1, input_ids.shape[1], num_prefix_tokens], tensor=attention_mask),
                 attention_mask,
             ], dim=3)
 
         # 1.5) prep
-        if peft_params:
+        if self.peft_config.peft_mode in (
+            peft.PEFT_PREFIX, peft.PEFT_PREFIX_LORA, peft.PEFT_PREFIX_SHARED_LORA,
+            peft.PEFT_SHARED_PREFIX, peft.PEFT_PREFIX_MLP_V2,
+            peft.PEFT_PREFIX_LAYERWISE_V1, peft.PEFT_PREFIX_LAYERWISE_V2,
+        ):
             kv_cache = self.create_prefix_kv_cache(peft_params)
         else:
             kv_cache = None
@@ -85,32 +112,11 @@ class LLaMAModel(nn.Module):
             input_ids,
             attention_mask=attention_mask,
             kv_cache=kv_cache,
-            compress=compress,
+            peft_params=peft_params,
         )
         # [batch_size, seq_len, vocab_size]
         logits = self.lm_head(model_out["hidden_states"])
-        out = {"logits": logits}
-        if "compressed" in model_out:
-            out["compressed"] = model_out["compressed"]
-        return out
-
-    @classmethod
-    def create_prefix_kv_cache(cls, peft_params):
-        # noinspection GrazieInspection
-        """Initialize KV cache from prefixes.
-
-        Used for decoder in both forward pass (train) and decoding
-
-        A KV cache consists of a list of dicts (one per layer):
-            dict(
-              key = [batch_size, num_heads, kv_seq_len=num_prefix_tokens, head_dim]
-              value = [batch_size, num_heads, kv_seq_len=num_prefix_tokens, head_dim]
-            )
-
-        :param peft_params:
-        :return: kv_cache
-        """
-        return peft_params
+        return logits
 
     def init_kv_cache(self, input_ids):
         # noinspection GrazieInspection
@@ -137,15 +143,46 @@ class LLaMAModel(nn.Module):
             })
         return kv_cache
 
-    def generate(self, input_ids, generation_length: int = 20, peft_params=None):
+    def create_prefix_kv_cache(self, peft_params):
+        # noinspection GrazieInspection
+        """Initialize KV cache from prefixes.
+
+        Used for decoder in both forward pass (train) and decoding
+
+        A KV cache consists of a list of dicts (one per layer):
+            dict(
+              key = [batch_size, num_heads, kv_seq_len=num_prefix_tokens, head_dim]
+              value = [batch_size, num_heads, kv_seq_len=num_prefix_tokens, head_dim]
+            )
+
+        :param peft_params:
+        :return: kv_cache
+        """
+        kv_cache = []
+        batch_size, num_prefix_tokens, _ = peft_params["layer_00"]["self_attention"]["key"].shape
+        num_heads = self.config.n_heads
+        head_dim = self.config.head_dim
+        for layer_i in range(self.config.n_layers):
+            # print("decoder", f"layer_{layer_i:02d}", "self_attention", "key")
+            kv_cache.append({
+                "key": peft_params[f"layer_{layer_i:02d}"]["self_attention"]["key"].view(
+                    batch_size, num_prefix_tokens, num_heads, head_dim,
+                ).transpose(1, 2),
+                "value": peft_params[f"layer_{layer_i:02d}"]["self_attention"]["value"].view(
+                    batch_size, num_prefix_tokens, num_heads, head_dim,
+                ).transpose(1, 2),
+            })
+        return kv_cache
+
+    def generate(self, input_ids, peft_params, generation_length: int = 20):
         """Generate tokens with efficient caching of KV.
 
         TODO: Add stopping conditions
         TODO: Add sampling capabilities
 
         :param input_ids: [batch_size, enc_seq_len]
+        :param peft_params:
         :param generation_length: int
-        :param peft_params
         :return: [batch_size, generation_length]
         """
         original_input_ids = input_ids
@@ -160,7 +197,11 @@ class LLaMAModel(nn.Module):
                 [[self.config.pad_token_id]] * batch_size
             ).to(self.lm_head.weights.device)
         # See: init_kv_cache. list[dict]
-        if peft_params:
+        if self.peft_config.peft_mode in (
+            peft.PEFT_PREFIX, peft.PEFT_PREFIX_LORA, peft.PEFT_PREFIX_SHARED_LORA,
+            peft.PEFT_SHARED_PREFIX, peft.PEFT_PREFIX_MLP_V2,
+            peft.PEFT_PREFIX_LAYERWISE_V1, peft.PEFT_PREFIX_LAYERWISE_V2,
+        ):
             kv_cache = self.create_prefix_kv_cache(peft_params)
             num_valid_kv_cache = num_valid_tokens + self.peft_config.num_prefix_tokens
         else:
@@ -171,9 +212,16 @@ class LLaMAModel(nn.Module):
 
         # 2) First encoding
         # [batch_size=1, num_heads=1, q_len=1, kv_len=1]
-        attention_mask = create_attention_mask(input_ids=input_ids, dtype=self.config.dtype)
-        if peft_params is not None:
-            num_prefix_tokens = self.config.num_prefix_tokens
+        attention_mask = create_attention_mask(
+            input_ids=input_ids,
+            dtype=self.config.dtype,
+        )
+        if self.peft_config.peft_mode in (
+            peft.PEFT_PREFIX, peft.PEFT_PREFIX_LORA, peft.PEFT_PREFIX_SHARED_LORA,
+            peft.PEFT_SHARED_PREFIX, peft.PEFT_PREFIX_MLP_V2,
+            peft.PEFT_PREFIX_LAYERWISE_V1, peft.PEFT_PREFIX_LAYERWISE_V2,
+        ):
+            num_prefix_tokens = self.peft_config.num_prefix_tokens
             total_seq_len += num_prefix_tokens
             # [batch_size, num_heads=1, q_len=seq_len, kv_len=num_prefix_tokens + dec_seq_len]
             attention_mask = torch.cat([
@@ -192,6 +240,7 @@ class LLaMAModel(nn.Module):
             input_ids=input_ids,
             attention_mask=attention_mask,
             kv_cache=kv_cache,
+            peft_params=peft_params,
         )
         logits = self.lm_head(model_out["hidden_states"])
         kv_cache = model_out["kv_cache"]
@@ -211,15 +260,15 @@ class LLaMAModel(nn.Module):
                     layer_kv_cache["value"], num_valid_tokens=num_valid_kv_cache)
 
         # 3) Subsequent steps
-        for decode_step in range(generation_length-1):
+        for decode_step in range(generation_length):
             num_valid_kv_cache += 1
             num_valid_tokens += 1
             total_seq_len += 1
-            # [batch_size=1, num_heads=1, q_len=1, kv_len=1]
+            # [batch_size=1, num_heads=1, q_len=1, kv_len=kv_seq_len]
             attention_mask = convert_mask_to_soft_mask(create_generation_attention_mask(
                 batch_size=batch_size,
                 seq_len=total_seq_len,
-                num_valid_tokens=num_valid_tokens,
+                num_valid_tokens=num_valid_kv_cache,
                 device=input_ids.device,
             ), dtype=self.config.dtype)
             # dict(
@@ -233,7 +282,8 @@ class LLaMAModel(nn.Module):
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 kv_cache=kv_cache,
-                offset_override=num_valid_tokens,
+                peft_params=peft_params,
+                offset_override=num_valid_kv_cache,
             )
             # [batch_size, dec_seq_len=1, vocab_size]
             logits = self.lm_head(model_out["hidden_states"])
@@ -246,34 +296,42 @@ class LLaMAModel(nn.Module):
 
 
 class LLaMAInnerModel(nn.Module):
-    def __init__(self, config: LLaMAConfig):
+    def __init__(self, config: LLaMAConfig, peft_config: peft.PeftConfig):
         super().__init__()
         self.config = config
+        self.peft_config = peft_config
+        self.context = ModelContext()
+
         self.embed_tokens = nn.Embedding(config.vocab_size, config.dim, dtype=config.dtype)
         self.layers = nn.ModuleList([
-            LLaMALayer(config=config)
-            for _ in range(config.n_layers)
+            LLaMALayer(
+                config=config, peft_config=peft_config,
+                context=self.context.update(layer=layer_i)
+            )
+            for layer_i in range(config.n_layers)
         ])
-        self.norm = RMSNorm(dim=config.dim)
+        self.norm = RMSNorm(
+            dim=config.dim, peft_config=peft_config,
+            context=self.context.update(layer=None, module="final_norm"),
+        )
 
     def forward(self,
                 input_ids,
                 attention_mask,
                 kv_cache=None,
                 offset_override=None,
-                compress=False):
+                peft_params=None):
         """
         :param input_ids: [batch_size, seq_len]
         :param attention_mask: [batch_size=1, num_heads=1, seq_len, seq_len]
         :param kv_cache: See init_kv_cache.
             We use the presence of kv_cache to determine if we're generating
         :param offset_override:
-        :param compress:
+        :param peft_params
         """
         hidden_states = self.embed_tokens(input_ids)
 
         new_kv_cache = []
-        compress_cache = []
         for layer_i, layer in enumerate(self.layers):
             if kv_cache:
                 # dict(
@@ -289,32 +347,43 @@ class LLaMAInnerModel(nn.Module):
                 attention_mask=attention_mask,
                 kv_cache=layer_kv_cache,
                 offset_override=offset_override,
-                compress=compress,
+                peft_params=peft_params,
             )
             hidden_states = layer_out["hidden_states"]
             if kv_cache:
                 new_kv_cache.append(layer_out["kv_cache"])
-            if compress:
-                compress_cache.append(layer_out["compressed"])
         hidden_states = self.norm(hidden_states)
         output = {
             "hidden_states": hidden_states
         }
         if kv_cache:
             output["kv_cache"] = new_kv_cache
-        if compress:
-            output["compressed"] = compress_cache
         return output
 
 
 class LLaMALayer(nn.Module):
-    def __init__(self, config: LLaMAConfig):
+    def __init__(self, config: LLaMAConfig, peft_config: peft.PeftConfig, context: ModelContext):
         super().__init__()
         self.config = config
-        self.self_attn = Attention(config=config)
-        self.mlp = MLP(config=config)
-        self.input_layernorm = RMSNorm(dim=config.dim, dtype=config.dtype)
-        self.post_attention_layernorm = RMSNorm(dim=config.dim, dtype=config.dtype)
+        self.peft_config = peft_config
+        self.context = context
+
+        self.self_attn = Attention(
+            config=config, peft_config=peft_config,
+            context=context.update(module="self_attention"),
+        )
+        self.mlp = MLP(
+            config=config, peft_config=peft_config,
+            context=context.update(module="ffn"),
+        )
+        self.input_layernorm = RMSNorm(
+            dim=config.dim, dtype=config.dtype,
+            peft_config=peft_config, context=context,
+        )
+        self.post_attention_layernorm = RMSNorm(
+            dim=config.dim, dtype=config.dtype,
+            peft_config=peft_config, context=context,
+        )
 
     def forward(
         self,
@@ -322,7 +391,7 @@ class LLaMALayer(nn.Module):
         attention_mask,
         kv_cache=None,
         offset_override=None,
-        compress=False,
+        peft_params=None,
     ):
         # 1) Self-attention
         # [batch_size, seq_len, hidden_dim]
@@ -340,7 +409,6 @@ class LLaMALayer(nn.Module):
             attention_mask=attention_mask,
             kv_cache=kv_cache,
             offset_override=offset_override,
-            compress=compress,
         )
         # [batch_size, seq_len, hidden_dim]
         hidden_states = hidden_states + raw_self_attn_output["attn_output"]
@@ -349,21 +417,29 @@ class LLaMALayer(nn.Module):
         # [batch_size, seq_len, hidden_dim]
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
         check_nan(hidden_states)
-        out = {"hidden_states": hidden_states}
         if kv_cache:
-            out["kv_cache"] = raw_self_attn_output["kv_cache"]
-        if compress:
-            out["compressed"] = raw_self_attn_output["compressed"]
-        return out
+            return {
+                "hidden_states": hidden_states,
+                "kv_cache": raw_self_attn_output["kv_cache"],
+            }
+        else:
+            return {
+                "hidden_states": hidden_states
+            }
 
 
 class MLP(nn.Module):
     def __init__(
         self,
         config: LLaMAConfig,
+        peft_config: peft.PeftConfig,
+        context: ModelContext,
         multiple_of: int = 256,
     ):
         super().__init__()
+        self.config = config
+        self.peft_config = peft_config
+        self.context = context
         dim = config.dim
         hidden_dim = 4 * dim
         hidden_dim = int(2 * hidden_dim / 3)
@@ -383,10 +459,14 @@ class MLP(nn.Module):
 
 
 class RMSNorm(torch.nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6, dtype=torch.float16):
+    def __init__(self, dim: int,
+                 peft_config: peft.PeftConfig, context: ModelContext,
+                 eps: float = 1e-6, dtype=torch.float16):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim, dtype=dtype))
+        self.peft_config = peft_config
+        self.context = context
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -397,9 +477,12 @@ class RMSNorm(torch.nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, config: LLaMAConfig):
+    def __init__(self, config: LLaMAConfig, peft_config: peft.PeftConfig, context: ModelContext):
         super().__init__()
         self.config = config
+        self.peft_config = peft_config
+        self.context = context
+
         self.n_heads = config.n_heads
         self.head_dim = config.dim // config.n_heads
 
@@ -413,23 +496,14 @@ class Attention(nn.Module):
             self.k_proj = NoInitLinear(config.dim, config.dim, bias=False, dtype=config.dtype)
             self.v_proj = NoInitLinear(config.dim, config.dim, bias=False, dtype=config.dtype)
             self.o_proj = NoInitLinear(config.dim, config.dim, bias=False, dtype=config.dtype)
-
-        self.a_proj = nn.Linear(
-            config.dim, (config.n_heads * config.num_prefix_tokens), bias=False, dtype=config.dtype)
-        self.b_proj = nn.Linear(
-            config.dim, (config.n_heads * config.num_prefix_tokens), bias=False, dtype=config.dtype)
-
         self.rotary_emb = RotaryEmbedding(dim=self.head_dim)
 
-    def forward(self, hidden_states, attention_mask, kv_cache=None, offset_override=None,
-                compress=False):
+    def forward(self, hidden_states, attention_mask, peft_params=None, kv_cache=None, offset_override=None):
         """
         precomputed_kv_hidden_states is for init (pre-compute KV activations, e.g. for added prefixes)
         kv_cache is for generation (cached past KV)
         """
         batch_size, q_seq_len, hidden_dim = hidden_states.size()
-        if compress:
-            assert not kv_cache
 
         if kv_cache is not None:
             offset = kv_cache["key"].shape[2]
@@ -446,7 +520,7 @@ class Attention(nn.Module):
 
         # (batch_size, num_heads, q_seq_len, head_dim)
         query_states = self.q_proj(hidden_states).view(
-            batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+                batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(
             batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(
@@ -455,18 +529,6 @@ class Attention(nn.Module):
         if kv_cache:
             key_states = torch.cat([kv_cache["key"], key_states], dim=2)
             value_states = torch.cat([kv_cache["value"], value_states], dim=2)
-        if compress:
-            # (batch_size, num_heads, num_prefix_tokens, q_seq_len)
-            key_proj = self.a_proj(hidden_states).view(
-                batch_size, q_seq_len, self.n_heads, self.config.num_prefix_tokens).permute(0, 2, 3, 1)
-            value_proj = self.b_proj(hidden_states).view(
-                batch_size, q_seq_len, self.n_heads, self.config.num_prefix_tokens).permute(0, 2, 3, 1)
-            # (batch_size, num_heads, num_prefix_tokens, head_dim)
-            compressed_key_states = torch.matmul(key_proj, key_states / math.sqrt(self.head_dim))
-            compressed_value_states = torch.matmul(value_proj, value_states / math.sqrt(self.head_dim))
-        else:
-            compressed_key_states = None
-            compressed_value_states = None
 
         scores = torch.matmul(
             query_states, key_states.transpose(3, 2).type_as(query_states) / math.sqrt(self.head_dim)
@@ -483,16 +545,11 @@ class Attention(nn.Module):
         )
         attn_output = self.o_proj(attn_output)
         check_nan(attn_output)
-        out = {"attn_output": attn_output}
         if kv_cache:
             new_kv_cache = {"key": key_states, "value": value_states}
-            out["kv_cache"] = new_kv_cache
-        if compress:
-            out["compressed"] = {
-                "key": compressed_key_states,
-                "value": compressed_value_states,
-            }
-        return out
+            return {"attn_output": attn_output, "kv_cache": new_kv_cache}
+        else:
+            return {"attn_output": attn_output}
 
 
 class RotaryEmbedding(torch.nn.Module):
@@ -628,17 +685,18 @@ def check_nan(x):
         pdb.set_trace()
 
 
-def create_model(model_name, hf_path, use_8bit=False, device=None):
+def create_model(model_name, hf_path, peft_config: peft.PeftConfig, use_8bit=False, device=None):
     config = LLAMA_CONFIG_DICT[model_name]
     weight_map = io_utils.read_json(os.path.join(hf_path, "pytorch_model.bin.index.json"))["weight_map"]
     filename_list = sorted(list(set(weight_map.values())))
     if device is None:
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
         # TODO: Local rank
-        device = torch.device("cuda:0")
+        device = torch.device(f"cuda:{local_rank}")
     if use_8bit:
         config = dataclasses.replace(config, use_8bit=True)
         with init_empty_weights():
-            model = LLaMAModel(config=config)
+            model = DownstreamLLaMAModel(config=config, peft_config=peft_config)
         state_keys = set(model.state_dict())
         filename_list = sorted(list(set(weight_map.values())))
         for filename in tqdm.tqdm(filename_list):
@@ -646,10 +704,11 @@ def create_model(model_name, hf_path, use_8bit=False, device=None):
             for k, v in loaded.items():
                 set_module_8bit_tensor_to_device(model, tensor_name=k, device=device, value=v)
                 state_keys.remove(k)
+        assert not state_keys
     else:
         # noinspection PyUnresolvedReferences
         torch.set_default_tensor_type(torch.cuda.HalfTensor)
-        model = LLaMAModel(config=config).cuda()
+        model = DownstreamLLaMAModel(config=config, peft_config=peft_config).to(device)
         torch.set_default_tensor_type(torch.FloatTensor)
         state_keys = set(model.state_dict())
         for filename in tqdm.tqdm(filename_list):
@@ -657,29 +716,15 @@ def create_model(model_name, hf_path, use_8bit=False, device=None):
             model.load_state_dict(loaded, strict=False)
             for k in loaded:
                 state_keys.remove(k)
-
-    for k, v in model.named_parameters():
-        if "a_proj" in k or "b_proj" in k:
-            v.requires_grad = True
-        else:
-            v.requires_grad = False
-
-    if use_8bit:
-        for layer_i in range(config.n_layers):
-            model.model.layers[layer_i].self_attn.a_proj.to_empty(device=device)
-            model.model.layers[layer_i].self_attn.a_proj.reset_parameters()
-            model.model.layers[layer_i].self_attn.b_proj.to_empty(device=device)
-            model.model.layers[layer_i].self_attn.b_proj.reset_parameters()
-
+        assert not state_keys
     return model
 
 
+def zeros_like(shape, tensor):
+    return torch.zeros(shape).type_as(tensor).to(tensor.device)
+
+
 def shift_kv_cache_right(layer_cache, num_valid_tokens):
-    """
-    :param layer_cache: left-aligned kv cache element, [batch_size, num_heads, seq_len, dim]
-    :param num_valid_tokens: [batch_size]
-    :return:
-    """
     batch_size = layer_cache.shape[0]
     # noinspection PyUnresolvedReferences
     return torch.stack([
@@ -692,13 +737,6 @@ def shift_kv_cache_right(layer_cache, num_valid_tokens):
 
 
 def create_generation_attention_mask(batch_size, seq_len, num_valid_tokens, device):
-    """
-    :param batch_size: int
-    :param seq_len: int
-    :param num_valid_tokens: [batch_size]
-    :param device:
-    :return:
-    """
     # For right-aligned, based on num_valid_tokens
     # noinspection PyTypeChecker
     attn_mask = torch.zeros([batch_size, 1, 1, seq_len], dtype=bool)
@@ -708,43 +746,3 @@ def create_generation_attention_mask(batch_size, seq_len, num_valid_tokens, devi
         # attn_mask[i, 0, -valid:, -valid:] = torch.tril(torch.ones([valid, valid], dtype=bool))
         attn_mask[i, 0, 0, -valid:] = True
     return attn_mask.to(device=device)
-
-
-def create_casual_attention_mask(seq_len, device):
-    # noinspection PyTypeChecker
-    attn_mask = torch.tril(torch.ones([seq_len, seq_len], dtype=bool))[None, None, :, :]
-    return attn_mask.to(device=device)
-
-
-# class Compressor(nn.Module):
-#     def __init__(self, config: LLaMAConfig):
-#         super().__init__()
-#         self.config = config
-#         self.layers = nn.ModuleList([
-#             CompressorLayer(config)
-#             for _ in range(config.num_compressor_layers)
-#         ])
-#
-#     def forward(self, hidden_states_list):
-#         prefixes = []
-#         for hidden_states, layer in zip(hidden_states_list, self.layers):
-#             prefixes.append(layer(hidden_states))
-#         return prefixes
-#
-#
-# class CompressorLayer(nn.Module):
-#     def __init__(self, config: LLaMAConfig):
-#         super().__init__()
-#         self.config = config
-#         self.a_proj = nn.Linear(config.hidden_size, config.hidden_size)
-#         self.b_proj = nn.Linear(config.hidden_size, config.hidden_size)
-#
-#     def forward(self, hidden_states):
-#         hidden_states = self.dense(hidden_states)
-#         hidden_states = self.dropout(hidden_states)
-#         hidden_states = self.LayerNorm(hidden_states)
-#         return hidden_states
-
-
-def zeros_like(shape, tensor):
-    return torch.zeros(shape).type_as(tensor).to(tensor.device)
