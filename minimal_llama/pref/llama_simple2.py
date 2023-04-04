@@ -27,8 +27,6 @@ class LLaMAConfig:
     eos_token_id: int = 2
     use_8bit: bool = False
 
-    num_prefix_tokens: int = 16
-
     @property
     def head_dim(self):
         return self.dim // self.n_heads
@@ -53,64 +51,29 @@ class LLaMAModel(nn.Module):
         self.lm_head = NoInitLinear(config.dim, config.vocab_size, bias=False, dtype=config.dtype)
 
     def forward(self,
-                input_ids,
-                peft_params=None,
-                compress=False):
+                input_ids):
         """Forward pass (with full decode sequence, intended for training or loss-scoring)
 
         :param input_ids: [batch_size, seq_len]
-        :param peft_params
-        :param compress
         :return: logits [batch_size, seq_len]
         """
         # 1) Create masks
         # decoder mask
         # [batch_size, num_heads=1, q_len=seq_len, kv_len=seq_len]
         attention_mask = create_attention_mask(input_ids=input_ids, dtype=self.config.dtype)
-        if peft_params:
-            attention_mask = torch.cat([
-                zeros_like([1, 1, input_ids.shape[1], self.config.num_prefix_tokens], tensor=attention_mask),
-                attention_mask,
-            ], dim=3)
-
-        # 1.5) prep
-        if peft_params:
-            kv_cache = self.create_prefix_kv_cache(peft_params)
-        else:
-            kv_cache = None
+        rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
+        cos, sin = self.get_cos_sin(rope_embed_ids)
 
         # 2) Forward pass
         # [batch_size, seq_len, hidden_dim]
         model_out = self.model(
             input_ids,
             attention_mask=attention_mask,
-            kv_cache=kv_cache,
-            compress=compress,
+            cos=cos, sin=sin,
         )
         # [batch_size, seq_len, vocab_size]
         logits = self.lm_head(model_out["hidden_states"])
-        out = {"logits": logits}
-        if "compressed" in model_out:
-            out["compressed"] = model_out["compressed"]
-        return out
-
-    @classmethod
-    def create_prefix_kv_cache(cls, peft_params):
-        # noinspection GrazieInspection
-        """Initialize KV cache from prefixes.
-
-        Used for decoder in both forward pass (train) and decoding
-
-        A KV cache consists of a list of dicts (one per layer):
-            dict(
-              key = [batch_size, num_heads, kv_seq_len=num_prefix_tokens, head_dim]
-              value = [batch_size, num_heads, kv_seq_len=num_prefix_tokens, head_dim]
-            )
-
-        :param peft_params:
-        :return: kv_cache
-        """
-        return peft_params
+        return logits
 
     def init_kv_cache(self, input_ids):
         # noinspection GrazieInspection
@@ -137,7 +100,7 @@ class LLaMAModel(nn.Module):
             })
         return kv_cache
 
-    def generate(self, input_ids, generation_length: int = 20, peft_params=None):
+    def generate(self, input_ids, generation_length: 20):
         """Generate tokens with efficient caching of KV.
 
         TODO: Add stopping conditions
@@ -145,7 +108,6 @@ class LLaMAModel(nn.Module):
 
         :param input_ids: [batch_size, enc_seq_len]
         :param generation_length: int
-        :param peft_params
         :return: [batch_size, generation_length]
         """
         original_input_ids = input_ids
@@ -160,27 +122,13 @@ class LLaMAModel(nn.Module):
                 [[self.config.pad_token_id]] * batch_size
             ).to(self.lm_head.weights.device)
         # See: init_kv_cache. list[dict]
-        if peft_params:
-            kv_cache = self.create_prefix_kv_cache(peft_params)
-            num_valid_kv_cache = num_valid_tokens + self.peft_config.num_prefix_tokens
-        else:
-            kv_cache = self.init_kv_cache(input_ids)
-            num_valid_kv_cache = num_valid_tokens
+        kv_cache = self.init_kv_cache(input_ids)
         generated_token_ids_list = [original_input_ids]
         total_seq_len = seq_len
 
         # 2) First encoding
         # [batch_size=1, num_heads=1, q_len=1, kv_len=1]
         attention_mask = create_attention_mask(input_ids=input_ids, dtype=self.config.dtype)
-        if peft_params is not None:
-            num_prefix_tokens = self.config.num_prefix_tokens
-            total_seq_len += num_prefix_tokens
-            # [batch_size, num_heads=1, q_len=seq_len, kv_len=num_prefix_tokens + dec_seq_len]
-            attention_mask = torch.cat([
-                zeros_like([1, 1, input_ids.shape[1], num_prefix_tokens], tensor=attention_mask),
-                attention_mask,
-            ], dim=3)
-
         # dict(
         #   hidden_states = [batch_size, dec_seq_len=decode_step+1, hidden_dim]
         #   kv_cache = list[dict(
@@ -188,9 +136,12 @@ class LLaMAModel(nn.Module):
         #     value = [batch_size, num_heads, kv_seq_len=decode_step+1, head_dim]
         #   )]
         # )
+        rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
+        cos, sin = self.get_cos_sin(rope_embed_ids)
         model_out = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            cos=cos, sin=sin,
             kv_cache=kv_cache,
         )
         logits = self.lm_head(model_out["hidden_states"])
@@ -206,13 +157,12 @@ class LLaMAModel(nn.Module):
         for layer_kv_cache in kv_cache:
             for i in range(batch_size):
                 layer_kv_cache["key"] = shift_kv_cache_right(
-                    layer_kv_cache["key"], num_valid_tokens=num_valid_kv_cache)
+                    layer_kv_cache["key"], num_valid_tokens=num_valid_tokens)
                 layer_kv_cache["value"] = shift_kv_cache_right(
-                    layer_kv_cache["value"], num_valid_tokens=num_valid_kv_cache)
+                    layer_kv_cache["value"], num_valid_tokens=num_valid_tokens)
 
         # 3) Subsequent steps
         for decode_step in range(generation_length-1):
-            num_valid_kv_cache += 1
             num_valid_tokens += 1
             total_seq_len += 1
             # [batch_size=1, num_heads=1, q_len=1, kv_len=1]
@@ -229,11 +179,13 @@ class LLaMAModel(nn.Module):
             #     value = [batch_size, num_heads, kv_seq_len=decode_step+1, head_dim]
             #   )]
             # )
+            rope_embed_ids = create_rope_embed_ids(input_ids=input_ids) + num_valid_tokens
+            cos, sin = self.get_cos_sin(rope_embed_ids)
             model_out = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 kv_cache=kv_cache,
-                offset_override=num_valid_tokens,
+                cos=cos, sin=sin,
             )
             # [batch_size, dec_seq_len=1, vocab_size]
             logits = self.lm_head(model_out["hidden_states"])
@@ -243,6 +195,17 @@ class LLaMAModel(nn.Module):
             generated_token_ids_list.append(generated_token_ids)
             input_ids = generated_token_ids
         return torch.cat(generated_token_ids_list, dim=1)
+
+    def get_cos_sin(self, rope_embed_ids):
+        cos = F.embedding(
+            rope_embed_ids,
+            self.model.layers[0].self_attn.rotary_emb.cos_cached[0, 0]
+        ).to(self.config.dtype)
+        sin = F.embedding(
+            rope_embed_ids,
+            self.model.layers[0].self_attn.rotary_emb.sin_cached[0, 0]
+        ).to(self.config.dtype)
+        return cos, sin
 
 
 class LLaMAInnerModel(nn.Module):
@@ -259,21 +222,19 @@ class LLaMAInnerModel(nn.Module):
     def forward(self,
                 input_ids,
                 attention_mask,
-                kv_cache=None,
-                offset_override=None,
-                compress=False):
+                cos, sin,
+                kv_cache=None):
         """
         :param input_ids: [batch_size, seq_len]
         :param attention_mask: [batch_size=1, num_heads=1, seq_len, seq_len]
         :param kv_cache: See init_kv_cache.
             We use the presence of kv_cache to determine if we're generating
-        :param offset_override:
-        :param compress:
+        :param cos:
+        :param sin:
         """
         hidden_states = self.embed_tokens(input_ids)
 
         new_kv_cache = []
-        compress_cache = []
         for layer_i, layer in enumerate(self.layers):
             if kv_cache:
                 # dict(
@@ -288,22 +249,17 @@ class LLaMAInnerModel(nn.Module):
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 kv_cache=layer_kv_cache,
-                offset_override=offset_override,
-                compress=compress,
+                cos=cos, sin=sin,
             )
             hidden_states = layer_out["hidden_states"]
             if kv_cache:
                 new_kv_cache.append(layer_out["kv_cache"])
-            if compress:
-                compress_cache.append(layer_out["compressed"])
         hidden_states = self.norm(hidden_states)
         output = {
             "hidden_states": hidden_states
         }
         if kv_cache:
             output["kv_cache"] = new_kv_cache
-        if compress:
-            output["compressed"] = compress_cache
         return output
 
 
@@ -320,9 +276,8 @@ class LLaMALayer(nn.Module):
         self,
         hidden_states,
         attention_mask,
+        cos, sin,
         kv_cache=None,
-        offset_override=None,
-        compress=False,
     ):
         # 1) Self-attention
         # [batch_size, seq_len, hidden_dim]
@@ -339,8 +294,7 @@ class LLaMALayer(nn.Module):
             hidden_states=normed_hidden_states,
             attention_mask=attention_mask,
             kv_cache=kv_cache,
-            offset_override=offset_override,
-            compress=compress,
+            cos=cos, sin=sin,
         )
         # [batch_size, seq_len, hidden_dim]
         hidden_states = hidden_states + raw_self_attn_output["attn_output"]
@@ -349,12 +303,15 @@ class LLaMALayer(nn.Module):
         # [batch_size, seq_len, hidden_dim]
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
         check_nan(hidden_states)
-        out = {"hidden_states": hidden_states}
         if kv_cache:
-            out["kv_cache"] = raw_self_attn_output["kv_cache"]
-        if compress:
-            out["compressed"] = raw_self_attn_output["compressed"]
-        return out
+            return {
+                "hidden_states": hidden_states,
+                "kv_cache": raw_self_attn_output["kv_cache"],
+            }
+        else:
+            return {
+                "hidden_states": hidden_states
+            }
 
 
 class MLP(nn.Module):
@@ -413,36 +370,14 @@ class Attention(nn.Module):
             self.k_proj = NoInitLinear(config.dim, config.dim, bias=False, dtype=config.dtype)
             self.v_proj = NoInitLinear(config.dim, config.dim, bias=False, dtype=config.dtype)
             self.o_proj = NoInitLinear(config.dim, config.dim, bias=False, dtype=config.dtype)
-
-        self.a_proj = nn.Linear(
-            config.dim, (config.n_heads * config.num_prefix_tokens), bias=False, dtype=config.dtype)
-        self.b_proj = nn.Linear(
-            config.dim, (config.n_heads * config.num_prefix_tokens), bias=False, dtype=config.dtype)
-
         self.rotary_emb = RotaryEmbedding(dim=self.head_dim)
 
-    def forward(self, hidden_states, attention_mask, kv_cache=None, offset_override=None,
-                compress=False):
+    def forward(self, hidden_states, attention_mask, cos, sin, kv_cache=None):
         """
         precomputed_kv_hidden_states is for init (pre-compute KV activations, e.g. for added prefixes)
         kv_cache is for generation (cached past KV)
         """
         batch_size, q_seq_len, hidden_dim = hidden_states.size()
-        if compress:
-            assert not kv_cache
-
-        if kv_cache is not None:
-            offset = kv_cache["key"].shape[2]
-        else:
-            offset = 0
-
-        if offset_override is not None:
-            offset = offset_override
-            kv_seq_len = hidden_states.shape[1] + offset.max().item()
-        else:
-            kv_seq_len = hidden_states.shape[1] + offset
-
-        cos, sin = self.rotary_emb(hidden_states, seq_len=kv_seq_len)
 
         # (batch_size, num_heads, q_seq_len, head_dim)
         query_states = self.q_proj(hidden_states).view(
@@ -451,22 +386,10 @@ class Attention(nn.Module):
             batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(
             batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos=cos, sin=sin, offset=offset)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos=cos, sin=sin)
         if kv_cache:
             key_states = torch.cat([kv_cache["key"], key_states], dim=2)
             value_states = torch.cat([kv_cache["value"], value_states], dim=2)
-        if compress:
-            # (batch_size, num_heads, num_prefix_tokens, q_seq_len)
-            key_proj = self.a_proj(hidden_states).view(
-                batch_size, q_seq_len, self.n_heads, self.config.num_prefix_tokens).permute(0, 2, 3, 1)
-            value_proj = self.b_proj(hidden_states).view(
-                batch_size, q_seq_len, self.n_heads, self.config.num_prefix_tokens).permute(0, 2, 3, 1)
-            # (batch_size, num_heads, num_prefix_tokens, head_dim)
-            compressed_key_states = torch.matmul(key_proj, key_states / math.sqrt(self.head_dim))
-            compressed_value_states = torch.matmul(value_proj, value_states / math.sqrt(self.head_dim))
-        else:
-            compressed_key_states = None
-            compressed_value_states = None
 
         scores = torch.matmul(
             query_states, key_states.transpose(3, 2).type_as(query_states) / math.sqrt(self.head_dim)
@@ -483,16 +406,11 @@ class Attention(nn.Module):
         )
         attn_output = self.o_proj(attn_output)
         check_nan(attn_output)
-        out = {"attn_output": attn_output}
         if kv_cache:
             new_kv_cache = {"key": key_states, "value": value_states}
-            out["kv_cache"] = new_kv_cache
-        if compress:
-            out["compressed"] = {
-                "key": compressed_key_states,
-                "value": compressed_value_states,
-            }
-        return out
+            return {"attn_output": attn_output, "kv_cache": new_kv_cache}
+        else:
+            return {"attn_output": attn_output}
 
 
 class RotaryEmbedding(torch.nn.Module):
@@ -534,21 +452,7 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rotary_pos_emb(q, k, cos, sin, offset: Union[int, torch.tensor] = 0):
-    base_length = q.shape[-2]
-    if isinstance(offset, int):
-        cos = cos[..., offset: base_length + offset, :]
-        sin = sin[..., offset: base_length + offset, :]
-    else:
-        batch_size = offset.shape[0]
-        cos = torch.stack([
-            cos[i, :, offset[i]: base_length + offset[i], :]
-            for i in range(batch_size)
-        ], dim=0)
-        sin = torch.stack([
-            sin[i, :, offset[i]: base_length + offset[i], :]
-            for i in range(batch_size)
-        ], dim=0)
+def apply_rotary_pos_emb(q, k, cos, sin):
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
@@ -646,6 +550,7 @@ def create_model(model_name, hf_path, use_8bit=False, device=None):
             for k, v in loaded.items():
                 set_module_8bit_tensor_to_device(model, tensor_name=k, device=device, value=v)
                 state_keys.remove(k)
+        assert not state_keys
     else:
         # noinspection PyUnresolvedReferences
         torch.set_default_tensor_type(torch.cuda.HalfTensor)
@@ -657,20 +562,6 @@ def create_model(model_name, hf_path, use_8bit=False, device=None):
             model.load_state_dict(loaded, strict=False)
             for k in loaded:
                 state_keys.remove(k)
-
-    for k, v in model.named_parameters():
-        if "a_proj" in k or "b_proj" in k:
-            v.requires_grad = True
-        else:
-            v.requires_grad = False
-
-    if use_8bit:
-        for layer_i in range(config.n_layers):
-            model.model.layers[layer_i].self_attn.a_proj.to_empty(device=device)
-            model.model.layers[layer_i].self_attn.a_proj.reset_parameters()
-            model.model.layers[layer_i].self_attn.b_proj.to_empty(device=device)
-            model.model.layers[layer_i].self_attn.b_proj.reset_parameters()
-
     return model
 
 
@@ -716,5 +607,9 @@ def create_casual_attention_mask(seq_len, device):
     return attn_mask.to(device=device)
 
 
-def zeros_like(shape, tensor):
-    return torch.zeros(shape).type_as(tensor).to(tensor.device)
+def create_rope_embed_ids(input_ids):
+    pad_token_id = 0
+    max_position = 2047
+    x = (input_ids != pad_token_id).cumsum(-1) - 1
+    x[input_ids == pad_token_id] = max_position
+    return x
