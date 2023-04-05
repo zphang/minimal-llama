@@ -490,7 +490,7 @@ def check_nan(x):
         pdb.set_trace()
 
 
-def create_model(model_name, hf_path, use_8bit=False, device=None):
+def create_model(model_name, hf_path, train_config: TrainConfig, use_8bit=False, device=None):
     config = LLAMA_CONFIG_DICT[model_name]
     weight_map = io_utils.read_json(os.path.join(hf_path, "pytorch_model.bin.index.json"))["weight_map"]
     filename_list = sorted(list(set(weight_map.values())))
@@ -500,7 +500,7 @@ def create_model(model_name, hf_path, use_8bit=False, device=None):
     if use_8bit:
         config = dataclasses.replace(config, use_8bit=True)
         with init_empty_weights():
-            model = LLaMAModel(config=config)
+            model = LLaMAModel(config=config, train_config=train_config)
         state_keys = set(model.state_dict())
         filename_list = sorted(list(set(weight_map.values())))
         for filename in tqdm.tqdm(filename_list):
@@ -512,7 +512,7 @@ def create_model(model_name, hf_path, use_8bit=False, device=None):
     else:
         # noinspection PyUnresolvedReferences
         torch.set_default_tensor_type(torch.cuda.HalfTensor)
-        model = LLaMAModel(config=config).cuda()
+        model = LLaMAModel(config=config, train_config=train_config).cuda()
         torch.set_default_tensor_type(torch.FloatTensor)
         state_keys = set(model.state_dict())
         for filename in tqdm.tqdm(filename_list):
@@ -520,6 +520,9 @@ def create_model(model_name, hf_path, use_8bit=False, device=None):
             model.load_state_dict(loaded, strict=False)
             for k in loaded:
                 state_keys.remove(k)
+
+    # TODO: Load weights into factorized compressor
+
     return model
 
 
@@ -572,7 +575,12 @@ class Compressor(nn.Module):
         super().__init__()
         self.config = config
         self.train_config = train_config
-        self.a_proj = nn.Linear(config.dim, config.n_heads * train_config.num_prefix_tokens, bias=False)
+        if self.train_config.factorized_compressor:
+            self.embed = nn.Embedding(train_config.num_prefix_tokens, config.dim)
+            self.sub_q_proj = nn.Linear(config.dim, config.dim, bias=False)
+            self.sub_k_proj = nn.Linear(config.dim, config.dim, bias=False)
+        else:
+            self.a_proj = nn.Linear(config.dim, config.n_heads * train_config.num_prefix_tokens, bias=False)
         self.head_dim = config.dim // config.n_heads
 
     def forward(self, hidden_states, past_kvs):
@@ -583,6 +591,7 @@ class Compressor(nn.Module):
         """
         batch_size, seq_len, _ = hidden_states.shape
         num_blocks = seq_len // self.train_config.block_size
+        device = hidden_states.device
         # [batch_size = 1, num_heads = 1, num_blocks, num_prefix_tokens = 1, seq_len]
         block_attn_mask = create_black_attention_mask(
             num_blocks=num_blocks,
@@ -591,12 +600,24 @@ class Compressor(nn.Module):
             dtype=self.config.dtype,
         )
 
-        # [batch_size, seq_len, num_heads * num_prefix_tokens]
-        a_projector = self.a_proj(hidden_states)
-        # [batch_size, num_heads, num_prefix_tokens, seq_len]
-        a_projector = a_projector.view(
-            batch_size, seq_len, self.config.n_heads, self.train_config.num_prefix_tokens,
-        ).permute(0, 2, 3, 1)
+        if self.train_config.factorized_compressor:
+            num_prefix_tokens = self.train_config.num_prefix_tokens
+            prefix_embed = self.embed(torch.arange(self.train_config.num_prefix_tokens).long().to(device))
+            sub_q = self.sub_q_proj(prefix_embed) \
+                .expand(batch_size, num_prefix_tokens, self.config.dim) \
+                .view(batch_size, num_prefix_tokens, self.config.n_heads, self.head_dim) \
+                .transpose(1, 2)
+            sub_k = self.sub_k_proj(hidden_states) \
+                .view(batch_size, seq_len, self.config.n_heads, self.head_dim) \
+                .transpose(1, 2)
+            a_projector = torch.matmul(sub_q, sub_k.transpose(-2, -1) / math.sqrt(self.head_dim))
+        else:
+            # [batch_size, seq_len, num_heads * num_prefix_tokens]
+            a_projector = self.a_proj(hidden_states)
+            # [batch_size, num_heads, num_prefix_tokens, seq_len]
+            a_projector = a_projector.view(
+                batch_size, seq_len, self.config.n_heads, self.train_config.num_prefix_tokens,
+            ).permute(0, 2, 3, 1)
         # [batch_size, num_heads, num_blocks, num_prefix_tokens, seq_len]
         blocked_a_projector = a_projector[:, :, None, :, :].expand(
             batch_size, self.config.n_heads, num_blocks, self.train_config.num_prefix_tokens, seq_len,
@@ -675,4 +696,3 @@ def create_black_attention_mask(num_blocks: int,
 
 def zeros_like(shape, tensor):
     return torch.zeros(shape).type_as(tensor).to(tensor.device)
-
