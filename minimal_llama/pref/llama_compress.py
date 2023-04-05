@@ -51,6 +51,7 @@ class TrainConfig:
     peft_mode: str
     num_prefix_tokens: int = None
     block_size: int = 64
+    factorized_compressor: bool = True
 
     def check(self):
         assert self.peft_mode in (
@@ -73,22 +74,41 @@ class LLaMAModel(nn.Module):
         :param input_ids: [batch_size, seq_len]
         :return: logits [batch_size, seq_len]
         """
-        # 1) Create masks
+        block_size = self.train_config.block_size
+        num_blocks = input_ids.shape[1] // block_size
+        device = input_ids.device
+        # 1.1) Create full masks and rope embeds
         # decoder mask
         # [batch_size, num_heads=1, q_len=seq_len, kv_len=seq_len]
-        attention_mask = create_attention_mask(input_ids=input_ids, dtype=self.config.dtype)
-        rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
-        cos, sin = self.get_cos_sin(rope_embed_ids)
+        full_attention_mask = create_attention_mask(input_ids=input_ids, dtype=self.config.dtype)
+        full_rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
+        full_cos, full_sin = self.get_cos_sin(full_rope_embed_ids)[None, None, :, :]
+
+        # 1.2) Create conditional masks and rope embeds
+        conditional_attention_mask = create_attention_mask(input_ids=input_ids[:, :block_size], dtype=self.config.dtype)
+        if self.train_config.peft_mode == PEFT_PREFIX:
+            num_prefix_tokens = self.peft_config.num_prefix_tokens
+            conditional_attention_mask = torch.cat([
+                zeros_like([1, 1, block_size, num_prefix_tokens], tensor=conditional_attention_mask),
+                conditional_attention_mask,
+            ], dim=3)[None]
+        # Assume fully packed
+        # [1, block_size*num_blocks=seq_len]
+        conditional_rope_embed_ids = torch.arange(num_blocks)[None, :].expand(block_size, num_blocks)[None]
+        conditional_rope_embed_ids = conditional_rope_embed_ids.long().to(device)
+        conditional_cos, conditional_sin = self.get_cos_sin(conditional_rope_embed_ids)[None, None, None, :, :]
 
         # 2) Forward pass
         # [batch_size, seq_len, hidden_dim]
         model_out = self.model(
-            input_ids,
-            attention_mask=attention_mask,
-            cos=cos, sin=sin,
+            input_ids=input_ids,
+            full_attention_mask=full_attention_mask,
+            conditional_attention_mask=conditional_attention_mask,
+            full_cos=full_cos, full_sin=full_sin,
+            conditional_cos=conditional_cos, conditional_sin=conditional_sin,
         )
         # [batch_size, seq_len, vocab_size]
-        logits = self.lm_head(model_out["hidden_states"])
+        logits = self.lm_head(model_out["full_hidden_states"])
         return logits
 
     def get_cos_sin(self, rope_embed_ids):
@@ -117,45 +137,37 @@ class LLaMAInnerModel(nn.Module):
 
     def forward(self,
                 input_ids,
-                attention_mask,
-                cos, sin,
-                kv_cache=None):
+                full_attention_mask,
+                conditional_attention_mask,
+                full_cos, full_sin,
+                conditional_cos, conditional_sin):
         """
         :param input_ids: [batch_size, seq_len]
-        :param attention_mask: [batch_size=1, num_heads=1, seq_len, seq_len]
-        :param kv_cache: See init_kv_cache.
-            We use the presence of kv_cache to determine if we're generating
-        :param cos:
-        :param sin:
+        :param full_attention_mask: [batch_size=1, num_heads=1, seq_len, seq_len]
+        :param conditional_attention_mask: [batch_size=1, num_heads=1, num_blocks, num_prefix_tokens=1, seq_len]
+        :param full_cos:
+        :param full_sin:
+        :param conditional_cos:
+        :param conditional_sin:
         """
-        hidden_states = self.embed_tokens(input_ids)
-
-        new_kv_cache = []
+        full_hidden_states = conditional_hidden_states = self.embed_tokens(input_ids)
         for layer_i, layer in enumerate(self.layers):
-            if kv_cache:
-                # dict(
-                #   key = [batch_size, num_heads, kv_seq_len=decode_step+1, head_dim]
-                #   value = [batch_size, num_heads, kv_seq_len=decode_step+1, head_dim]
-                # )
-                layer_kv_cache = kv_cache[layer_i]
-            else:
-                layer_kv_cache = None
-
             layer_out = layer(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                kv_cache=layer_kv_cache,
-                cos=cos, sin=sin,
+                full_hidden_states=full_hidden_states,
+                full_attention_mask=full_attention_mask,
+                conditional_hidden_states=conditional_hidden_states,
+                conditional_attention_mask=conditional_attention_mask,
+                full_cos=full_cos, full_sin=full_sin,
+                conditional_cos=conditional_cos, conditional_sin=conditional_sin,
             )
-            hidden_states = layer_out["hidden_states"]
-            if kv_cache:
-                new_kv_cache.append(layer_out["kv_cache"])
-        hidden_states = self.norm(hidden_states)
+            full_hidden_states = layer_out["full_hidden_states"]
+            conditional_hidden_states = layer_out["conditional_hidden_states"]
+        full_hidden_states = self.norm(full_hidden_states)
+        conditional_hidden_states = self.norm(conditional_hidden_states)
         output = {
-            "hidden_states": hidden_states
+            "full_hidden_states": full_hidden_states,
+            "conditional_hidden_states": conditional_hidden_states,
         }
-        if kv_cache:
-            output["kv_cache"] = new_kv_cache
         return output
 
 
@@ -171,14 +183,15 @@ class LLaMALayer(nn.Module):
 
     def forward(
         self,
-        hidden_states,
-        attention_mask,
-        cos, sin,
-        kv_cache=None,
+        full_hidden_states, full_attention_mask,
+        conditional_hidden_states, conditional_attention_mask,
+        full_cos, full_sin,
+        conditional_cos, conditional_sin
     ):
         # 1) Self-attention
         # [batch_size, seq_len, hidden_dim]
-        normed_hidden_states = self.input_layernorm(hidden_states)
+        normed_full_hidden_states = self.input_layernorm(full_hidden_states)
+        normed_conditional_hidden_states = self.input_layernorm(conditional_hidden_states)
         # dict(
         #   attn_output = [batch_size, seq_len, hidden_dim]
         #   kv_cache = dict(
@@ -186,29 +199,33 @@ class LLaMALayer(nn.Module):
         #     value = [batch_size, num_heads, kv_seq_len, head_dim]
         #   )
         # )
-        check_nan(normed_hidden_states)
+        check_nan(normed_full_hidden_states)
+        check_nan(normed_conditional_hidden_states)
         raw_self_attn_output = self.self_attn(
-            hidden_states=normed_hidden_states,
-            attention_mask=attention_mask,
-            kv_cache=kv_cache,
-            cos=cos, sin=sin,
+            full_hidden_states=normed_full_hidden_states,
+            full_attention_mask=full_attention_mask,
+            conditional_hidden_states=normed_conditional_hidden_states,
+            conditional_attention_mask=conditional_attention_mask,
+            full_cos=full_cos, full_sin=full_sin,
+            conditional_cos=conditional_cos, conditional_sin=conditional_sin,
         )
         # [batch_size, seq_len, hidden_dim]
-        hidden_states = hidden_states + raw_self_attn_output["attn_output"]
-        check_nan(hidden_states)
+        full_hidden_states = normed_full_hidden_states + raw_self_attn_output["full_attn_output"]
+        conditional_hidden_states = normed_conditional_hidden_states + raw_self_attn_output["conditional_attn_output"]
+        check_nan(full_hidden_states)
+        check_nan(conditional_hidden_states)
         # 2) FFN
         # [batch_size, seq_len, hidden_dim]
-        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
-        check_nan(hidden_states)
-        if kv_cache:
-            return {
-                "hidden_states": hidden_states,
-                "kv_cache": raw_self_attn_output["kv_cache"],
-            }
-        else:
-            return {
-                "hidden_states": hidden_states
-            }
+        full_hidden_states = full_hidden_states + self.mlp(
+            self.post_attention_layernorm(full_hidden_states))
+        conditional_hidden_states = conditional_hidden_states + self.mlp(
+            self.post_attention_layernorm(conditional_hidden_states))
+        check_nan(full_hidden_states)
+        check_nan(conditional_hidden_states)
+        return {
+            "full_hidden_states": full_hidden_states,
+            "conditional_hidden_states": conditional_hidden_states,
+        }
 
 
 class MLP(nn.Module):
@@ -257,6 +274,7 @@ class Attention(nn.Module):
         self.train_config = train_config
         self.n_heads = config.n_heads
         self.head_dim = config.dim // config.n_heads
+        self.block_size = self.trian_config.block_size
 
         if config.use_8bit:
             self.q_proj = NoInit8bitLinear(config.dim, config.dim, bias=False, threshold=6.0, has_fp16_weights=False)
@@ -269,47 +287,88 @@ class Attention(nn.Module):
             self.v_proj = NoInitLinear(config.dim, config.dim, bias=False, dtype=config.dtype)
             self.o_proj = NoInitLinear(config.dim, config.dim, bias=False, dtype=config.dtype)
         self.rotary_emb = RotaryEmbedding(dim=self.head_dim)
-        self.compressor = Compressor(config=config, train_config=train_config)
+        self.k_compressor = Compressor(config=config, train_config=train_config)
+        self.v_compressor = Compressor(config=config, train_config=train_config)
 
-    def forward(self, hidden_states, attention_mask, cos, sin, kv_cache=None):
+    def forward(self,
+                full_hidden_states, full_attention_mask,
+                conditional_hidden_states, conditional_attention_mask,
+                full_cos, full_sin,
+                conditional_cos, conditional_sin):
         """
-        precomputed_kv_hidden_states is for init (pre-compute KV activations, e.g. for added prefixes)
-        kv_cache is for generation (cached past KV)
         """
-        batch_size, q_seq_len, hidden_dim = hidden_states.size()
-
+        batch_size, full_seq_len, hidden_dim = full_hidden_states.size()
+        num_blocks = full_seq_len // self.train_config.block_size
+        # 1) Compute history
         # (batch_size, num_heads, q_seq_len, head_dim)
-        query_states = self.q_proj(hidden_states).view(
-            batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(
-            batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(
-            batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos=cos, sin=sin)
-        if kv_cache:
-            key_states = torch.cat([kv_cache["key"], key_states], dim=2)
-            value_states = torch.cat([kv_cache["value"], value_states], dim=2)
-
-        scores = torch.matmul(
-            query_states, key_states.transpose(3, 2).type_as(query_states) / math.sqrt(self.head_dim)
+        full_query_states = self.q_proj(full_hidden_states).view(
+            batch_size, full_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        full_key_states = self.k_proj(full_hidden_states).view(
+            batch_size, full_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        full_value_states = self.v_proj(full_hidden_states).view(
+            batch_size, full_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        full_query_states, full_key_states = apply_rotary_pos_emb(
+            full_query_states, full_key_states,
+            cos=full_cos, sin=full_sin)
+        full_scores = torch.matmul(
+            full_query_states,
+            full_key_states.transpose(3, 2).type_as(full_query_states) / math.sqrt(self.head_dim)
         )
-        scores += attention_mask
+        full_scores += full_attention_mask
 
-        # (batch_size, num_heads, q_seq_len, kv_seq_len)
-        attn_weights = F.softmax(scores.float(), dim=-1).type_as(scores)
-        # (batch_size, num_heads, q_seq_len, head_dim)
-        attn_output = torch.matmul(attn_weights, value_states.type_as(query_states))
+        # (batch_size, num_heads, block_size, full_seq_len, kv_seq_len)
+        full_attn_weights = F.softmax(full_scores.float(), dim=-1).type_as(full_scores)
+        # (batch_size, num_heads, full_seq_len, head_dim)
+        full_attn_output = torch.matmul(full_attn_weights, full_value_states.type_as(full_query_states))
         # (batch_size, q_seq_len, hidden_dim)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(
-            batch_size, q_seq_len, hidden_dim,
+        full_attn_output = full_attn_output.transpose(1, 2).contiguous().view(
+            batch_size, full_seq_len, hidden_dim,
         )
-        attn_output = self.o_proj(attn_output)
-        check_nan(attn_output)
-        if kv_cache:
-            new_kv_cache = {"key": key_states, "value": value_states}
-            return {"attn_output": attn_output, "kv_cache": new_kv_cache}
-        else:
-            return {"attn_output": attn_output}
+        full_attn_output = self.o_proj(full_attn_output)
+        check_nan(full_attn_output)
+        # ====
+
+        # 2) Compute prefix
+        # [batch_size, num_heads, num_blocks, num_prefix_tokens, head_dim]
+        prefix_k = self.k_compressor(hidden_states=full_hidden_states, past_kvs=full_key_states)
+        prefix_v = self.v_compressor(hidden_states=full_hidden_states, past_kvs=full_value_states)
+        # ====
+
+        # 3) Compute conditional LM
+        # [batch_size, num_blocks, num_heads, block_size, head_dim]
+        conditional_query_states = self.q_proj(conditional_hidden_states).view(
+            batch_size, num_blocks, self.block_size, self.n_heads, self.head_dim).transpose(-2, -3)
+        conditional_key_states = self.k_proj(conditional_hidden_states).view(
+            batch_size, num_blocks, self.block_size, self.n_heads, self.head_dim).transpose(-2, -3)
+        conditional_value_states = self.v_proj(conditional_hidden_states).view(
+            batch_size, num_blocks, self.block_size, self.n_heads, self.head_dim).transpose(-2, -3)
+        conditional_query_states, conditional_key_states = apply_rotary_pos_emb(
+            conditional_query_states, conditional_key_states,
+            cos=conditional_cos, sin=conditional_sin,
+        )
+        # [batch_size, num_blocks, num_heads, num_prefix_tokens+block_size, head_dim]
+        conditional_key_states = torch.cat([prefix_k, conditional_key_states], dim=-2)
+        conditional_value_states = torch.cat([prefix_v, conditional_value_states], dim=-2)
+        # [batch_size, num_blocks, num_heads, block_size, num_prefix_tokens+block_size]
+        conditional_scores = torch.matmul(
+            conditional_query_states,
+            conditional_key_states.transpose(-1, -2).type_as(conditional_query_states) / math.sqrt(self.head_dim)
+        )
+        conditional_scores += conditional_attention_mask
+        # [batch_size, num_blocks, num_heads, block_size, num_prefix_tokens+block_size]
+        attn_weights = F.softmax(conditional_scores.float(), dim=-1).type_as(conditional_scores)
+        # [batch_size, num_blocks, num_heads, block_size, head_dim]
+        attn_output = torch.matmul(attn_weights, conditional_value_states.type_as(conditional_query_states))
+        # [batch_size, num_heads, full_seq_len, head_dim]
+        conditional_attn_output = attn_output.transpose(1, 2).contiguous().view(
+            batch_size, full_seq_len, hidden_dim,
+        )
+        conditional_attn_output = self.o_proj(conditional_attn_output)
+
+        return {
+            "full_attn_output": full_attn_output,
+            "conditional_attn_output": conditional_attn_output,
+        }
 
 
 class RotaryEmbedding(torch.nn.Module):
@@ -612,3 +671,8 @@ def create_black_attention_mask(num_blocks: int,
     mask = base_mask[:, :, None].expand(num_blocks, num_blocks, block_size).reshape(num_blocks, seq_len)
     mask = convert_mask_to_soft_mask(mask, dtype)[None, None, :, None, :]
     return mask
+
+
+def zeros_like(shape, tensor):
+    return torch.zeros(shape).type_as(tensor).to(tensor.device)
+
