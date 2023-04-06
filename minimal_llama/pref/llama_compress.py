@@ -6,6 +6,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 import bitsandbytes as bnb
 from accelerate import init_empty_weights
 
@@ -29,10 +30,14 @@ class LLaMAConfig:
     bos_token_id: int = 1
     eos_token_id: int = 2
     use_8bit: bool = False
+    gradient_checkpointing: bool = False
 
     @property
     def head_dim(self):
         return self.dim // self.n_heads
+
+    def to_dict(self):
+        return dataclasses.asdict(self)
 
 
 LLAMA_7B_CONFIG = LLaMAConfig(
@@ -137,6 +142,14 @@ class LLaMAModel(nn.Module):
         ).to(self.config.dtype)
         return cos, sin
 
+    def gradient_checkpointing_enable(self):
+        self.config.gradient_checkpointing = True
+
+    def enable_input_require_grads(self):
+        def make_inputs_require_grads(module, input, output):
+            output.requires_grad_(True)
+        self.model.embed_tokens.register_forward_hook(make_inputs_require_grads)
+
 
 class LLaMAInnerModel(nn.Module):
     def __init__(self, config: LLaMAConfig, train_config: TrainConfig):
@@ -165,18 +178,33 @@ class LLaMAInnerModel(nn.Module):
         :param conditional_cos:
         :param conditional_sin:
         """
-        full_hidden_states = conditional_hidden_states = self.embed_tokens(input_ids)
+        full_hidden_states = self.embed_tokens(input_ids)
+        conditional_hidden_states = full_hidden_states.detach().clone()
+        if self.config.gradient_checkpointing:
+            conditional_hidden_states.requires_grad_(True)
         for layer_i, layer in enumerate(self.layers):
-            layer_out = layer(
-                full_hidden_states=full_hidden_states,
-                full_attention_mask=full_attention_mask,
-                conditional_hidden_states=conditional_hidden_states,
-                conditional_attention_mask=conditional_attention_mask,
-                full_cos=full_cos, full_sin=full_sin,
-                conditional_cos=conditional_cos, conditional_sin=conditional_sin,
-            )
-            full_hidden_states = layer_out["full_hidden_states"]
-            conditional_hidden_states = layer_out["conditional_hidden_states"]
+            if self.config.gradient_checkpointing:
+                layer_out = torch.utils.checkpoint.checkpoint(
+                    layer,
+                    full_hidden_states,
+                    full_attention_mask,
+                    conditional_hidden_states,
+                    conditional_attention_mask,
+                    full_cos, full_sin,
+                    conditional_cos, conditional_sin,
+                )
+            else:
+                layer_out = layer(
+                    full_hidden_states=full_hidden_states,
+                    full_attention_mask=full_attention_mask,
+                    conditional_hidden_states=conditional_hidden_states,
+                    conditional_attention_mask=conditional_attention_mask,
+                    full_cos=full_cos, full_sin=full_sin,
+                    conditional_cos=conditional_cos, conditional_sin=conditional_sin,
+                )
+            # full_hidden_states = layer_out["full_hidden_states"]
+            # conditional_hidden_states = layer_out["conditional_hidden_states"]
+            full_hidden_states, conditional_hidden_states = layer_out
         full_hidden_states = self.norm(full_hidden_states)
         conditional_hidden_states = self.norm(conditional_hidden_states)
         output = {
@@ -237,10 +265,11 @@ class LLaMALayer(nn.Module):
             self.post_attention_layernorm(conditional_hidden_states))
         check_nan(full_hidden_states)
         check_nan(conditional_hidden_states)
-        return {
-            "full_hidden_states": full_hidden_states,
-            "conditional_hidden_states": conditional_hidden_states,
-        }
+        # return {
+        #     "full_hidden_states": full_hidden_states,
+        #     "conditional_hidden_states": conditional_hidden_states,
+        # }
+        return full_hidden_states, conditional_hidden_states
 
 
 class MLP(nn.Module):
@@ -400,6 +429,7 @@ class Attention(nn.Module):
                 batch_size, full_seq_len, hidden_dim,
             )
             conditional_attn_output = self.o_proj(conditional_attn_output)
+            check_nan(conditional_attn_output)
         elif self.train_config.peft_mode == PEFT_PREFIX_ADAPTER:
             conditional_scores = torch.matmul(
                 conditional_query_states,
@@ -420,18 +450,21 @@ class Attention(nn.Module):
             )
             # [batch_size, num_blocks, num_heads, block_size, num_prefix_tokens]
             adapter_attn_weights = F.softmax(adapter_scores.float(), dim=-1).type_as(adapter_scores)
+            # [batch_size=1, num_blocks=1, num_heads, block_size=1, head_dim=1]
+            gate = F.tanh(self.adapter_gates.view(1, 1, -1, 1, 1).to(full_hidden_states.dtype))
             # [batch_size, num_blocks, num_heads, block_size, head_dim]
-            adapter_attn_output = self.adapter_gates.view(1, 1, -1, 1, 1) * torch.matmul(
+            adapter_attn_output = gate * torch.matmul(
                 adapter_attn_weights,
                 prefix_v.type_as(conditional_query_states),
             )
             # [batch_size, num_blocks, num_heads, block_size, head_dim]
             conditional_attn_output += adapter_attn_output
             # [batch_size, num_heads, full_seq_len, head_dim]
-            conditional_attn_output = conditional_attn_output.transpose(1, 2).contiguous().view(
+            conditional_attn_output = conditional_attn_output.transpose(2, 3).contiguous().view(
                 batch_size, full_seq_len, hidden_dim,
             )
             conditional_attn_output = self.o_proj(conditional_attn_output)
+            check_nan(conditional_attn_output)
         elif self.train_config.peft_mode == PEFT_NO:
             conditional_attn_output = full_attn_output
         else:
@@ -559,6 +592,20 @@ def create_model(model_name, hf_path, train_config: TrainConfig, use_8bit=False,
         config = dataclasses.replace(config, use_8bit=True)
         with init_empty_weights():
             model = LLaMAModel(config=config, train_config=train_config)
+
+        for layer_i in range(config.n_layers):
+            model.model.layers[layer_i].self_attn.rotary_emb.cos_cached = \
+                model.model.layers[layer_i].self_attn.rotary_emb.cos_cached.to(device)
+            model.model.layers[layer_i].self_attn.rotary_emb.sin_cached = \
+                model.model.layers[layer_i].self_attn.rotary_emb.sin_cached.to(device)
+            model.model.layers[layer_i].self_attn.k_compressor.to_empty(device=device)
+            model.model.layers[layer_i].self_attn.k_compressor.init_weights()
+            model.model.layers[layer_i].self_attn.v_compressor.to_empty(device=device)
+            model.model.layers[layer_i].self_attn.v_compressor.init_weights()
+            if train_config.peft_mode == PEFT_PREFIX_ADAPTER:
+                model.model.layers[layer_i].self_attn.adapter_gates.to_empty(device=device)
+                model.model.layers[layer_i].self_attn.adapter_gates.weight.zeros_()
+
         state_keys = set(model.state_dict())
         filename_list = sorted(list(set(weight_map.values())))
         for filename in tqdm.tqdm(filename_list):
@@ -571,27 +618,27 @@ def create_model(model_name, hf_path, train_config: TrainConfig, use_8bit=False,
                         layer_i = int(k.split(".")[2])
                         # noinspection PyTypeChecker
                         model.load_state_dict({
-                            f"model.layers.{layer_i}.self_attn.k_compressor.sub_k_proj.weight": v
+                            f"model.layers.{layer_i}.self_attn.k_compressor.sub_k_proj.weight": v.clone(),
                         }, strict=False)
                         state_keys.remove(f"model.layers.{layer_i}.self_attn.k_compressor.sub_k_proj.weight")
                     if "self_attn.v_proj" in k:
                         layer_i = int(k.split(".")[2])
                         # noinspection PyTypeChecker
                         model.load_state_dict({
-                            f"model.layers.{layer_i}.self_attn.v_compressor.sub_k_proj.weight": v
+                            f"model.layers.{layer_i}.self_attn.v_compressor.sub_k_proj.weight": v.clone(),
                         }, strict=False)
                         state_keys.remove(f"model.layers.{layer_i}.self_attn.v_compressor.sub_k_proj.weight")
                     if "self_attn.q_proj" in k:
                         layer_i = int(k.split(".")[2])
                         # noinspection PyTypeChecker
                         model.load_state_dict({
-                            f"model.layers.{layer_i}.self_attn.k_compressor.sub_q_proj.weight": v,
-                            f"model.layers.{layer_i}.self_attn.v_compressor.sub_q_proj.weight": v,
+                            f"model.layers.{layer_i}.self_attn.k_compressor.sub_q_proj.weight": v.clone(),
+                            f"model.layers.{layer_i}.self_attn.v_compressor.sub_q_proj.weight": v.clone(),
                         }, strict=False)
                         state_keys.remove(f"model.layers.{layer_i}.self_attn.k_compressor.sub_q_proj.weight")
                         state_keys.remove(f"model.layers.{layer_i}.self_attn.v_compressor.sub_q_proj.weight")
 
-        assert not state_keys
+        # assert not state_keys
     else:
         # noinspection PyUnresolvedReferences
         torch.set_default_tensor_type(torch.cuda.HalfTensor)
@@ -605,17 +652,17 @@ def create_model(model_name, hf_path, train_config: TrainConfig, use_8bit=False,
                     if "self_attn.k_proj" in k:
                         layer_i = int(k.split(".")[2])
                         new_k = f"model.layers.{layer_i}.self_attn.k_compressor.sub_k_proj.weight"
-                        loaded[new_k] = v
+                        loaded[new_k] = v.clone()
                     if "self_attn.v_proj" in k:
                         layer_i = int(k.split(".")[2])
                         new_k = f"model.layers.{layer_i}.self_attn.v_compressor.sub_k_proj.weight"
-                        loaded[new_k] = v
+                        loaded[new_k] = v.clone()
                     if "self_attn.q_proj" in k:
                         layer_i = int(k.split(".")[2])
                         new_k = f"model.layers.{layer_i}.self_attn.k_compressor.sub_q_proj.weight"
-                        loaded[new_k] = v
+                        loaded[new_k] = v.clone()
                         new_k = f"model.layers.{layer_i}.self_attn.v_compressor.sub_q_proj.weight"
-                        loaded[new_k] = v
+                        loaded[new_k] = v.clone()
             model.load_state_dict(loaded, strict=False)
             for k in loaded:
                 state_keys.remove(k)
@@ -629,6 +676,13 @@ def create_model(model_name, hf_path, train_config: TrainConfig, use_8bit=False,
             p.requires_grad = True
         else:
             p.requires_grad = False
+
+    for layer_i in range(config.n_layers):
+        model.model.layers[layer_i].self_attn.k_compressor.float()
+        model.model.layers[layer_i].self_attn.v_compressor.float()
+        if train_config.peft_mode == PEFT_PREFIX_ADAPTER:
+            model.model.layers[layer_i].self_attn.adapter_gates = nn.Parameter(
+                model.model.layers[layer_i].self_attn.adapter_gates.float())
 
     return model
 
@@ -686,9 +740,19 @@ class Compressor(nn.Module):
             self.embed = nn.Embedding(train_config.num_prefix_tokens, config.dim)
             self.sub_q_proj = nn.Linear(config.dim, config.dim, bias=False)
             self.sub_k_proj = nn.Linear(config.dim, config.dim, bias=False)
+            self.sub_q_proj.weight.data.normal_(mean=0.0, std=0.02)
+            self.sub_k_proj.weight.data.normal_(mean=0.0, std=0.02)
         else:
             self.a_proj = nn.Linear(config.dim, config.n_heads * train_config.num_prefix_tokens, bias=False)
+            self.a_proj.weight.data.normal_(mean=0.0, std=0.02)
         self.head_dim = config.dim // config.n_heads
+
+    def init_weights(self):
+        if self.train_config.factorized_compressor:
+            self.sub_q_proj.weight.data.normal_(mean=0.0, std=0.02)
+            self.sub_k_proj.weight.data.normal_(mean=0.0, std=0.02)
+        else:
+            self.a_proj.weight.data.normal_(mean=0.0, std=0.02)
 
     def forward(self, hidden_states, past_kvs):
         """
@@ -704,8 +768,10 @@ class Compressor(nn.Module):
             num_blocks=num_blocks,
             block_size=self.train_config.block_size,
             seq_len=seq_len,
-            dtype=self.config.dtype,
+            dtype=torch.float16,
         ).to(device)
+        hidden_states = hidden_states.float()
+        past_kvs = past_kvs.float()
 
         if self.train_config.factorized_compressor:
             num_prefix_tokens = self.train_config.num_prefix_tokens
@@ -739,7 +805,8 @@ class Compressor(nn.Module):
         )
         # [batch_size, num_blocks, num_heads, num_prefix_tokens, head_dim]
         attn_output = torch.matmul(blocked_attn_weights, blocked_past_kvs)
-        return attn_output
+        check_nan(attn_output)
+        return attn_output.to(hidden_states.dtype)
 
 
 def apply_attn(q, k, v, causal_attention_mask=None):

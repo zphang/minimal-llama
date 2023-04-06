@@ -52,7 +52,7 @@ def main():
 
     ds = datasets.Dataset.from_dict({"input_ids": all_tokenized})
     ds.save_to_disk(args.save_path)
-    print(f"Generated {arr.shape[0]} samples.")
+    print(f"Generated {len(all_tokenized)} samples.")
 
 
 if __name__ == "__main__":
