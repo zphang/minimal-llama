@@ -8,13 +8,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import bitsandbytes as bnb
 from accelerate import init_empty_weights
-from typing import Union
 
 import proj_shared.io_utils as io_utils
 from transformers.utils.bitsandbytes import set_module_8bit_tensor_to_device
 
 PEFT_PREFIX = "prefix"
 PEFT_PREFIX_ADAPTER = "prefix_adapter"
+PEFT_NO = "nothing"
 
 
 @dataclasses.dataclass
@@ -52,6 +52,7 @@ class TrainConfig:
     num_prefix_tokens: int = None
     block_size: int = 64
     factorized_compressor: bool = True
+    adapter_gate_mode: str = "fixed"
 
     def check(self):
         assert self.peft_mode in (
@@ -68,10 +69,12 @@ class LLaMAModel(nn.Module):
         self.lm_head = NoInitLinear(config.dim, config.vocab_size, bias=False, dtype=config.dtype)
 
     def forward(self,
-                input_ids):
+                input_ids,
+                output_full=False):
         """Forward pass (with full decode sequence, intended for training or loss-scoring)
 
         :param input_ids: [batch_size, seq_len]
+        :param output_full:
         :return: logits [batch_size, seq_len]
         """
         block_size = self.train_config.block_size
@@ -82,21 +85,26 @@ class LLaMAModel(nn.Module):
         # [batch_size, num_heads=1, q_len=seq_len, kv_len=seq_len]
         full_attention_mask = create_attention_mask(input_ids=input_ids, dtype=self.config.dtype)
         full_rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
-        full_cos, full_sin = self.get_cos_sin(full_rope_embed_ids)[None, None, :, :]
+        full_cos, full_sin = self.get_cos_sin(full_rope_embed_ids)
+        full_cos, full_sin = full_cos[:, None, :, :], full_sin[:, None, :, :]
 
         # 1.2) Create conditional masks and rope embeds
         conditional_attention_mask = create_attention_mask(input_ids=input_ids[:, :block_size], dtype=self.config.dtype)
         if self.train_config.peft_mode == PEFT_PREFIX:
-            num_prefix_tokens = self.peft_config.num_prefix_tokens
+            num_prefix_tokens = self.train_config.num_prefix_tokens
             conditional_attention_mask = torch.cat([
                 zeros_like([1, 1, block_size, num_prefix_tokens], tensor=conditional_attention_mask),
                 conditional_attention_mask,
             ], dim=3)[None]
         # Assume fully packed
         # [1, block_size*num_blocks=seq_len]
-        conditional_rope_embed_ids = torch.arange(num_blocks)[None, :].expand(block_size, num_blocks)[None]
+        conditional_rope_embed_ids = torch.arange(block_size)[None, :].expand(num_blocks, block_size)
         conditional_rope_embed_ids = conditional_rope_embed_ids.long().to(device)
-        conditional_cos, conditional_sin = self.get_cos_sin(conditional_rope_embed_ids)[None, None, None, :, :]
+        conditional_cos, conditional_sin = self.get_cos_sin(conditional_rope_embed_ids)
+        conditional_cos, conditional_sin = (
+            conditional_cos[None, :, None, :, :],
+            conditional_sin[None, :, None, :, :],
+        )
 
         # 2) Forward pass
         # [batch_size, seq_len, hidden_dim]
@@ -108,8 +116,15 @@ class LLaMAModel(nn.Module):
             conditional_cos=conditional_cos, conditional_sin=conditional_sin,
         )
         # [batch_size, seq_len, vocab_size]
-        logits = self.lm_head(model_out["full_hidden_states"])
-        return logits
+        logits = self.lm_head(model_out["conditional_hidden_states"])
+        if output_full:
+            full_logits = self.lm_head(model_out["full_hidden_states"])
+            return {
+                "logits": logits,
+                "full_logits": full_logits,
+            }
+        else:
+            return logits
 
     def get_cos_sin(self, rope_embed_ids):
         cos = F.embedding(
@@ -210,8 +225,8 @@ class LLaMALayer(nn.Module):
             conditional_cos=conditional_cos, conditional_sin=conditional_sin,
         )
         # [batch_size, seq_len, hidden_dim]
-        full_hidden_states = normed_full_hidden_states + raw_self_attn_output["full_attn_output"]
-        conditional_hidden_states = normed_conditional_hidden_states + raw_self_attn_output["conditional_attn_output"]
+        full_hidden_states = full_hidden_states + raw_self_attn_output["full_attn_output"]
+        conditional_hidden_states = conditional_hidden_states + raw_self_attn_output["conditional_attn_output"]
         check_nan(full_hidden_states)
         check_nan(conditional_hidden_states)
         # 2) FFN
@@ -274,7 +289,7 @@ class Attention(nn.Module):
         self.train_config = train_config
         self.n_heads = config.n_heads
         self.head_dim = config.dim // config.n_heads
-        self.block_size = self.trian_config.block_size
+        self.block_size = self.train_config.block_size
 
         if config.use_8bit:
             self.q_proj = NoInit8bitLinear(config.dim, config.dim, bias=False, threshold=6.0, has_fp16_weights=False)
@@ -287,8 +302,20 @@ class Attention(nn.Module):
             self.v_proj = NoInitLinear(config.dim, config.dim, bias=False, dtype=config.dtype)
             self.o_proj = NoInitLinear(config.dim, config.dim, bias=False, dtype=config.dtype)
         self.rotary_emb = RotaryEmbedding(dim=self.head_dim)
-        self.k_compressor = Compressor(config=config, train_config=train_config)
-        self.v_compressor = Compressor(config=config, train_config=train_config)
+
+        if self.train_config.peft_mode in (PEFT_PREFIX, PEFT_PREFIX_ADAPTER):
+            self.k_compressor = Compressor(config=config, train_config=train_config)
+            self.v_compressor = Compressor(config=config, train_config=train_config)
+        elif self.train_config.peft_mode == PEFT_NO:
+            pass
+        else:
+            raise KeyError(self.train_config.peft_mode)
+
+        if self.train_config.peft_mode == PEFT_PREFIX_ADAPTER:
+            if self.train_config.adapter_gate_mode == "fixed":
+                self.adapter_gates = nn.Parameter(torch.zeros(self.n_heads))
+            else:
+                raise KeyError(self.train_config.adapter_gate_mode)
 
     def forward(self,
                 full_hidden_states, full_attention_mask,
@@ -312,7 +339,7 @@ class Attention(nn.Module):
             cos=full_cos, sin=full_sin)
         full_scores = torch.matmul(
             full_query_states,
-            full_key_states.transpose(3, 2).type_as(full_query_states) / math.sqrt(self.head_dim)
+            full_key_states.transpose(-1, -2).type_as(full_query_states) / math.sqrt(self.head_dim)
         )
         full_scores += full_attention_mask
 
@@ -330,8 +357,13 @@ class Attention(nn.Module):
 
         # 2) Compute prefix
         # [batch_size, num_heads, num_blocks, num_prefix_tokens, head_dim]
-        prefix_k = self.k_compressor(hidden_states=full_hidden_states, past_kvs=full_key_states)
-        prefix_v = self.v_compressor(hidden_states=full_hidden_states, past_kvs=full_value_states)
+        if self.train_config.peft_mode in (PEFT_PREFIX, PEFT_PREFIX_ADAPTER):
+            prefix_k = self.k_compressor(hidden_states=full_hidden_states, past_kvs=full_key_states)
+            prefix_v = self.v_compressor(hidden_states=full_hidden_states, past_kvs=full_value_states)
+        elif self.train_config.peft_mode == PEFT_NO:
+            pass
+        else:
+            raise KeyError(self.train_config.peft_mode)
         # ====
 
         # 3) Compute conditional LM
@@ -346,25 +378,64 @@ class Attention(nn.Module):
             conditional_query_states, conditional_key_states,
             cos=conditional_cos, sin=conditional_sin,
         )
-        # [batch_size, num_blocks, num_heads, num_prefix_tokens+block_size, head_dim]
-        conditional_key_states = torch.cat([prefix_k, conditional_key_states], dim=-2)
-        conditional_value_states = torch.cat([prefix_v, conditional_value_states], dim=-2)
-        # [batch_size, num_blocks, num_heads, block_size, num_prefix_tokens+block_size]
-        conditional_scores = torch.matmul(
-            conditional_query_states,
-            conditional_key_states.transpose(-1, -2).type_as(conditional_query_states) / math.sqrt(self.head_dim)
-        )
-        conditional_scores += conditional_attention_mask
-        # [batch_size, num_blocks, num_heads, block_size, num_prefix_tokens+block_size]
-        attn_weights = F.softmax(conditional_scores.float(), dim=-1).type_as(conditional_scores)
-        # [batch_size, num_blocks, num_heads, block_size, head_dim]
-        attn_output = torch.matmul(attn_weights, conditional_value_states.type_as(conditional_query_states))
-        # [batch_size, num_heads, full_seq_len, head_dim]
-        conditional_attn_output = attn_output.transpose(1, 2).contiguous().view(
-            batch_size, full_seq_len, hidden_dim,
-        )
-        conditional_attn_output = self.o_proj(conditional_attn_output)
-
+        if self.train_config.peft_mode == PEFT_PREFIX:
+            # [batch_size, num_blocks, num_heads, num_prefix_tokens+block_size, head_dim]
+            conditional_key_states = torch.cat([prefix_k, conditional_key_states], dim=-2)
+            conditional_value_states = torch.cat([prefix_v, conditional_value_states], dim=-2)
+            # [batch_size, num_blocks, num_heads, block_size, num_prefix_tokens+block_size]
+            conditional_scores = torch.matmul(
+                conditional_query_states,
+                conditional_key_states.transpose(-1, -2).type_as(conditional_query_states) / math.sqrt(self.head_dim)
+            )
+            conditional_scores += conditional_attention_mask
+            # [batch_size, num_blocks, num_heads, block_size, num_prefix_tokens+block_size]
+            conditional_attn_weights = F.softmax(conditional_scores.float(), dim=-1).type_as(conditional_scores)
+            # [batch_size, num_blocks, num_heads, block_size, head_dim]
+            conditional_attn_output = torch.matmul(
+                conditional_attn_weights,
+                conditional_value_states.type_as(conditional_query_states),
+            )
+            # [batch_size, num_heads, full_seq_len, head_dim]
+            conditional_attn_output = conditional_attn_output.transpose(2, 3).contiguous().view(
+                batch_size, full_seq_len, hidden_dim,
+            )
+            conditional_attn_output = self.o_proj(conditional_attn_output)
+        elif self.train_config.peft_mode == PEFT_PREFIX_ADAPTER:
+            conditional_scores = torch.matmul(
+                conditional_query_states,
+                conditional_key_states.transpose(-1, -2).type_as(conditional_query_states) / math.sqrt(self.head_dim)
+            )
+            conditional_scores += conditional_attention_mask
+            # [batch_size, num_blocks, num_heads, block_size, num_prefix_tokens+block_size]
+            conditional_attn_weights = F.softmax(conditional_scores.float(), dim=-1).type_as(conditional_scores)
+            # [batch_size, num_blocks, num_heads, block_size, head_dim]
+            conditional_attn_output = torch.matmul(
+                conditional_attn_weights,
+                conditional_value_states.type_as(conditional_query_states),
+            )
+            # [batch_size, num_blocks, num_heads, block_size, num_prefix_tokens]
+            adapter_scores = torch.matmul(
+                conditional_query_states,
+                prefix_k.transpose(-1, -2).type_as(conditional_query_states) / math.sqrt(self.head_dim)
+            )
+            # [batch_size, num_blocks, num_heads, block_size, num_prefix_tokens]
+            adapter_attn_weights = F.softmax(adapter_scores.float(), dim=-1).type_as(adapter_scores)
+            # [batch_size, num_blocks, num_heads, block_size, head_dim]
+            adapter_attn_output = self.adapter_gates.view(1, 1, -1, 1, 1) * torch.matmul(
+                adapter_attn_weights,
+                prefix_v.type_as(conditional_query_states),
+            )
+            # [batch_size, num_blocks, num_heads, block_size, head_dim]
+            conditional_attn_output += adapter_attn_output
+            # [batch_size, num_heads, full_seq_len, head_dim]
+            conditional_attn_output = conditional_attn_output.transpose(1, 2).contiguous().view(
+                batch_size, full_seq_len, hidden_dim,
+            )
+            conditional_attn_output = self.o_proj(conditional_attn_output)
+        elif self.train_config.peft_mode == PEFT_NO:
+            conditional_attn_output = full_attn_output
+        else:
+            raise KeyError(self.train_config.peft_mode)
         return {
             "full_attn_output": full_attn_output,
             "conditional_attn_output": conditional_attn_output,
@@ -387,20 +458,7 @@ class RotaryEmbedding(torch.nn.Module):
         self.sin_cached = emb.sin()[None, None, :, :]
 
     def forward(self, x, seq_len=None):
-        # x: [bs, num_attention_heads, seq_len, head_size]
-        # This `if` block is unlikely to be run after we build sin/cos in `__init__`. Keep the logic here just in case.
-        if seq_len > self.max_seq_len_cached:
-            self.max_seq_len_cached = seq_len
-            t = torch.arange(self.max_seq_len_cached, device=x.device).to(self.inv_freq.dtype)
-            freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-            # Different from paper, but it uses a different permutation in order to obtain the same calculation
-            emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
-            self.cos_cached = emb.cos()[None, None, :, :].to(dtype=x.dtype)
-            self.sin_cached = emb.sin()[None, None, :, :].to(dtype=x.dtype)
-        return (
-            self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype, device=x.device),
-            self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype, device=x.device),
-        )
+        raise NotImplementedError()
 
 
 def rotate_half(x):
@@ -508,6 +566,31 @@ def create_model(model_name, hf_path, train_config: TrainConfig, use_8bit=False,
             for k, v in loaded.items():
                 set_module_8bit_tensor_to_device(model, tensor_name=k, device=device, value=v)
                 state_keys.remove(k)
+                if train_config.factorized_compressor:
+                    if "self_attn.k_proj" in k:
+                        layer_i = int(k.split(".")[2])
+                        # noinspection PyTypeChecker
+                        model.load_state_dict({
+                            f"model.layers.{layer_i}.self_attn.k_compressor.sub_k_proj.weight": v
+                        }, strict=False)
+                        state_keys.remove(f"model.layers.{layer_i}.self_attn.k_compressor.sub_k_proj.weight")
+                    if "self_attn.v_proj" in k:
+                        layer_i = int(k.split(".")[2])
+                        # noinspection PyTypeChecker
+                        model.load_state_dict({
+                            f"model.layers.{layer_i}.self_attn.v_compressor.sub_k_proj.weight": v
+                        }, strict=False)
+                        state_keys.remove(f"model.layers.{layer_i}.self_attn.v_compressor.sub_k_proj.weight")
+                    if "self_attn.q_proj" in k:
+                        layer_i = int(k.split(".")[2])
+                        # noinspection PyTypeChecker
+                        model.load_state_dict({
+                            f"model.layers.{layer_i}.self_attn.k_compressor.sub_q_proj.weight": v,
+                            f"model.layers.{layer_i}.self_attn.v_compressor.sub_q_proj.weight": v,
+                        }, strict=False)
+                        state_keys.remove(f"model.layers.{layer_i}.self_attn.k_compressor.sub_q_proj.weight")
+                        state_keys.remove(f"model.layers.{layer_i}.self_attn.v_compressor.sub_q_proj.weight")
+
         assert not state_keys
     else:
         # noinspection PyUnresolvedReferences
@@ -517,11 +600,35 @@ def create_model(model_name, hf_path, train_config: TrainConfig, use_8bit=False,
         state_keys = set(model.state_dict())
         for filename in tqdm.tqdm(filename_list):
             loaded = torch.load(os.path.join(hf_path, filename), map_location="cpu")
+            if train_config.factorized_compressor:
+                for k, v in list(loaded.items()):
+                    if "self_attn.k_proj" in k:
+                        layer_i = int(k.split(".")[2])
+                        new_k = f"model.layers.{layer_i}.self_attn.k_compressor.sub_k_proj.weight"
+                        loaded[new_k] = v
+                    if "self_attn.v_proj" in k:
+                        layer_i = int(k.split(".")[2])
+                        new_k = f"model.layers.{layer_i}.self_attn.v_compressor.sub_k_proj.weight"
+                        loaded[new_k] = v
+                    if "self_attn.q_proj" in k:
+                        layer_i = int(k.split(".")[2])
+                        new_k = f"model.layers.{layer_i}.self_attn.k_compressor.sub_q_proj.weight"
+                        loaded[new_k] = v
+                        new_k = f"model.layers.{layer_i}.self_attn.v_compressor.sub_q_proj.weight"
+                        loaded[new_k] = v
             model.load_state_dict(loaded, strict=False)
             for k in loaded:
                 state_keys.remove(k)
 
-    # TODO: Load weights into factorized compressor
+    print(f"Not loaded: {state_keys}")
+
+    for n, p in model.named_parameters():
+        if "_compressor" in n:
+            p.requires_grad = True
+        elif ".adapter_gates" in n:
+            p.requires_grad = True
+        else:
+            p.requires_grad = False
 
     return model
 
@@ -598,7 +705,7 @@ class Compressor(nn.Module):
             block_size=self.train_config.block_size,
             seq_len=seq_len,
             dtype=self.config.dtype,
-        )
+        ).to(device)
 
         if self.train_config.factorized_compressor:
             num_prefix_tokens = self.train_config.num_prefix_tokens
@@ -618,19 +725,19 @@ class Compressor(nn.Module):
             a_projector = a_projector.view(
                 batch_size, seq_len, self.config.n_heads, self.train_config.num_prefix_tokens,
             ).permute(0, 2, 3, 1)
-        # [batch_size, num_heads, num_blocks, num_prefix_tokens, seq_len]
-        blocked_a_projector = a_projector[:, :, None, :, :].expand(
-            batch_size, self.config.n_heads, num_blocks, self.train_config.num_prefix_tokens, seq_len,
+        # [batch_size, num_blocks, num_heads, num_prefix_tokens, seq_len]
+        blocked_a_projector = a_projector[:, None, :, :, :].expand(
+            batch_size, num_blocks, self.config.n_heads, self.train_config.num_prefix_tokens, seq_len,
         )
-        # [batch_size, num_heads, num_blocks, num_prefix_tokens, seq_len]
+        # [batch_size, num_blocks, num_heads, num_prefix_tokens, seq_len]
         blocked_scores = blocked_a_projector + block_attn_mask
-        # [batch_size, num_heads, num_blocks, num_prefix_tokens, seq_len]
+        # [batch_size, num_blocks, num_heads, num_prefix_tokens, seq_len]
         blocked_attn_weights = softmax(blocked_scores)
-        # [batch_size, num_heads, num_blocks, seq_len, head_dim]
-        blocked_past_kvs = past_kvs[:, :, None, :, :].expand(
-            batch_size, self.config.n_heads, num_blocks, seq_len, self.head_dim,
+        # [batch_size, num_blocks, num_heads, seq_len, head_dim]
+        blocked_past_kvs = past_kvs[:, None, :, :, :].expand(
+            batch_size, num_blocks, self.config.n_heads, seq_len, self.head_dim,
         )
-        # [batch_size, num_heads, num_blocks, num_prefix_tokens, head_dim]
+        # [batch_size, num_blocks, num_heads, num_prefix_tokens, head_dim]
         attn_output = torch.matmul(blocked_attn_weights, blocked_past_kvs)
         return attn_output
 
@@ -684,13 +791,13 @@ def create_black_attention_mask(num_blocks: int,
     :param block_size:
     :param seq_len:
     :param dtype:
-    :return: [batch_size=1, num_heads=1, num_blocks, num_prefix_tokens=1, seq_len]
+    :return: [batch_size=1, num_blocks, num_heads=1, num_prefix_tokens=1, seq_len]
     """
     assert seq_len == num_blocks * block_size
     # noinspection PyTypeChecker
     base_mask = torch.tril(torch.ones([num_blocks, num_blocks], dtype=bool))
     mask = base_mask[:, :, None].expand(num_blocks, num_blocks, block_size).reshape(num_blocks, seq_len)
-    mask = convert_mask_to_soft_mask(mask, dtype)[None, None, :, None, :]
+    mask = convert_mask_to_soft_mask(mask, dtype)[None, :, None, None, :]
     return mask
 
 
