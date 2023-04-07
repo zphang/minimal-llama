@@ -1,5 +1,7 @@
 import argparse
 import json
+import os
+
 import numpy as np
 import random
 import tqdm.auto as tqdm
@@ -28,7 +30,9 @@ def main():
     parser.add_argument("--data_format", type=str, default="jsonl")
     parser.add_argument("--save_path", type=str)
     parser.add_argument("--max_seq_length", type=int, default=2048)
+    parser.add_argument("--shard_size", type=int, default=100000)
     args = parser.parse_args()
+    os.makedirs(args.save_path, exist_ok=True)
 
     tokenizer = transformers.LlamaTokenizer.from_pretrained(args.tokenizer_path)
 
@@ -40,6 +44,8 @@ def main():
     else:
         raise KeyError(args.data_format)
 
+    total = 0
+    shards = 0
     for elem in tqdm.tqdm(reader):
         text = elem["text"] if args.data_format == "jsonl" else elem
         tokenized = tokenizer.encode(text)
@@ -49,10 +55,18 @@ def main():
                 j * args.max_seq_length: (j + 1) * args.max_seq_length
             ]
             all_tokenized.append(chunk)
+            total += 1
+            if len(all_tokenized) == args.shard_size:
+                ds = datasets.Dataset.from_dict({"input_ids": all_tokenized})
+                ds.save_to_disk(os.path.join(args.save_path, "shard_{:05d}".format(shards)))
+                all_tokenized = []
+                shards += 1
 
-    ds = datasets.Dataset.from_dict({"input_ids": all_tokenized})
-    ds.save_to_disk(args.save_path)
-    print(f"Generated {len(all_tokenized)} samples.")
+    if len(all_tokenized) > 0:
+        ds = datasets.Dataset.from_dict({"input_ids": all_tokenized})
+        ds.save_to_disk(os.path.join(args.save_path, "shard_{:05d}".format(shards)))
+
+    print(f"Generated {total} samples in {shards} shards.")
 
 
 if __name__ == "__main__":
