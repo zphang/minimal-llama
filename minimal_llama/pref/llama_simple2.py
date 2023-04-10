@@ -179,7 +179,7 @@ class LLaMAModel(nn.Module):
             #     value = [batch_size, num_heads, kv_seq_len=decode_step+1, head_dim]
             #   )]
             # )
-            rope_embed_ids = create_rope_embed_ids(input_ids=input_ids) + num_valid_tokens
+            rope_embed_ids = create_rope_embed_ids(input_ids=input_ids) + num_valid_tokens[:, None]
             cos, sin = self.get_cos_sin(rope_embed_ids)
             model_out = self.model(
                 input_ids=input_ids,
