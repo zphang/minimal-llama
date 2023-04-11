@@ -105,6 +105,8 @@ class LLaMAModel(nn.Module):
         cos, sin = self.get_cos_sin(rope_embed_ids)
         cos, sin = cos[:, None, :, :], sin[:, None, :, :]
 
+        compress_mask = convert_mask_to_soft_mask(input_ids != self.config.pad_token_id, dtype=self.config.dtype)
+
         # 2) Forward pass
         # [batch_size, seq_len, hidden_dim]
         model_out = self.model(
@@ -112,6 +114,7 @@ class LLaMAModel(nn.Module):
             attention_mask=attention_mask,
             cos=cos, sin=sin,
             forward_mode=FORWARD_COMPRESS,
+            compress_mask=compress_mask,
         )
         return model_out
 
@@ -270,12 +273,12 @@ class LLaMAModel(nn.Module):
         input_ids = generated_token_ids
 
         # 2.1 shift KV cache
+        print(num_valid_kv_cache)
         for layer_kv_cache in kv_cache:
-            for i in range(batch_size):
-                layer_kv_cache["key"] = shift_kv_cache_right(
-                    layer_kv_cache["key"], num_valid_tokens=num_valid_kv_cache)
-                layer_kv_cache["value"] = shift_kv_cache_right(
-                    layer_kv_cache["value"], num_valid_tokens=num_valid_kv_cache)
+            layer_kv_cache["key"] = shift_kv_cache_right(
+                layer_kv_cache["key"], num_valid_tokens=num_valid_kv_cache)
+            layer_kv_cache["value"] = shift_kv_cache_right(
+                layer_kv_cache["value"], num_valid_tokens=num_valid_kv_cache)
 
         # 3) Subsequent steps
         for decode_step in range(generation_length-1):
@@ -343,7 +346,8 @@ class LLaMAInnerModel(nn.Module):
                 cos, sin,
                 kv_cache=None,
                 peft_params=None,
-                forward_mode=FORWARD_PEFT):
+                forward_mode=FORWARD_PEFT,
+                compress_mask=None):
         """
         :param input_ids: [batch_size, seq_len]
         :param attention_mask: [batch_size=1, num_heads=1, seq_len, seq_len]
@@ -353,6 +357,7 @@ class LLaMAInnerModel(nn.Module):
             We use the presence of kv_cache to determine if we're generating
         :param peft_params
         :param forward_mode
+        :param compress_mask
         """
         hidden_states = self.embed_tokens(input_ids)
 
@@ -375,6 +380,7 @@ class LLaMAInnerModel(nn.Module):
                 cos=cos, sin=sin,
                 forward_mode=forward_mode,
                 peft_params=peft_params[layer_i] if peft_params else None,
+                compress_mask=compress_mask,
             )
             hidden_states = layer_out["hidden_states"]
             if kv_cache:
@@ -408,6 +414,7 @@ class LLaMALayer(nn.Module):
         kv_cache=None,
         forward_mode=FORWARD_PEFT,
         peft_params=None,
+        compress_mask=None,
     ):
         # 1) Self-attention
         # [batch_size, seq_len, hidden_dim]
@@ -427,6 +434,7 @@ class LLaMALayer(nn.Module):
             cos=cos, sin=sin,
             forward_mode=forward_mode,
             peft_params=peft_params,
+            compress_mask=compress_mask,
         )
         # [batch_size, seq_len, hidden_dim]
         hidden_states = hidden_states + raw_self_attn_output["attn_output"]
@@ -505,7 +513,7 @@ class Attention(nn.Module):
                     raise KeyError(self.downstream_config.adapter_gate_mode)
 
     def forward(self, hidden_states, attention_mask, cos, sin, kv_cache=None,
-                forward_mode=FORWARD_PEFT, peft_params=None):
+                forward_mode=FORWARD_PEFT, peft_params=None, compress_mask=None):
         """
         precomputed_kv_hidden_states is for init (pre-compute KV activations, e.g. for added prefixes)
         kv_cache is for generation (cached past KV)
@@ -525,7 +533,7 @@ class Attention(nn.Module):
             key_states = torch.cat([kv_cache["key"], key_states], dim=2)
             value_states = torch.cat([kv_cache["value"], value_states], dim=2)
         elif forward_mode == FORWARD_PEFT and self.downstream_config.peft_mode == PEFT_PREFIX:
-            # Not generation/Forward Mode (not cache), PEFT mode and PEFT prefix
+            # Forward Mode (no cache=not generation), PEFT mode and PEFT prefix
             key_states = torch.cat([peft_params["key"], key_states], dim=2)
             value_states = torch.cat([peft_params["value"], value_states], dim=2)
 
@@ -574,11 +582,20 @@ class Attention(nn.Module):
             self.k_compressor.train_config.block_size = q_seq_len
             self.v_compressor.train_config.block_size = q_seq_len
 
-            # [batch_size, num_heads, num_blocks, num_prefix_tokens, head_dim]
+            # [batch_size, num_heads, num_prefix_tokens, head_dim]
             if self.downstream_config.peft_mode in (PEFT_PREFIX, PEFT_PREFIX_ADAPTER):
+                # [:, 0] indexes out the num_blocks dimension
                 peft_dict = {
-                    "key": self.k_compressor(hidden_states=hidden_states, past_kvs=key_states)[:, 0],
-                    "value": self.v_compressor(hidden_states=hidden_states, past_kvs=value_states)[:, 0],
+                    "key": self.k_compressor(
+                        hidden_states=hidden_states,
+                        past_kvs=key_states,
+                        compress_mask=compress_mask,
+                    )[:, 0],
+                    "value": self.v_compressor(
+                        hidden_states=hidden_states,
+                        past_kvs=value_states,
+                        compress_mask=compress_mask,
+                    )[:, 0],
                 }
                 if self.downstream_config.peft_mode == PEFT_PREFIX_ADAPTER:
                     peft_dict["gate"] = F.tanh(self.adapter_gates.to(hidden_states.dtype))

@@ -102,7 +102,7 @@ class LLaMAModel(nn.Module):
                 conditional_attention_mask,
             ], dim=3)[None]
         # Assume fully packed
-        # [1, block_size*num_blocks=seq_len]
+        # [num_blocks, block_size]
         conditional_rope_embed_ids = torch.arange(block_size)[None, :].expand(num_blocks, block_size)
         conditional_rope_embed_ids = conditional_rope_embed_ids.long().to(device)
         conditional_cos, conditional_sin = self.get_cos_sin(conditional_rope_embed_ids)
@@ -180,8 +180,6 @@ class LLaMAInnerModel(nn.Module):
         """
         full_hidden_states = self.embed_tokens(input_ids)
         conditional_hidden_states = full_hidden_states.detach().clone()
-        if self.config.gradient_checkpointing:
-            conditional_hidden_states.requires_grad_(True)
         for layer_i, layer in enumerate(self.layers):
             if self.config.gradient_checkpointing:
                 layer_out = torch.utils.checkpoint.checkpoint(
@@ -385,7 +383,7 @@ class Attention(nn.Module):
         # ====
 
         # 2) Compute prefix
-        # [batch_size, num_heads, num_blocks, num_prefix_tokens, head_dim]
+        # [batch_size, num_blocks, num_heads, num_prefix_tokens, head_dim]
         if self.train_config.peft_mode in (PEFT_PREFIX, PEFT_PREFIX_ADAPTER):
             prefix_k = self.k_compressor(hidden_states=full_hidden_states, past_kvs=full_key_states)
             prefix_v = self.v_compressor(hidden_states=full_hidden_states, past_kvs=full_value_states)
@@ -754,21 +752,23 @@ class Compressor(nn.Module):
         else:
             self.a_proj.weight.data.normal_(mean=0.0, std=0.02)
 
-    def forward(self, hidden_states, past_kvs):
+    def forward(self, hidden_states, past_kvs, compress_mask=None):
         """
         :param hidden_states: [batch_size, seq_len, hidden_dim]
         :param past_kvs: [batch_size, n_heads, seq_len, head_dim]
+        :param compress_mask: [batch_size, seq_len]
+            Only used for inference compression. Soft mask.
         :return:
         """
         batch_size, seq_len, _ = hidden_states.shape
         num_blocks = seq_len // self.train_config.block_size
         device = hidden_states.device
         # [batch_size = 1, num_heads = 1, num_blocks, num_prefix_tokens = 1, seq_len]
-        block_attn_mask = create_black_attention_mask(
+        block_attn_mask = create_block_attention_mask(
             num_blocks=num_blocks,
             block_size=self.train_config.block_size,
             seq_len=seq_len,
-            dtype=torch.float16,
+            dtype=hidden_states.dtype,
         ).to(device)
         hidden_states = hidden_states.float()
         past_kvs = past_kvs.float()
@@ -797,6 +797,10 @@ class Compressor(nn.Module):
         )
         # [batch_size, num_blocks, num_heads, num_prefix_tokens, seq_len]
         blocked_scores = blocked_a_projector + block_attn_mask
+
+        if compress_mask is not None:
+            blocked_scores += compress_mask[:, None, None, None, :]
+
         # [batch_size, num_blocks, num_heads, num_prefix_tokens, seq_len]
         blocked_attn_weights = softmax(blocked_scores)
         # [batch_size, num_blocks, num_heads, seq_len, head_dim]
@@ -849,7 +853,7 @@ def softmax(scores, dim=-1):
     return F.softmax(scores.float(), dim=dim).type_as(scores)
 
 
-def create_black_attention_mask(num_blocks: int,
+def create_block_attention_mask(num_blocks: int,
                                 block_size: int,
                                 seq_len: int,
                                 dtype=torch.float16):
