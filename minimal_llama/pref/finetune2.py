@@ -19,6 +19,8 @@ from transformers import (
 )
 import minimal_llama.pref.llama_compress as llama_compress
 import minimal_llama.pref.data.p3 as p3_datasets
+import proj_shared.assets_utils as assets_utils
+import proj_shared.io_utils as io_utils
 
 
 @dataclass
@@ -29,7 +31,10 @@ class FinetuneArguments:
     model_name: str = field(default="7b")
     use_8bit: bool = field(default=False)
 
+    load_checkpoint: str = field(default=None)
+
     # p3_specific
+    p3_subset_name: str = field(default="t0_short")
 
 
 @dataclass
@@ -131,11 +136,11 @@ def main():
         dataset = datasets.load_from_disk(finetune_args.dataset_path)
         data_collator = c4_data_collator
     elif finetune_args.dataset_type == "p3":
-        subset = [
-            "ag_news_classify",
-            "cosmos_qa_context_answer_to_question",
-            "glue_mrpc_equivalent",
-        ]
+        if finetune_args.p3_subset_name == "t0_short":
+            subset_filename = "p3_t0_short_tasks.json"
+        else:
+            raise KeyError(finetune_args.p3_subset_name)
+        subset = io_utils.read_json(assets_utils.get_assets_path("subsets", subset_filename))
         dataset = p3_datasets.P3FewshotHyperTrainDataset(
             base_path=finetune_args.dataset_path,
             full_sequence_length=compress_args.max_sequence_length,
@@ -162,8 +167,16 @@ def main():
         use_8bit=finetune_args.use_8bit,
     )
     model.lm_head = CastOutputToFloat(model.lm_head)
-    # model.gradient_checkpointing_enable()
-    # model.enable_input_require_grads()
+
+    if finetune_args.load_checkpoint is not None:
+        print(f"Load checkpoint from: {finetune_args.load_checkpoint}")
+        checkpoint = torch.load(finetune_args.load_checkpoint)
+        load_output = model.load_state_dict(checkpoint, strict=False)
+        assert not load_output.unexpected_keys
+        print("Loaded")
+
+    model.gradient_checkpointing_enable()
+    model.enable_input_require_grads()
 
     print("Train")
     trainer = ModifiedTrainer(

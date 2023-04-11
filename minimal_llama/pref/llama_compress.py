@@ -85,6 +85,7 @@ class LLaMAModel(nn.Module):
         :return: logits [batch_size, seq_len]
         """
         block_size = self.train_config.block_size
+        batch_size, seq_len = input_ids.shape
         num_blocks = input_ids.shape[1] // block_size
         device = input_ids.device
         # 1.1) Create full masks and rope embeds
@@ -93,7 +94,9 @@ class LLaMAModel(nn.Module):
         # full_attention_mask = create_attention_mask(input_ids=input_ids, dtype=self.config.dtype)
         full_attention_mask = create_full_hidden_state_mask(input_ids=input_ids, dtype=self.config.dtype)
         full_rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
+        # [batch_size, seq_len, dim]
         full_cos, full_sin = self.get_cos_sin(full_rope_embed_ids)
+        # [batch_size, num_heads, seq_len, dim]
         full_cos, full_sin = full_cos[:, None, :, :], full_sin[:, None, :, :]
 
         # 1.2) Create conditional masks and rope embeds
@@ -105,13 +108,15 @@ class LLaMAModel(nn.Module):
                 conditional_attention_mask,
             ], dim=3)[None]
         # Assume fully packed
-        # [num_blocks, block_size]
-        conditional_rope_embed_ids = torch.arange(block_size)[None, :].expand(num_blocks, block_size)
+        # [batch_size, num_blocks, block_size]
+        conditional_rope_embed_ids = create_rope_embed_ids(input_ids=input_ids.view(batch_size, num_blocks, block_size))
         conditional_rope_embed_ids = conditional_rope_embed_ids.long().to(device)
+        # [batch_size, num_blocks, block_size, dim]
         conditional_cos, conditional_sin = self.get_cos_sin(conditional_rope_embed_ids)
+        # [batch_size, num_blocks, num_heads, block_size, dim]
         conditional_cos, conditional_sin = (
-            conditional_cos[None, :, None, :, :],
-            conditional_sin[None, :, None, :, :],
+            conditional_cos[:, :, None, :, :],
+            conditional_sin[:, :, None, :, :],
         )
 
         # 2) Forward pass
