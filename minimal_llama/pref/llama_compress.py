@@ -883,15 +883,15 @@ def create_full_hidden_state_mask(input_ids,
     :param input_ids: [batch_size, seq_len]
     :param dtype: dtype
     :param return_soft_mask: whether to return mask or logits-mask
-    :return: float [batch_size=1, num_heads=1, q_len=seq_len, kv_len=seq_len]
+    :return: float [batch_size, num_heads=1, q_len=seq_len, kv_len=seq_len]
     """
     is_valid = (input_ids != LLAMA_PAD_TOKEN_ID).long()
     batch_size, seq_len = is_valid.shape
-    mask = torch.ones([batch_size, seq_len, seq_len])
+    mask = torch.ones([batch_size, seq_len, seq_len]).to(input_ids.device)
     tril_mask = torch.tril(mask)
     # The one of these is not necessary, but let's just do both
     final_mask = tril_mask * is_valid[:, None, :] * is_valid[:, :, None]
-    final_mask = final_mask.to(device=is_valid.device)
+    final_mask = final_mask.to(device=is_valid.device)[:, None, :, :]
     if return_soft_mask:
         return convert_mask_to_soft_mask(final_mask, dtype=dtype)
     else:

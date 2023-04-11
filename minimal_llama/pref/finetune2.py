@@ -18,14 +18,18 @@ from transformers import (
     TrainingArguments,
 )
 import minimal_llama.pref.llama_compress as llama_compress
+import minimal_llama.pref.data.p3 as p3_datasets
 
 
 @dataclass
 class FinetuneArguments:
+    dataset_type: str = field()  # c4, p3
     dataset_path: str = field()
     hf_path: str = field()
     model_name: str = field(default="7b")
     use_8bit: bool = field(default=False)
+
+    # p3_specific
 
 
 @dataclass
@@ -35,6 +39,7 @@ class CompressArguments:
     block_size: int = field(default=64)
     factorized_compressor: bool = field(default=True)
     adapter_gate_mode: str = field(default="fixed")
+    max_sequence_length: int = field(default=512)
 
 
 class CastOutputToFloat(nn.Sequential):
@@ -54,11 +59,17 @@ class ModifiedTrainer(Trainer):
 
     def compute_loss(self, model, inputs, return_outputs=False):
         batch_size = inputs["input_ids"].shape[0]
-        labels = inputs["input_ids"]
-        input_ids = torch.cat([
-            torch.ones(batch_size, 1).long().to(labels.device),
-            inputs["input_ids"][:, :-1],
-        ], dim=1)
+
+        if "labels" in inputs:
+            labels = inputs["labels"]
+            input_ids = inputs["input_ids"]
+        else:
+            labels = inputs["input_ids"]
+            input_ids = torch.cat([
+                torch.ones(batch_size, 1).long().to(labels.device),
+                inputs["input_ids"][:, :-1],
+            ], dim=1)
+
         logits = model(input_ids=input_ids)
         loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
         loss = loss_fct(logits.reshape(
@@ -85,12 +96,16 @@ class ModifiedTrainer(Trainer):
         pass
 
 
-def data_collator(features: list) -> dict:
+def c4_data_collator(features: list) -> dict:
     return {
-        "input_ids": torch.stack([
-            torch.LongTensor(f["input_ids"])
-            for f in features
-        ])
+        "input_ids": torch.stack([torch.LongTensor(f["input_ids"]) for f in features]),
+    }
+
+
+def p3_data_collator(features: list) -> dict:
+    return {
+        "input_ids": torch.stack([torch.LongTensor(f["input_ids"]) for f in features]),
+        "labels": torch.stack([torch.LongTensor(f["labels"]) for f in features]),
     }
 
 
@@ -111,7 +126,26 @@ def main():
     )).parse_args_into_dataclasses()
 
     print("Setup Data")
-    dataset = datasets.load_from_disk(finetune_args.dataset_path)
+    training_args.remove_unused_columns = False
+    if finetune_args.dataset_type == "c4":
+        dataset = datasets.load_from_disk(finetune_args.dataset_path)
+        data_collator = c4_data_collator
+    elif finetune_args.dataset_type == "p3":
+        subset = [
+            "ag_news_classify",
+            "cosmos_qa_context_answer_to_question",
+            "glue_mrpc_equivalent",
+        ]
+        dataset = p3_datasets.P3FewshotHyperTrainDataset(
+            base_path=finetune_args.dataset_path,
+            full_sequence_length=compress_args.max_sequence_length,
+            block_size=compress_args.block_size,
+            add_special_tokens=True,
+            subset=subset,
+        )
+        data_collator = p3_data_collator
+    else:
+        raise KeyError(f"Unknown dataset type: {finetune_args.dataset_type}")
 
     print("Setup Model")
     train_config = llama_compress.TrainConfig(
@@ -128,7 +162,7 @@ def main():
         use_8bit=finetune_args.use_8bit,
     )
     model.lm_head = CastOutputToFloat(model.lm_head)
-    model.gradient_checkpointing_enable()
+    # model.gradient_checkpointing_enable()
     # model.enable_input_require_grads()
 
     print("Train")
@@ -136,7 +170,7 @@ def main():
         model=model,
         train_dataset=dataset,
         args=training_args,
-        data_collator=data_collator,
+        data_collator=data_collator
     )
     trainer.train()
     save_tunable_parameters(model, os.path.join(training_args.output_dir, "params.p"))

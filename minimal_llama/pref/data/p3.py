@@ -60,44 +60,40 @@ class P3FewshotHyperTrainIterator:
         indices = self.rng.integers(len(ds), size=self.num_examples)
 
         all_input_ids = []
-        all_label_mask = []
+        all_labels = []
         for index in indices:
             example = ds[int(index)]
-            input_ids = example["inputs"] + example["targets"]
-            label_mask = [0] * len(example["inputs"]) + [1] * (len(example["targets"]) + 1)
+            raw_input_ids = example["inputs"] + example["targets"]
+            label_mask = [0] * len(example["inputs"]) + [1] * len(example["targets"])
             if self.add_special_tokens:
-                input_ids = [LLAMA_BOS_TOKEN_ID] + input_ids + [LLAMA_EOS_TOKEN_ID]
+                raw_input_ids = [LLAMA_BOS_TOKEN_ID] + example["inputs"] + example["targets"] + [LLAMA_EOS_TOKEN_ID]
                 label_mask = [0] + label_mask + [1]
-            input_ids = pad_tokens(input_ids, max_length=self.block_size, pad_token_id=LLAMA_PAD_TOKEN_ID)
-            label_mask = pad_tokens(label_mask, max_length=self.block_size, pad_token_id=LLAMA_PAD_TOKEN_ID)
+            raw_input_ids = pad_tokens(raw_input_ids, max_length=self.block_size + 1, pad_token_id=LLAMA_PAD_TOKEN_ID)
+            label_mask = pad_tokens(label_mask, max_length=self.block_size + 1, pad_token_id=0)
+            input_ids = raw_input_ids[:-1]
+            labels = [
+                raw_input_ids[i] if label_mask[i] else -100
+                for i in range(1, len(raw_input_ids))
+            ]
             all_input_ids.append(input_ids)
-            all_label_mask.append(label_mask)
-
-        final_inputs = torch.LongTensor(all_input_ids).view(-1)
-        final_label_mask = torch.LongTensor(all_label_mask).view(-1)
-        labels = [
-            final_inputs[i] if final_label_mask[i] == 1 else -100
-            for i in range(1, self.full_sequence_length)
-        ] + [-100]
+            all_labels.append(labels)
 
         return {
-            "inputs": torch.LongTensor(all_input_ids).view(-1),
-            "label_mask": torch.LongTensor(all_label_mask).view(-1),
-            "labels": torch.LongTensor(labels),
+            "input_ids": torch.LongTensor(all_input_ids).view(-1),
+            "labels": torch.LongTensor(all_labels).view(-1),
         }
 
 
 # noinspection PyAbstractClass
 class P3FewshotHyperTrainDataset(IterableDataset):
 
-    def __init__(self, tokenizer, base_path,
+    def __init__(self, base_path,
                  block_size=64,
                  full_sequence_length=512,
                  add_special_tokens=True,
                  subset=None,
                  explicit_seed=None):
         assert full_sequence_length % block_size == 0
-        self.tokenizer = tokenizer
         self.base_path = base_path
         self.block_size = block_size
         self.full_sequence_length = full_sequence_length
