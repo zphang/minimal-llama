@@ -17,6 +17,8 @@ PEFT_PREFIX = "prefix"
 PEFT_PREFIX_ADAPTER = "prefix_adapter"
 PEFT_NO = "nothing"
 
+LLAMA_PAD_TOKEN_ID = 0
+
 
 @dataclasses.dataclass
 class LLaMAConfig:
@@ -88,7 +90,8 @@ class LLaMAModel(nn.Module):
         # 1.1) Create full masks and rope embeds
         # decoder mask
         # [batch_size, num_heads=1, q_len=seq_len, kv_len=seq_len]
-        full_attention_mask = create_attention_mask(input_ids=input_ids, dtype=self.config.dtype)
+        # full_attention_mask = create_attention_mask(input_ids=input_ids, dtype=self.config.dtype)
+        full_attention_mask = create_full_hidden_state_mask(input_ids=input_ids, dtype=self.config.dtype)
         full_rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
         full_cos, full_sin = self.get_cos_sin(full_rope_embed_ids)
         full_cos, full_sin = full_cos[:, None, :, :], full_sin[:, None, :, :]
@@ -870,6 +873,29 @@ def create_block_attention_mask(num_blocks: int,
     mask = base_mask[:, :, None].expand(num_blocks, num_blocks, block_size).reshape(num_blocks, seq_len)
     mask = convert_mask_to_soft_mask(mask, dtype)[None, :, None, None, :]
     return mask
+
+
+def create_full_hidden_state_mask(input_ids,
+                                  dtype=torch.float16,
+                                  return_soft_mask=True):
+    """Create mask for full history of hidden states, accounting for padding in between blocks
+
+    :param input_ids: [batch_size, seq_len]
+    :param dtype: dtype
+    :param return_soft_mask: whether to return mask or logits-mask
+    :return: float [batch_size=1, num_heads=1, q_len=seq_len, kv_len=seq_len]
+    """
+    is_valid = (input_ids != LLAMA_PAD_TOKEN_ID).long()
+    batch_size, seq_len = is_valid.shape
+    mask = torch.ones([batch_size, seq_len, seq_len])
+    tril_mask = torch.tril(mask)
+    # The one of these is not necessary, but let's just do both
+    final_mask = tril_mask * is_valid[:, None, :] * is_valid[:, :, None]
+    final_mask = final_mask.to(device=is_valid.device)
+    if return_soft_mask:
+        return convert_mask_to_soft_mask(final_mask, dtype=dtype)
+    else:
+        return final_mask
 
 
 def zeros_like(shape, tensor):
