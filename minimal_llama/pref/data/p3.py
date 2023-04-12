@@ -16,6 +16,8 @@ LLAMA_PAD_TYPE_ID = 0
 LLAMA_INPUT_TYPE_ID = 1
 LLAMA_TARGET_TYPE_ID = 2
 
+ANSWER_INDICATOR_TOKENS = [673, 29901]
+
 
 def pad_tokens(x, max_length, pad_token_id,
                truncate_from="left",
@@ -43,6 +45,7 @@ class P3FewshotHyperTrainIterator:
                  block_size=64,
                  full_sequence_length=512,
                  add_special_tokens=True,
+                 add_answer_indicator=False,
                  predict_input=False,
                  ):
         assert len(ds_weights) == len(ds_list)
@@ -54,6 +57,7 @@ class P3FewshotHyperTrainIterator:
         self.full_sequence_length = full_sequence_length
         self.add_special_tokens = add_special_tokens
         self.predict_input = predict_input
+        self.add_answer_indicator = add_answer_indicator
 
         self.num_examples = full_sequence_length // block_size
 
@@ -70,11 +74,19 @@ class P3FewshotHyperTrainIterator:
         all_type_masks = []
         for index in indices:
             example = ds[int(index)]
-            raw_input_ids = example["inputs"] + example["targets"]
-            raw_type_mask = (
-                [LLAMA_INPUT_TYPE_ID] * len(example["inputs"])
-                + [LLAMA_TARGET_TYPE_ID] * len(example["targets"])
-            )
+            if self.add_answer_indicator:
+                raw_input_ids = example["inputs"] + ANSWER_INDICATOR_TOKENS + example["targets"]
+                raw_type_mask = (
+                    [LLAMA_INPUT_TYPE_ID] * len(example["inputs"])
+                    + [LLAMA_INPUT_TYPE_ID] * len(ANSWER_INDICATOR_TOKENS)
+                    + [LLAMA_TARGET_TYPE_ID] * len(example["targets"])
+                )
+            else:
+                raw_input_ids = example["inputs"] + example["targets"]
+                raw_type_mask = (
+                    [LLAMA_INPUT_TYPE_ID] * len(example["inputs"])
+                    + [LLAMA_TARGET_TYPE_ID] * len(example["targets"])
+                )
             if self.add_special_tokens:
                 raw_input_ids = [LLAMA_BOS_TOKEN_ID] + raw_input_ids + [LLAMA_EOS_TOKEN_ID]
                 raw_type_mask = [LLAMA_INPUT_TYPE_ID] + raw_type_mask + [LLAMA_TARGET_TYPE_ID]
@@ -112,6 +124,7 @@ class P3FewshotHyperTrainDataset(IterableDataset):
                  full_sequence_length=512,
                  add_special_tokens=True,
                  predict_input=False,
+                 add_answer_indicator=False,
                  subset=None,
                  explicit_seed=None):
         assert full_sequence_length % block_size == 0
@@ -119,6 +132,7 @@ class P3FewshotHyperTrainDataset(IterableDataset):
         self.block_size = block_size
         self.full_sequence_length = full_sequence_length
         self.add_special_tokens = add_special_tokens
+        self.add_answer_indicator = add_answer_indicator
         self.predict_input = predict_input
         self.subset = subset
         self.explicit_seed = explicit_seed
@@ -147,4 +161,5 @@ class P3FewshotHyperTrainDataset(IterableDataset):
             ds_list=self.ds_list,
             ds_weights=self.ds_weights,
             predict_input=self.predict_input,
+            add_answer_indicator=self.add_answer_indicator,
         )

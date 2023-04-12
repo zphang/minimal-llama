@@ -35,6 +35,7 @@ class FinetuneArguments:
 
     # p3_specific
     p3_subset_name: str = field(default="t0_short")
+    add_answer_indicator: bool = field(default=False)
 
 
 @dataclass
@@ -146,6 +147,7 @@ def main():
             full_sequence_length=compress_args.max_sequence_length,
             block_size=compress_args.block_size,
             add_special_tokens=True,
+            add_answer_indicator=finetune_args.add_answer_indicator,
             subset=subset,
         )
         data_collator = p3_data_collator
