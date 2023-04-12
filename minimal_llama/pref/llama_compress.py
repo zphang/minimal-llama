@@ -91,7 +91,6 @@ class LLaMAModel(nn.Module):
         # 1.1) Create full masks and rope embeds
         # decoder mask
         # [batch_size, num_heads=1, q_len=seq_len, kv_len=seq_len]
-        # full_attention_mask = create_attention_mask(input_ids=input_ids, dtype=self.config.dtype)
         full_attention_mask = create_full_hidden_state_mask(input_ids=input_ids, dtype=self.config.dtype)
         full_rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
         # [batch_size, seq_len, dim]

@@ -12,6 +12,10 @@ LLAMA_PAD_TOKEN_ID = 0
 LLAMA_BOS_TOKEN_ID = 1
 LLAMA_EOS_TOKEN_ID = 2
 
+LLAMA_PAD_TYPE_ID = 0
+LLAMA_INPUT_TYPE_ID = 1
+LLAMA_TARGET_TYPE_ID = 2
+
 
 def pad_tokens(x, max_length, pad_token_id,
                truncate_from="left",
@@ -39,6 +43,7 @@ class P3FewshotHyperTrainIterator:
                  block_size=64,
                  full_sequence_length=512,
                  add_special_tokens=True,
+                 predict_input=False,
                  ):
         assert len(ds_weights) == len(ds_list)
         assert full_sequence_length % block_size == 0
@@ -48,6 +53,7 @@ class P3FewshotHyperTrainIterator:
         self.block_size = block_size
         self.full_sequence_length = full_sequence_length
         self.add_special_tokens = add_special_tokens
+        self.predict_input = predict_input
 
         self.num_examples = full_sequence_length // block_size
 
@@ -61,26 +67,40 @@ class P3FewshotHyperTrainIterator:
 
         all_input_ids = []
         all_labels = []
+        all_type_masks = []
         for index in indices:
             example = ds[int(index)]
             raw_input_ids = example["inputs"] + example["targets"]
-            label_mask = [0] * len(example["inputs"]) + [1] * len(example["targets"])
+            raw_type_mask = (
+                [LLAMA_INPUT_TYPE_ID] * len(example["inputs"])
+                + [LLAMA_TARGET_TYPE_ID] * len(example["targets"])
+            )
             if self.add_special_tokens:
-                raw_input_ids = [LLAMA_BOS_TOKEN_ID] + example["inputs"] + example["targets"] + [LLAMA_EOS_TOKEN_ID]
-                label_mask = [0] + label_mask + [1]
-            raw_input_ids = pad_tokens(raw_input_ids, max_length=self.block_size + 1, pad_token_id=LLAMA_PAD_TOKEN_ID)
-            label_mask = pad_tokens(label_mask, max_length=self.block_size + 1, pad_token_id=0)
-            input_ids = raw_input_ids[:-1]
-            labels = [
-                raw_input_ids[i] if label_mask[i] else -100
-                for i in range(1, len(raw_input_ids))
-            ]
+                raw_input_ids = [LLAMA_BOS_TOKEN_ID] + raw_input_ids + [LLAMA_EOS_TOKEN_ID]
+                raw_type_mask = [LLAMA_INPUT_TYPE_ID] + raw_type_mask + [LLAMA_TARGET_TYPE_ID]
+            input_ids = pad_tokens(raw_input_ids, max_length=self.block_size, pad_token_id=LLAMA_PAD_TOKEN_ID)
+            type_mask = pad_tokens(raw_type_mask, max_length=self.block_size, pad_token_id=LLAMA_PAD_TYPE_ID)
+            if self.predict_input:
+                # Don't predict BOS
+                labels = [
+                    input_ids[i] if (type_mask[i] != LLAMA_PAD_TYPE_ID and input_ids[i] != LLAMA_BOS_TOKEN_ID) else -100
+                    for i in range(1, self.block_size)
+                ] + [-100]
+            else:
+                labels = [
+                    input_ids[i] if type_mask[i] == LLAMA_TARGET_TYPE_ID else -100
+                    for i in range(1, self.block_size)
+                ] + [-100]
+
+            label_type_mask = type_mask[1:] + [LLAMA_PAD_TYPE_ID]
             all_input_ids.append(input_ids)
             all_labels.append(labels)
+            all_type_masks.append(label_type_mask)
 
         return {
             "input_ids": torch.LongTensor(all_input_ids).view(-1),
             "labels": torch.LongTensor(all_labels).view(-1),
+            "type_mask": torch.LongTensor(all_type_masks).view(-1),
         }
 
 
@@ -91,6 +111,7 @@ class P3FewshotHyperTrainDataset(IterableDataset):
                  block_size=64,
                  full_sequence_length=512,
                  add_special_tokens=True,
+                 predict_input=False,
                  subset=None,
                  explicit_seed=None):
         assert full_sequence_length % block_size == 0
@@ -98,6 +119,8 @@ class P3FewshotHyperTrainDataset(IterableDataset):
         self.block_size = block_size
         self.full_sequence_length = full_sequence_length
         self.add_special_tokens = add_special_tokens
+        self.predict_input = predict_input
+        self.subset = subset
         self.explicit_seed = explicit_seed
 
         train_and_caps = p3_metadata.get_full_t0_train_and_caps()
@@ -123,4 +146,5 @@ class P3FewshotHyperTrainDataset(IterableDataset):
             rng_seed=rng_seed,
             ds_list=self.ds_list,
             ds_weights=self.ds_weights,
+            predict_input=self.predict_input,
         )

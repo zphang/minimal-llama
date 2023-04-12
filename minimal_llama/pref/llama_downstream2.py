@@ -29,6 +29,8 @@ from minimal_llama.pref.llama_compress import (
     check_nan,
 )
 
+LLAMA_PAD_TOKEN_ID = 0
+
 
 @dataclasses.dataclass
 class LLaMAConfig:
@@ -100,7 +102,7 @@ class LLaMAModel(nn.Module):
             return self.compress_forward(input_ids)
 
     def compress_forward(self, input_ids):
-        attention_mask = create_attention_mask(input_ids=input_ids, dtype=self.config.dtype)
+        attention_mask = create_full_hidden_state_mask(input_ids=input_ids, dtype=self.config.dtype)
         rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
         cos, sin = self.get_cos_sin(rope_embed_ids)
         cos, sin = cos[:, None, :, :], sin[:, None, :, :]
@@ -716,3 +718,26 @@ def create_model(model_name, hf_path, downstream_config: DownstreamConfig, use_8
                 model.model.layers[layer_i].self_attn.adapter_gates.float())
 
     return model
+
+
+def create_full_hidden_state_mask(input_ids,
+                                  dtype=torch.float16,
+                                  return_soft_mask=True):
+    """Create mask for full history of hidden states, accounting for padding in between blocks
+
+    :param input_ids: [batch_size, seq_len]
+    :param dtype: dtype
+    :param return_soft_mask: whether to return mask or logits-mask
+    :return: float [batch_size, num_heads=1, q_len=seq_len, kv_len=seq_len]
+    """
+    is_valid = (input_ids != LLAMA_PAD_TOKEN_ID).long()
+    batch_size, seq_len = is_valid.shape
+    mask = torch.ones([batch_size, seq_len, seq_len]).to(input_ids.device)
+    tril_mask = torch.tril(mask)
+    # The one of these is not necessary, but let's just do both
+    final_mask = tril_mask * is_valid[:, None, :] * is_valid[:, :, None]
+    final_mask = final_mask.to(device=is_valid.device)[:, None, :, :]
+    if return_soft_mask:
+        return convert_mask_to_soft_mask(final_mask, dtype=dtype)
+    else:
+        return final_mask
