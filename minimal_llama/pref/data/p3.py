@@ -160,6 +160,8 @@ class P3FewshotHyperTrainDataset(IterableDataset):
             rng_seed=rng_seed,
             ds_list=self.ds_list,
             ds_weights=self.ds_weights,
+            block_size=self.block_size,
+            full_sequence_length=self.full_sequence_length,
             predict_input=self.predict_input,
             add_answer_indicator=self.add_answer_indicator,
         )
