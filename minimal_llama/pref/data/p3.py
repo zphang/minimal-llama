@@ -119,14 +119,16 @@ class P3FewshotHyperTrainIterator:
 # noinspection PyAbstractClass
 class P3FewshotHyperTrainDataset(IterableDataset):
 
-    def __init__(self, base_path,
+    def __init__(self,
+                 base_path,
                  block_size=64,
                  full_sequence_length=512,
                  add_special_tokens=True,
                  predict_input=False,
                  add_answer_indicator=False,
                  subset=None,
-                 explicit_seed=None):
+                 explicit_seed=None,
+                 single_task_mode=False):
         assert full_sequence_length % block_size == 0
         self.base_path = base_path
         self.block_size = block_size
@@ -136,19 +138,27 @@ class P3FewshotHyperTrainDataset(IterableDataset):
         self.predict_input = predict_input
         self.subset = subset
         self.explicit_seed = explicit_seed
+        self.single_task_mode = single_task_mode
 
         train_and_caps = p3_metadata.get_full_t0_train_and_caps()
         # Should take about 3 seconds to initialize
-        self.ds_list = []
-        self.ds_weights = []
-        for name, weight in zip(tqdm(train_and_caps["names"]), train_and_caps["caps"]):
-            if subset and name not in subset:
-                continue
-            self.ds_list.append(datasets.load_from_disk(
-                os.path.join(base_path, "train", name)))
-            self.ds_weights.append(weight)
-        assert self.ds_list, "No valid datasets."
-        self.ds_weights = np.array(self.ds_weights)
+        if self.single_task_mode:
+            assert len(subset) == 1
+            self.ds_list = [
+                datasets.load_from_disk(os.path.join(base_path, "train", subset[0]))
+            ]
+            self.ds_weights = np.array([1.])
+        else:
+            self.ds_list = []
+            self.ds_weights = []
+            for name, weight in zip(tqdm(train_and_caps["names"]), train_and_caps["caps"]):
+                if subset and name not in subset:
+                    continue
+                self.ds_list.append(datasets.load_from_disk(
+                    os.path.join(base_path, "train", name)))
+                self.ds_weights.append(weight)
+            assert self.ds_list, "No valid datasets."
+            self.ds_weights = np.array(self.ds_weights)
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
@@ -165,3 +175,60 @@ class P3FewshotHyperTrainDataset(IterableDataset):
             predict_input=self.predict_input,
             add_answer_indicator=self.add_answer_indicator,
         )
+
+
+class P3FewshotHyperValidationDataset(Dataset):
+    def __init__(self,
+                 dataset_name,
+                 base_path,
+                 max_input_length=384,
+                 max_target_length=128,
+                 add_special_tokens=True,
+                 add_answer_indicator=False,
+                 do_test=False):
+        self.dataset_name = dataset_name
+        self.base_path = base_path
+        self.max_input_length = max_input_length
+        self.max_target_length = max_target_length
+        self.add_special_tokens = add_special_tokens
+        self.add_answer_indicator = add_answer_indicator
+        eval_phase = "test" if do_test else "validation"
+        self.val_ds = datasets.load_from_disk(
+            os.path.join(base_path, eval_phase, self.dataset_name))
+
+    def __len__(self):
+        return len(self.val_ds)
+
+    def __getitem__(self, idx):
+        example = self.val_ds[int(idx)]
+        input_ids = example["inputs"]
+        labels = example["targets"]
+        if self.add_answer_indicator:
+            input_ids = input_ids + ANSWER_INDICATOR_TOKENS
+        if self.add_special_tokens:
+            input_ids = [LLAMA_BOS_TOKEN_ID] + input_ids
+            labels = labels + [LLAMA_EOS_TOKEN_ID]
+
+        input_ids = pad_tokens(
+            input_ids, max_length=self.max_input_length, pad_token_id=LLAMA_PAD_TOKEN_ID,
+            truncate_from="right", pad_from="left",
+        )
+        labels = pad_tokens(
+            labels, max_length=self.max_input_length, pad_token_id=-100,
+            truncate_from="right", pad_from="right",
+        )
+
+        out = {
+            "input_ids": input_ids,
+            "labels": labels
+        }
+        if "is_correct" in example:
+            out["is_correct"] = example["is_correct"]
+        return out
+
+
+def p3_data_collator(features: list) -> dict:
+    return {
+        "input_ids": torch.stack([torch.LongTensor(f["input_ids"]) for f in features]),
+        "labels": torch.stack([torch.LongTensor(f["labels"]) for f in features]),
+    }

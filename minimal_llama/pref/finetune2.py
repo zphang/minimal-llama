@@ -108,13 +108,6 @@ def c4_data_collator(features: list) -> dict:
     }
 
 
-def p3_data_collator(features: list) -> dict:
-    return {
-        "input_ids": torch.stack([torch.LongTensor(f["input_ids"]) for f in features]),
-        "labels": torch.stack([torch.LongTensor(f["labels"]) for f in features]),
-    }
-
-
 def save_tunable_parameters(model, path):
     saved_params = {
         k: v.to("cpu")
@@ -150,7 +143,7 @@ def main():
             add_answer_indicator=finetune_args.add_answer_indicator,
             subset=subset,
         )
-        data_collator = p3_data_collator
+        data_collator = p3_datasets.p3_data_collator
     else:
         raise KeyError(f"Unknown dataset type: {finetune_args.dataset_type}")
 

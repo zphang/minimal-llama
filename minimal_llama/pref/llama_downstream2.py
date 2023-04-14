@@ -91,12 +91,16 @@ class LLaMAModel(nn.Module):
         self.downstream_config = downstream_config
         self.model = LLaMAInnerModel(config, downstream_config=downstream_config)
         self.lm_head = NoInitLinear(config.dim, config.vocab_size, bias=False, dtype=config.dtype)
+        self.peft_params = None
 
     def forward(self,
                 input_ids,
                 peft_params=None,
                 forward_mode=FORWARD_PEFT):
         if forward_mode == FORWARD_PEFT:
+            if peft_params is None:
+                assert self.peft_params is not None, "Must provide peft_params if not already set"
+                peft_params = self.peft_params
             return self.peft_forward(input_ids, peft_params=peft_params)
         elif forward_mode == FORWARD_COMPRESS:
             return self.compress_forward(input_ids)
@@ -156,6 +160,7 @@ class LLaMAModel(nn.Module):
             kv_cache=kv_cache,
             cos=cos, sin=sin,
             forward_mode=FORWARD_PEFT,
+            peft_params=peft_params,
         )
         # [batch_size, seq_len, vocab_size]
         logits = self.lm_head(model_out["hidden_states"])
@@ -204,7 +209,8 @@ class LLaMAModel(nn.Module):
             })
         return kv_cache
 
-    def generate(self, input_ids, generation_length: int = 20, peft_params=None):
+    def generate(self, input_ids, generation_length: int = 20, peft_params=None,
+                 return_output_only=True):
         """Generate tokens with efficient caching of KV.
 
         TODO: Add stopping conditions
@@ -213,6 +219,7 @@ class LLaMAModel(nn.Module):
         :param input_ids: [batch_size, enc_seq_len]
         :param generation_length: int
         :param peft_params:
+        :param return_output_only:
         :return: [batch_size, generation_length]
         """
         original_input_ids = input_ids
@@ -317,7 +324,10 @@ class LLaMAModel(nn.Module):
             generated_token_ids = logits.argmax(-1)[:, -1:]
             generated_token_ids_list.append(generated_token_ids)
             input_ids = generated_token_ids
-        return torch.cat(generated_token_ids_list, dim=1)
+        output = torch.cat(generated_token_ids_list, dim=1)
+        if return_output_only:
+            output = output[:, seq_len:]
+        return output
 
     def get_cos_sin(self, rope_embed_ids):
         cos = F.embedding(
