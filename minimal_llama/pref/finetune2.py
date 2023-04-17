@@ -32,6 +32,8 @@ class FinetuneArguments:
     use_8bit: bool = field(default=False)
 
     load_checkpoint: str = field(default=None)
+    compile: bool = field(default=False)
+    use_new_attention: bool = field(default=False)
 
     # p3_specific
     p3_subset_name: str = field(default="t0_short")
@@ -162,6 +164,7 @@ def main():
         hf_path=finetune_args.hf_path,
         use_8bit=finetune_args.use_8bit,
     )
+    model.config.use_new_attention = finetune_args.use_new_attention
     model.lm_head = CastOutputToFloat(model.lm_head)
 
     if finetune_args.load_checkpoint is not None:
@@ -173,6 +176,12 @@ def main():
 
     model.gradient_checkpointing_enable()
     model.enable_input_require_grads()
+
+    if finetune_args.compile:
+        print("Compiling model")
+        model = torch.compile(model)
+    else:
+        print("Not compiling model")
 
     print("Train")
     trainer = ModifiedTrainer(

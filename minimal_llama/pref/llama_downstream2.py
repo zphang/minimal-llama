@@ -44,6 +44,7 @@ class LLaMAConfig:
     bos_token_id: int = 1
     eos_token_id: int = 2
     use_8bit: bool = False
+    use_new_attention: bool = False
 
     @property
     def head_dim(self):
@@ -204,8 +205,8 @@ class LLaMAModel(nn.Module):
         for layer in self.model.layers:
             device = layer.input_layernorm.weight.device
             kv_cache.append({
-                "key": torch.zeros([batch_size, num_heads, 0, head_dim]).to(device),
-                "value": torch.zeros([batch_size, num_heads, 0, head_dim]).to(device),
+                "key": torch.zeros([batch_size, num_heads, 0, head_dim]).to(device=device, dtype=self.config.dtype),
+                "value": torch.zeros([batch_size, num_heads, 0, head_dim]).to(device=device, dtype=self.config.dtype),
             })
         return kv_cache
 
@@ -549,34 +550,56 @@ class Attention(nn.Module):
             key_states = torch.cat([peft_params["key"], key_states], dim=2)
             value_states = torch.cat([peft_params["value"], value_states], dim=2)
 
-        scores = torch.matmul(
-            query_states, key_states.transpose(3, 2).type_as(query_states) / math.sqrt(self.head_dim)
-        )
-        scores += attention_mask
+        if self.config.use_new_attention:
+            # print("Using New Attention")
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query=query_states,
+                key=key_states,
+                value=value_states,
+                attn_mask=attention_mask,
+            )
 
-        # (batch_size, num_heads, q_seq_len, kv_seq_len)
-        attn_weights = F.softmax(scores.float(), dim=-1).type_as(scores)
-        # (batch_size, num_heads, q_seq_len, head_dim)
-        attn_output = torch.matmul(attn_weights, value_states.type_as(query_states))
+        else:
+            # print("Using Old Attention")
+            scores = torch.matmul(
+                query_states, key_states.transpose(3, 2).type_as(query_states) / math.sqrt(self.head_dim)
+            )
+            scores += attention_mask
+
+            # (batch_size, num_heads, q_seq_len, kv_seq_len)
+            attn_weights = F.softmax(scores.float(), dim=-1).type_as(scores)
+            # (batch_size, num_heads, q_seq_len, head_dim)
+            attn_output = torch.matmul(attn_weights, value_states.type_as(query_states))
 
         if forward_mode == FORWARD_PEFT and self.downstream_config.peft_mode == PEFT_PREFIX_ADAPTER:
             prefix_k, prefix_v = peft_params["key"], peft_params["value"]
             gate = peft_params["gate"].view(1, -1, 1, 1)
-            # [batch_size, num_blocks, num_heads, block_size, num_prefix_tokens]
-            adapter_scores = torch.matmul(
-                query_states,
-                prefix_k.transpose(-1, -2).type_as(query_states) / math.sqrt(self.head_dim)
-            )
-            # [batch_size, num_blocks, num_heads, block_size, num_prefix_tokens]
-            adapter_attn_weights = F.softmax(adapter_scores.float(), dim=-1).type_as(adapter_scores)
-            # [batch_size=1, num_blocks=1, num_heads, block_size=1, head_dim=1]
+            if self.config.use_new_attention:
+                # print("Using New Attention")
+                adapter_attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    query=query_states,
+                    key=prefix_k,
+                    value=prefix_v,
+                )
+
+            else:
+                # [batch_size, num_blocks, num_heads, block_size, num_prefix_tokens]
+                adapter_scores = torch.matmul(
+                    query_states,
+                    prefix_k.transpose(-1, -2).type_as(query_states) / math.sqrt(self.head_dim)
+                )
+                # [batch_size, num_blocks, num_heads, block_size, num_prefix_tokens]
+                adapter_attn_weights = F.softmax(adapter_scores.float(), dim=-1).type_as(adapter_scores)
+                # [batch_size=1, num_blocks=1, num_heads, block_size=1, head_dim=1]
+                adapter_attn_output = torch.matmul(
+                    adapter_attn_weights,
+                    prefix_v.type_as(query_states),
+                )
+
             # [batch_size, num_blocks, num_heads, block_size, head_dim]
-            adapter_attn_output = gate * torch.matmul(
-                adapter_attn_weights,
-                prefix_v.type_as(query_states),
-            )
+            adapter_attn_output = gate * adapter_attn_output
             # [batch_size, num_blocks, num_heads, block_size, head_dim]
-            attn_output += adapter_attn_output
+            attn_output += adapter_attn_output.to(attn_output.dtype)
         # (batch_size, q_seq_len, hidden_dim)
         attn_output = attn_output.transpose(1, 2).contiguous().view(
             batch_size, q_seq_len, hidden_dim,
@@ -602,12 +625,12 @@ class Attention(nn.Module):
                         hidden_states=hidden_states,
                         past_kvs=key_states,
                         compress_mask=compress_mask,
-                    )[:, 0],
+                    )[:, 0].to(hidden_states.dtype),
                     "value": self.v_compressor(
                         hidden_states=hidden_states,
                         past_kvs=value_states,
                         compress_mask=compress_mask,
-                    )[:, 0],
+                    )[:, 0].to(hidden_states.dtype),
                 }
                 if self.downstream_config.peft_mode == PEFT_PREFIX_ADAPTER:
                     peft_dict["gate"] = F.tanh(self.adapter_gates.to(hidden_states.dtype))

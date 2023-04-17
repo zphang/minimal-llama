@@ -32,6 +32,7 @@ class LLaMAConfig:
     bos_token_id: int = 1
     eos_token_id: int = 2
     use_8bit: bool = False
+    use_new_attention: bool = False
     gradient_checkpointing: bool = False
 
     @property
@@ -378,16 +379,24 @@ class Attention(nn.Module):
         full_query_states, full_key_states = apply_rotary_pos_emb(
             full_query_states, full_key_states,
             cos=full_cos, sin=full_sin)
-        full_scores = torch.matmul(
-            full_query_states,
-            full_key_states.transpose(-1, -2).type_as(full_query_states) / math.sqrt(self.head_dim)
-        )
-        full_scores += full_attention_mask
+        if self.config.use_new_attention:
+            full_attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query=full_query_states,
+                key=full_key_states,
+                value=full_key_states,
+                is_causal=True,
+            )
+        else:
+            full_scores = torch.matmul(
+                full_query_states,
+                full_key_states.transpose(-1, -2).type_as(full_query_states) / math.sqrt(self.head_dim)
+            )
+            full_scores += full_attention_mask
+            # (batch_size, num_heads, block_size, full_seq_len, kv_seq_len)
+            full_attn_weights = F.softmax(full_scores.float(), dim=-1).type_as(full_scores)
+            # (batch_size, num_heads, full_seq_len, head_dim)
+            full_attn_output = torch.matmul(full_attn_weights, full_value_states.type_as(full_query_states))
 
-        # (batch_size, num_heads, block_size, full_seq_len, kv_seq_len)
-        full_attn_weights = F.softmax(full_scores.float(), dim=-1).type_as(full_scores)
-        # (batch_size, num_heads, full_seq_len, head_dim)
-        full_attn_output = torch.matmul(full_attn_weights, full_value_states.type_as(full_query_states))
         # (batch_size, q_seq_len, hidden_dim)
         full_attn_output = full_attn_output.transpose(1, 2).contiguous().view(
             batch_size, full_seq_len, hidden_dim,
@@ -423,19 +432,35 @@ class Attention(nn.Module):
             # [batch_size, num_blocks, num_heads, num_prefix_tokens+block_size, head_dim]
             conditional_key_states = torch.cat([prefix_k, conditional_key_states], dim=-2)
             conditional_value_states = torch.cat([prefix_v, conditional_value_states], dim=-2)
-            # [batch_size, num_blocks, num_heads, block_size, num_prefix_tokens+block_size]
-            conditional_scores = torch.matmul(
-                conditional_query_states,
-                conditional_key_states.transpose(-1, -2).type_as(conditional_query_states) / math.sqrt(self.head_dim)
-            )
-            conditional_scores += conditional_attention_mask
-            # [batch_size, num_blocks, num_heads, block_size, num_prefix_tokens+block_size]
-            conditional_attn_weights = F.softmax(conditional_scores.float(), dim=-1).type_as(conditional_scores)
-            # [batch_size, num_blocks, num_heads, block_size, head_dim]
-            conditional_attn_output = torch.matmul(
-                conditional_attn_weights,
-                conditional_value_states.type_as(conditional_query_states),
-            )
+
+            if self.config.use_new_attention:
+                # Have to use the old attention here because the new attention does not support
+                # special masks
+                with torch.backends.cuda.sdp_kernel(
+                    enable_flash=True,
+                    enable_math=True,
+                    enable_mem_efficient=False
+                ):
+                    conditional_attn_output = torch.nn.functional.scaled_dot_product_attention(
+                        query=conditional_query_states,
+                        key=conditional_key_states,
+                        value=conditional_value_states,
+                        attn_mask=conditional_attention_mask,
+                    )
+            else:
+                # [batch_size, num_blocks, num_heads, block_size, num_prefix_tokens+block_size]
+                conditional_scores = torch.matmul(
+                    conditional_query_states,
+                    conditional_key_states.transpose(-1, -2).type_as(conditional_query_states) / math.sqrt(self.head_dim)
+                )
+                conditional_scores += conditional_attention_mask
+                # [batch_size, num_blocks, num_heads, block_size, num_prefix_tokens+block_size]
+                conditional_attn_weights = F.softmax(conditional_scores.float(), dim=-1).type_as(conditional_scores)
+                # [batch_size, num_blocks, num_heads, block_size, head_dim]
+                conditional_attn_output = torch.matmul(
+                    conditional_attn_weights,
+                    conditional_value_states.type_as(conditional_query_states),
+                )
             # [batch_size, num_heads, full_seq_len, head_dim]
             conditional_attn_output = conditional_attn_output.transpose(2, 3).contiguous().view(
                 batch_size, full_seq_len, hidden_dim,
@@ -443,32 +468,49 @@ class Attention(nn.Module):
             conditional_attn_output = self.o_proj(conditional_attn_output)
             check_nan(conditional_attn_output)
         elif self.train_config.peft_mode == PEFT_PREFIX_ADAPTER:
-            conditional_scores = torch.matmul(
-                conditional_query_states,
-                conditional_key_states.transpose(-1, -2).type_as(conditional_query_states) / math.sqrt(self.head_dim)
-            )
-            conditional_scores += conditional_attention_mask
-            # [batch_size, num_blocks, num_heads, block_size, num_prefix_tokens+block_size]
-            conditional_attn_weights = F.softmax(conditional_scores.float(), dim=-1).type_as(conditional_scores)
-            # [batch_size, num_blocks, num_heads, block_size, head_dim]
-            conditional_attn_output = torch.matmul(
-                conditional_attn_weights,
-                conditional_value_states.type_as(conditional_query_states),
-            )
-            # [batch_size, num_blocks, num_heads, block_size, num_prefix_tokens]
-            adapter_scores = torch.matmul(
-                conditional_query_states,
-                prefix_k.transpose(-1, -2).type_as(conditional_query_states) / math.sqrt(self.head_dim)
-            )
-            # [batch_size, num_blocks, num_heads, block_size, num_prefix_tokens]
-            adapter_attn_weights = F.softmax(adapter_scores.float(), dim=-1).type_as(adapter_scores)
+            if self.config.use_new_attention:
+                conditional_attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    query=conditional_query_states,
+                    key=conditional_key_states,
+                    value=conditional_value_states,
+                    is_causal=True,
+                )
+            else:
+                conditional_scores = torch.matmul(
+                    conditional_query_states,
+                    conditional_key_states.transpose(-1, -2).type_as(conditional_query_states) / math.sqrt(self.head_dim)
+                )
+                conditional_scores += conditional_attention_mask
+                # [batch_size, num_blocks, num_heads, block_size, num_prefix_tokens+block_size]
+                conditional_attn_weights = F.softmax(conditional_scores.float(), dim=-1).type_as(conditional_scores)
+                # [batch_size, num_blocks, num_heads, block_size, head_dim]
+                conditional_attn_output = torch.matmul(
+                    conditional_attn_weights,
+                    conditional_value_states.type_as(conditional_query_states),
+                )
+            if self.config.use_new_attention:
+                adapter_attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    query=conditional_query_states,
+                    key=prefix_k,
+                    value=prefix_v,
+                )
+            else:
+                # [batch_size, num_blocks, num_heads, block_size, num_prefix_tokens]
+                adapter_scores = torch.matmul(
+                    conditional_query_states,
+                    prefix_k.transpose(-1, -2).type_as(conditional_query_states) / math.sqrt(self.head_dim)
+                )
+                # [batch_size, num_blocks, num_heads, block_size, num_prefix_tokens]
+                adapter_attn_weights = F.softmax(adapter_scores.float(), dim=-1).type_as(adapter_scores)
+                # [batch_size, num_blocks, num_heads, block_size, head_dim]
+                adapter_attn_output = torch.matmul(
+                    adapter_attn_weights,
+                    prefix_v.type_as(conditional_query_states),
+                )
             # [batch_size=1, num_blocks=1, num_heads, block_size=1, head_dim=1]
             gate = F.tanh(self.adapter_gates.view(1, 1, -1, 1, 1).to(full_hidden_states.dtype))
             # [batch_size, num_blocks, num_heads, block_size, head_dim]
-            adapter_attn_output = gate * torch.matmul(
-                adapter_attn_weights,
-                prefix_v.type_as(conditional_query_states),
-            )
+            adapter_attn_output = gate * adapter_attn_output
             # [batch_size, num_blocks, num_heads, block_size, head_dim]
             conditional_attn_output += adapter_attn_output
             # [batch_size, num_heads, full_seq_len, head_dim]
@@ -774,6 +816,7 @@ class Compressor(nn.Module):
             Only used for inference compression. Soft mask.
         :return:
         """
+        dtype = hidden_states.dtype
         batch_size, seq_len, _ = hidden_states.shape
         num_blocks = seq_len // self.train_config.block_size
         device = hidden_states.device
@@ -824,7 +867,7 @@ class Compressor(nn.Module):
         # [batch_size, num_blocks, num_heads, num_prefix_tokens, head_dim]
         attn_output = torch.matmul(blocked_attn_weights, blocked_past_kvs)
         check_nan(attn_output)
-        return attn_output.to(hidden_states.dtype)
+        return attn_output.to(dtype)
 
 
 def apply_attn(q, k, v, causal_attention_mask=None):
