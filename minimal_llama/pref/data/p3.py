@@ -231,4 +231,5 @@ def p3_data_collator(features: list) -> dict:
     return {
         "input_ids": torch.stack([torch.LongTensor(f["input_ids"]) for f in features]),
         "labels": torch.stack([torch.LongTensor(f["labels"]) for f in features]),
+        "type_mask": torch.stack([torch.LongTensor(f["type_mask"]) for f in features]),
     }

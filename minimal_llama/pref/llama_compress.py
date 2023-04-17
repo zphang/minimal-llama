@@ -380,12 +380,17 @@ class Attention(nn.Module):
             full_query_states, full_key_states,
             cos=full_cos, sin=full_sin)
         if self.config.use_new_attention:
-            full_attn_output = torch.nn.functional.scaled_dot_product_attention(
-                query=full_query_states,
-                key=full_key_states,
-                value=full_key_states,
-                is_causal=True,
-            )
+            with torch.backends.cuda.sdp_kernel(
+                enable_flash=True,
+                enable_math=False,
+                enable_mem_efficient=False
+            ):
+                full_attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    query=full_query_states,
+                    key=full_key_states,
+                    value=full_key_states,
+                    is_causal=True,
+                )
         else:
             full_scores = torch.matmul(
                 full_query_states,
@@ -469,16 +474,22 @@ class Attention(nn.Module):
             check_nan(conditional_attn_output)
         elif self.train_config.peft_mode == PEFT_PREFIX_ADAPTER:
             if self.config.use_new_attention:
-                conditional_attn_output = torch.nn.functional.scaled_dot_product_attention(
-                    query=conditional_query_states,
-                    key=conditional_key_states,
-                    value=conditional_value_states,
-                    is_causal=True,
-                )
+                with torch.backends.cuda.sdp_kernel(
+                    enable_flash=True,
+                    enable_math=False,
+                    enable_mem_efficient=False
+                ):
+                    conditional_attn_output = fast_attention_5_dim(
+                        query=conditional_query_states,
+                        key=conditional_key_states,
+                        value=conditional_value_states,
+                        is_causal=True,
+                    )
             else:
                 conditional_scores = torch.matmul(
                     conditional_query_states,
-                    conditional_key_states.transpose(-1, -2).type_as(conditional_query_states) / math.sqrt(self.head_dim)
+                    conditional_key_states.transpose(-1, -2).type_as(conditional_query_states)
+                    / math.sqrt(self.head_dim)
                 )
                 conditional_scores += conditional_attention_mask
                 # [batch_size, num_blocks, num_heads, block_size, num_prefix_tokens+block_size]
@@ -489,11 +500,17 @@ class Attention(nn.Module):
                     conditional_value_states.type_as(conditional_query_states),
                 )
             if self.config.use_new_attention:
-                adapter_attn_output = torch.nn.functional.scaled_dot_product_attention(
-                    query=conditional_query_states,
-                    key=prefix_k,
-                    value=prefix_v,
-                )
+                with torch.backends.cuda.sdp_kernel(
+                    enable_flash=True,
+                    enable_math=False,
+                    enable_mem_efficient=False
+                ):
+                    adapter_attn_output = fast_attention_5_dim(
+                        query=conditional_query_states,
+                        key=prefix_k,
+                        value=prefix_v,
+                        is_causal=False,
+                    )
             else:
                 # [batch_size, num_blocks, num_heads, block_size, num_prefix_tokens]
                 adapter_scores = torch.matmul(
@@ -954,3 +971,19 @@ def create_full_hidden_state_mask(input_ids,
 
 def zeros_like(shape, tensor):
     return torch.zeros(shape).type_as(tensor).to(tensor.device)
+
+
+def fast_attention_5_dim(query, key, value, is_causal):
+    batch_size, num_blocks, num_heads, q_block_size, head_dim = query.shape
+    if is_causal:
+        assert query.shape == key.shape == value.shape
+        kv_block_size = q_block_size
+    else:
+        kv_block_size = key.shape[-2]
+    conditional_attn_output = torch.nn.functional.scaled_dot_product_attention(
+        query=query.view(batch_size * num_blocks, num_heads, q_block_size, head_dim),
+        key=key.view(batch_size * num_blocks, num_heads, kv_block_size, head_dim),
+        value=value.view(batch_size * num_blocks, num_heads, kv_block_size, head_dim),
+        is_causal=is_causal,
+    )
+    return conditional_attn_output.view(batch_size, num_blocks, num_heads, q_block_size, head_dim)

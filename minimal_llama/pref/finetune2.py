@@ -34,6 +34,7 @@ class FinetuneArguments:
     load_checkpoint: str = field(default=None)
     compile: bool = field(default=False)
     use_new_attention: bool = field(default=False)
+    input_loss_weight: float = field(default=None)
 
     # p3_specific
     p3_subset_name: str = field(default="t0_short")
@@ -78,12 +79,23 @@ class ModifiedTrainer(Trainer):
                 inputs["input_ids"][:, :-1],
             ], dim=1)
 
+        # logits will be 1 block shorter than input_ids, since we're dropping off the first block
         logits = model(input_ids=input_ids)
         truncated_labels = labels[:, model.train_config.block_size:]
-        loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-        loss = loss_fct(logits.reshape(
-            -1, logits.size(-1)), truncated_labels.reshape(-1)
-        )
+
+        if model.finetune_args.input_loss_weight is not None:
+            assert "type_mask" in inputs
+            truncated_type_mask = inputs["type_mask"][:, model.train_config.block_size:]
+            loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
+            all_loss = loss_fct(logits.reshape(-1, logits.size(-1)), truncated_labels.reshape(-1))
+            loss_weights_by_type = torch.Tensor([0.0, model.finetune_args.input_loss_weight, 1.0]).float().cuda()
+            loss_weights = loss_weights_by_type[truncated_type_mask.reshape(-1)]
+            loss = (all_loss * loss_weights).sum() / loss_weights.sum()
+        else:
+            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+            loss = loss_fct(logits.reshape(
+                -1, logits.size(-1)), truncated_labels.reshape(-1)
+            )
         if return_outputs:
             return loss, logits
         else:
@@ -166,6 +178,7 @@ def main():
     )
     model.config.use_new_attention = finetune_args.use_new_attention
     model.lm_head = CastOutputToFloat(model.lm_head)
+    model.finetune_args = finetune_args
 
     if finetune_args.load_checkpoint is not None:
         print(f"Load checkpoint from: {finetune_args.load_checkpoint}")
