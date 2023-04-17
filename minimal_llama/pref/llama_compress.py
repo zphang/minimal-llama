@@ -475,11 +475,18 @@ class Attention(nn.Module):
         elif self.train_config.peft_mode == PEFT_PREFIX_ADAPTER:
             if self.config.use_new_attention:
                 with torch.backends.cuda.sdp_kernel(
-                    enable_flash=True,
-                    enable_math=False,
+                    enable_flash=False,
+                    enable_math=True,
                     enable_mem_efficient=False
                 ):
-                    conditional_attn_output = fast_attention_5_dim(
+                    # No idea why this doesn't work
+                    # conditional_attn_output = fast_attention_5_dim(
+                    #     query=conditional_query_states,
+                    #     key=conditional_key_states,
+                    #     value=conditional_value_states,
+                    #     is_causal=True,
+                    # )
+                    conditional_attn_output = torch.nn.functional.scaled_dot_product_attention(
                         query=conditional_query_states,
                         key=conditional_key_states,
                         value=conditional_value_states,
