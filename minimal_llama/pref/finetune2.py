@@ -77,9 +77,10 @@ class ModifiedTrainer(Trainer):
             ], dim=1)
 
         logits = model(input_ids=input_ids)
+        truncated_labels = labels[:, model.train_config.block_size:]
         loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
         loss = loss_fct(logits.reshape(
-            -1, logits.size(-1)), labels.view(-1)
+            -1, logits.size(-1)), truncated_labels.reshape(-1)
         )
         if return_outputs:
             return loss, logits

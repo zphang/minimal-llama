@@ -86,20 +86,23 @@ class LLaMAModel(nn.Module):
         """
         block_size = self.train_config.block_size
         batch_size, seq_len = input_ids.shape
-        num_blocks = input_ids.shape[1] // block_size
+        num_blocks = input_ids.shape[1] // block_size - 1
         device = input_ids.device
         # 1.1) Create full masks and rope embeds
+        full_input_ids = input_ids[:, :-block_size]  # Just used for sizing
         # decoder mask
         # [batch_size, num_heads=1, q_len=seq_len, kv_len=seq_len]
-        full_attention_mask = create_full_hidden_state_mask(input_ids=input_ids, dtype=self.config.dtype)
-        full_rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
+        full_attention_mask = create_full_hidden_state_mask(input_ids=full_input_ids, dtype=self.config.dtype)
+        full_rope_embed_ids = create_rope_embed_ids(input_ids=full_input_ids)
         # [batch_size, seq_len, dim]
         full_cos, full_sin = self.get_cos_sin(full_rope_embed_ids)
         # [batch_size, num_heads, seq_len, dim]
         full_cos, full_sin = full_cos[:, None, :, :], full_sin[:, None, :, :]
 
         # 1.2) Create conditional masks and rope embeds
-        conditional_attention_mask = create_attention_mask(input_ids=input_ids[:, :block_size], dtype=self.config.dtype)
+        conditional_input_ids = input_ids[:, block_size:]  # Just used for sizing
+        conditional_attention_mask = create_attention_mask(
+            input_ids=conditional_input_ids[:, :block_size], dtype=self.config.dtype)
         if self.train_config.peft_mode == PEFT_PREFIX:
             num_prefix_tokens = self.train_config.num_prefix_tokens
             conditional_attention_mask = torch.cat([
@@ -108,7 +111,8 @@ class LLaMAModel(nn.Module):
             ], dim=3)[None]
         # Assume fully packed
         # [batch_size, num_blocks, block_size]
-        conditional_rope_embed_ids = create_rope_embed_ids(input_ids=input_ids.view(batch_size, num_blocks, block_size))
+        conditional_rope_embed_ids = create_rope_embed_ids(
+            input_ids=conditional_input_ids.view(batch_size, num_blocks, block_size))
         conditional_rope_embed_ids = conditional_rope_embed_ids.long().to(device)
         # [batch_size, num_blocks, block_size, dim]
         conditional_cos, conditional_sin = self.get_cos_sin(conditional_rope_embed_ids)
@@ -185,8 +189,11 @@ class LLaMAInnerModel(nn.Module):
         :param conditional_cos:
         :param conditional_sin:
         """
-        full_hidden_states = self.embed_tokens(input_ids)
-        conditional_hidden_states = full_hidden_states.detach().clone()
+        # [batch_size, seq_len, dim]
+        embeddings = self.embed_tokens(input_ids)
+        # [batch_size, seq_len - block_size, dim]
+        full_hidden_states = embeddings[:, :-self.train_config.block_size, :].clone()
+        conditional_hidden_states = embeddings[:, self.train_config.block_size:, :].clone()
         for layer_i, layer in enumerate(self.layers):
             if self.config.gradient_checkpointing:
                 layer_out = torch.utils.checkpoint.checkpoint(
