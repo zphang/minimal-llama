@@ -90,8 +90,15 @@ class P3FewshotHyperTrainIterator:
             if self.add_special_tokens:
                 raw_input_ids = [LLAMA_BOS_TOKEN_ID] + raw_input_ids + [LLAMA_EOS_TOKEN_ID]
                 raw_type_mask = [LLAMA_INPUT_TYPE_ID] + raw_type_mask + [LLAMA_TARGET_TYPE_ID]
-            input_ids = pad_tokens(raw_input_ids, max_length=self.block_size, pad_token_id=LLAMA_PAD_TOKEN_ID)
-            type_mask = pad_tokens(raw_type_mask, max_length=self.block_size, pad_token_id=LLAMA_PAD_TYPE_ID)
+            input_ids = pad_tokens(
+                raw_input_ids, max_length=self.block_size, pad_token_id=LLAMA_PAD_TOKEN_ID)
+            type_mask = pad_tokens(
+                raw_type_mask, max_length=self.block_size, pad_token_id=LLAMA_PAD_TYPE_ID)
+            if self.add_special_tokens:
+                if input_ids[0] != LLAMA_PAD_TOKEN_ID:
+                    input_ids[0] = LLAMA_BOS_TOKEN_ID
+                    type_mask[0] = LLAMA_INPUT_TYPE_ID
+
             if self.predict_input:
                 # Don't predict BOS
                 labels = [
