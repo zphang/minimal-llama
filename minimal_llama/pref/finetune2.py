@@ -147,9 +147,12 @@ def main():
     elif finetune_args.dataset_type == "p3":
         if finetune_args.p3_subset_name == "t0_short":
             subset_filename = "p3_t0_short_tasks.json"
+            subset = io_utils.read_json(assets_utils.get_assets_path("subsets", subset_filename))
+        elif finetune_args.p3_subset_name.startswith("single_task:"):
+            subset = [finetune_args.p3_subset_name.split("single_task:")[1]]
         else:
             raise KeyError(finetune_args.p3_subset_name)
-        subset = io_utils.read_json(assets_utils.get_assets_path("subsets", subset_filename))
+
         dataset = p3_datasets.P3FewshotHyperTrainDataset(
             base_path=finetune_args.dataset_path,
             full_sequence_length=compress_args.max_sequence_length,
@@ -157,6 +160,7 @@ def main():
             add_special_tokens=True,
             add_answer_indicator=finetune_args.add_answer_indicator,
             subset=subset,
+            predict_input=finetune_args.input_loss_weight is not None,
         )
         data_collator = p3_datasets.p3_data_collator
     else:
