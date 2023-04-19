@@ -49,6 +49,12 @@ LLAMA_7B_CONFIG = LLaMAConfig(
     n_heads=32,
 )
 
+DEBUG_CONFIG = LLaMAConfig(
+    dim=64,
+    n_layers=3,
+    n_heads=4,
+)
+
 LLAMA_CONFIG_DICT = {
     "7b": LLAMA_7B_CONFIG,
 }
@@ -722,28 +728,29 @@ def create_model(model_name, hf_path, train_config: TrainConfig, use_8bit=False,
         torch.set_default_tensor_type(torch.cuda.HalfTensor)
         model = LLaMAModel(config=config, train_config=train_config).cuda()
         torch.set_default_tensor_type(torch.FloatTensor)
-        state_keys = set(model.state_dict())
-        for filename in tqdm.tqdm(filename_list):
-            loaded = torch.load(os.path.join(hf_path, filename), map_location="cpu")
-            if train_config.factorized_compressor:
-                for k, v in list(loaded.items()):
-                    if "self_attn.k_proj" in k:
-                        layer_i = int(k.split(".")[2])
-                        new_k = f"model.layers.{layer_i}.self_attn.k_compressor.sub_k_proj.weight"
-                        loaded[new_k] = v.clone()
-                    if "self_attn.v_proj" in k:
-                        layer_i = int(k.split(".")[2])
-                        new_k = f"model.layers.{layer_i}.self_attn.v_compressor.sub_k_proj.weight"
-                        loaded[new_k] = v.clone()
-                    if "self_attn.q_proj" in k:
-                        layer_i = int(k.split(".")[2])
-                        new_k = f"model.layers.{layer_i}.self_attn.k_compressor.sub_q_proj.weight"
-                        loaded[new_k] = v.clone()
-                        new_k = f"model.layers.{layer_i}.self_attn.v_compressor.sub_q_proj.weight"
-                        loaded[new_k] = v.clone()
-            model.load_state_dict(loaded, strict=False)
-            for k in loaded:
-                state_keys.remove(k)
+        if model_name != "debug":
+            state_keys = set(model.state_dict())
+            for filename in tqdm.tqdm(filename_list):
+                loaded = torch.load(os.path.join(hf_path, filename), map_location="cpu")
+                if train_config.factorized_compressor:
+                    for k, v in list(loaded.items()):
+                        if "self_attn.k_proj" in k:
+                            layer_i = int(k.split(".")[2])
+                            new_k = f"model.layers.{layer_i}.self_attn.k_compressor.sub_k_proj.weight"
+                            loaded[new_k] = v.clone()
+                        if "self_attn.v_proj" in k:
+                            layer_i = int(k.split(".")[2])
+                            new_k = f"model.layers.{layer_i}.self_attn.v_compressor.sub_k_proj.weight"
+                            loaded[new_k] = v.clone()
+                        if "self_attn.q_proj" in k:
+                            layer_i = int(k.split(".")[2])
+                            new_k = f"model.layers.{layer_i}.self_attn.k_compressor.sub_q_proj.weight"
+                            loaded[new_k] = v.clone()
+                            new_k = f"model.layers.{layer_i}.self_attn.v_compressor.sub_q_proj.weight"
+                            loaded[new_k] = v.clone()
+                model.load_state_dict(loaded, strict=False)
+                for k in loaded:
+                    state_keys.remove(k)
 
     print(f"Not loaded: {state_keys}")
 
