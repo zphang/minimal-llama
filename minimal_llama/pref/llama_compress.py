@@ -74,6 +74,20 @@ class TrainConfig:
         )
 
 
+@dataclasses.dataclass
+class ModelContext:
+    """
+    module:
+    submodule:
+    """
+    layer: int = None
+    module: str = None
+    submodule: str = None
+
+    def update(self, **kwargs):
+        return dataclasses.replace(self, **kwargs)
+
+
 class LLaMAModel(nn.Module):
     def __init__(self, config: LLaMAConfig, train_config: TrainConfig):
         super().__init__()
@@ -176,8 +190,8 @@ class LLaMAInnerModel(nn.Module):
         self.train_config = train_config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.dim, dtype=config.dtype)
         self.layers = nn.ModuleList([
-            LLaMALayer(config=config, train_config=train_config)
-            for _ in range(config.n_layers)
+            LLaMALayer(config=config, train_config=train_config, context=ModelContext(layer=layer_i))
+            for layer_i in range(config.n_layers)
         ])
         self.norm = RMSNorm(dim=config.dim)
 
@@ -234,11 +248,12 @@ class LLaMAInnerModel(nn.Module):
 
 
 class LLaMALayer(nn.Module):
-    def __init__(self, config: LLaMAConfig, train_config: TrainConfig):
+    def __init__(self, config: LLaMAConfig, train_config: TrainConfig, context: ModelContext):
         super().__init__()
         self.config = config
         self.train_config = train_config
-        self.self_attn = Attention(config=config, train_config=train_config)
+        self.context = context
+        self.self_attn = Attention(config=config, train_config=train_config, context=context.update(module="attn"))
         self.mlp = MLP(config=config)
         self.input_layernorm = RMSNorm(dim=config.dim, dtype=config.dtype)
         self.post_attention_layernorm = RMSNorm(dim=config.dim, dtype=config.dtype)
@@ -331,10 +346,11 @@ class RMSNorm(torch.nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, config: LLaMAConfig, train_config: TrainConfig):
+    def __init__(self, config: LLaMAConfig, train_config: TrainConfig, context: ModelContext):
         super().__init__()
         self.config = config
         self.train_config = train_config
+        self.context = context
         self.n_heads = config.n_heads
         self.head_dim = config.dim // config.n_heads
         self.block_size = self.train_config.block_size
