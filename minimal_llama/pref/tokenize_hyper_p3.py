@@ -25,12 +25,15 @@ def main():
     else:
         task_name = args.task_name
     print(f"Tokenizing task {task_name}")
-    tokenizer = transformers.LlamaTokenizer.from_pretrained(args.tokenizer_path)
+    llama_tokenizer = transformers.LlamaTokenizer.from_pretrained(args.tokenizer_path)
+    t5_tokenizer = transformers.T5TokenizerFast.from_pretrained("t5-base")
 
     def map_fn(example):
-        out =  {
-            "inputs": tokenizer(example["inputs_pretokenized"], add_special_tokens=False)["input_ids"],
-            "targets": tokenizer(example["targets_pretokenized"], add_special_tokens=False)["input_ids"],
+        out = {
+            "t5_inputs": t5_tokenizer(example["inputs_pretokenized"], add_special_tokens=False)["input_ids"],
+            "t5_targets": llama_tokenizer(example["targets_pretokenized"], add_special_tokens=False)["input_ids"],
+            "llama_inputs": llama_tokenizer(example["inputs_pretokenized"], add_special_tokens=False)["input_ids"],
+            "llama_targets": llama_tokenizer(example["targets_pretokenized"], add_special_tokens=False)["input_ids"],
         }
         if "is_correct" in example:
             out["is_correct"] = example["is_correct"]

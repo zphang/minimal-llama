@@ -235,8 +235,10 @@ class P3FewshotHyperValidationDataset(Dataset):
 
 
 def p3_data_collator(features: list) -> dict:
-    return {
+    out = {
         "input_ids": torch.stack([torch.LongTensor(f["input_ids"]) for f in features]),
         "labels": torch.stack([torch.LongTensor(f["labels"]) for f in features]),
-        "type_mask": torch.stack([torch.LongTensor(f["type_mask"]) for f in features]),
     }
+    if "type_mask" in features[0]:
+        out["type_mask"]: torch.stack([torch.LongTensor(f["type_mask"]) for f in features])
+    return out
