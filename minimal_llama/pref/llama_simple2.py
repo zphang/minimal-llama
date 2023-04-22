@@ -21,15 +21,23 @@ class LLaMAConfig:
     n_heads: int
     vocab_size: int = 32000
     max_seq_length: int = 2048
-    dtype = torch.float16
+    dtype: torch.Type = torch.float16
     pad_token_id: int = 0
     bos_token_id: int = 1
     eos_token_id: int = 2
     use_8bit: bool = False
+    gradient_checkpointing: bool = False
 
     @property
     def head_dim(self):
         return self.dim // self.n_heads
+
+    @property
+    def hidden_size(self):
+        return self.dim
+
+    def to_dict(self):
+        return dataclasses.asdict(self)
 
 
 LLAMA_7B_CONFIG = LLaMAConfig(
@@ -37,9 +45,15 @@ LLAMA_7B_CONFIG = LLaMAConfig(
     n_layers=32,
     n_heads=32,
 )
+DEBUG_CONFIG = LLaMAConfig(
+    dim=64,
+    n_layers=3,
+    n_heads=4,
+)
 
 LLAMA_CONFIG_DICT = {
     "7b": LLAMA_7B_CONFIG,
+    "debug": DEBUG_CONFIG,
 }
 
 
@@ -63,6 +77,7 @@ class LLaMAModel(nn.Module):
         attention_mask = create_attention_mask(input_ids=input_ids, dtype=self.config.dtype)
         rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
         cos, sin = self.get_cos_sin(rope_embed_ids)
+        cos, sin = cos[:, None, :, :], sin[:, None, :, :]
 
         # 2) Forward pass
         # [batch_size, seq_len, hidden_dim]
@@ -138,6 +153,7 @@ class LLaMAModel(nn.Module):
         # )
         rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
         cos, sin = self.get_cos_sin(rope_embed_ids)
+        cos, sin = cos[:, None, :, :], sin[:, None, :, :]
         model_out = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -181,6 +197,7 @@ class LLaMAModel(nn.Module):
             # )
             rope_embed_ids = create_rope_embed_ids(input_ids=input_ids) + num_valid_tokens[:, None]
             cos, sin = self.get_cos_sin(rope_embed_ids)
+            cos, sin = cos[:, None, :, :], sin[:, None, :, :]
             model_out = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -233,6 +250,7 @@ class LLaMAInnerModel(nn.Module):
         :param sin:
         """
         hidden_states = self.embed_tokens(input_ids)
+        hidden_states = hidden_states.to(self.config.dtype)
 
         new_kv_cache = []
         for layer_i, layer in enumerate(self.layers):
@@ -245,12 +263,22 @@ class LLaMAInnerModel(nn.Module):
             else:
                 layer_kv_cache = None
 
-            layer_out = layer(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                kv_cache=layer_kv_cache,
-                cos=cos, sin=sin,
-            )
+            if self.config.gradient_checkpointing:
+                layer_out = torch.utils.checkpoint.checkpoint(
+                    layer,
+                    hidden_states,
+                    attention_mask,
+                    cos, sin,
+                    None,
+                )
+            else:
+                layer_out = layer(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    cos=cos, sin=sin,
+                    kv_cache=layer_kv_cache,
+                )
+
             hidden_states = layer_out["hidden_states"]
             if kv_cache:
                 new_kv_cache.append(layer_out["kv_cache"])
@@ -281,7 +309,7 @@ class LLaMALayer(nn.Module):
     ):
         # 1) Self-attention
         # [batch_size, seq_len, hidden_dim]
-        normed_hidden_states = self.input_layernorm(hidden_states)
+        normed_hidden_states = self.input_layernorm(hidden_states).to(self.config.dtype)
         # dict(
         #   attn_output = [batch_size, seq_len, hidden_dim]
         #   kv_cache = dict(
@@ -391,15 +419,12 @@ class Attention(nn.Module):
             key_states = torch.cat([kv_cache["key"], key_states], dim=2)
             value_states = torch.cat([kv_cache["value"], value_states], dim=2)
 
-        scores = torch.matmul(
-            query_states, key_states.transpose(3, 2).type_as(query_states) / math.sqrt(self.head_dim)
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query=query_states,
+            key=key_states,
+            value=value_states,
+            attn_mask=attention_mask,
         )
-        scores += attention_mask
-
-        # (batch_size, num_heads, q_seq_len, kv_seq_len)
-        attn_weights = F.softmax(scores.float(), dim=-1).type_as(scores)
-        # (batch_size, num_heads, q_seq_len, head_dim)
-        attn_output = torch.matmul(attn_weights, value_states.type_as(query_states))
         # (batch_size, q_seq_len, hidden_dim)
         attn_output = attn_output.transpose(1, 2).contiguous().view(
             batch_size, q_seq_len, hidden_dim,
