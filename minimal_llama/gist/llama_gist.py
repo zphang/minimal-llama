@@ -110,11 +110,4 @@ def create_model(model_name, hf_path, num_gist_tokens, device=None, dtype=torch.
             state_keys.remove(k)
     assert not state_keys, "Some keys were not loaded: {}".format(state_keys)
 
-    # # DEBUG
-    # model.model.embed_tokens = model.model.embed_tokens.to(torch.float32)
-    # for n, p in model.named_parameters():
-    #     if "model.embed_tokens" in n:
-    #         p.requires_grad = True
-    #     else:
-    #         p.requires_grad = False
     return model
