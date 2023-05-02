@@ -93,6 +93,35 @@ def data_collator(features: list) -> dict:
     return batch
 
 
+def last_checkpoint_handling(training_args):
+    """HF logic for getting last checkpoint/overwriting an existing run
+    """
+    # Detecting last checkpoint.
+    last_checkpoint = None
+    if io_utils.fsspec_isdir(
+            training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
+        last_checkpoint = get_last_checkpoint(training_args.output_dir)
+        print(f"123 {last_checkpoint}")
+        if last_checkpoint is None and len(io_utils.fsspec_listdir(training_args.output_dir)) > 0:
+            raise ValueError(
+                f"Output directory ({training_args.output_dir}) already exists and is not empty. "
+                "Use --overwrite_output_dir to overcome."
+            )
+        elif last_checkpoint is not None:
+            print(
+                f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
+                "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
+            )
+        else:
+            print(f"No checkpoint detected at {training_args.output_dir}, starting afresh")
+    else:
+        print(f"No checkpoint detected at {training_args.output_dir}, starting afresh")
+    checkpoint = None
+    if last_checkpoint is not None:
+        checkpoint = last_checkpoint
+    return checkpoint
+
+
 def main():
     finetune_args, gist_args, training_args = HfArgumentParser((
         FinetuneArguments,
@@ -134,7 +163,12 @@ def main():
         train_dataset=train_ds,
         data_collator=data_collator,
     )
-    trainer.train()
+    checkpoint = last_checkpoint_handling(training_args=training_args)
+    if trainer.is_world_process_zero():
+        print("Loading from checkpoint", checkpoint)
+    trainer.train(
+        resume_from_checkpoint=checkpoint,
+    )
 
 
 if __name__ == "__main__":
