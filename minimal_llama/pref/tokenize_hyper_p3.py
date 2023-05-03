@@ -45,7 +45,11 @@ def main():
             cache_dir="/home/zp489/scratch/working/2206/08_msft/p3/cache/",
             split=[phase],
         )[0]
-        remove = [feat for feat in ds.features if feat not in ["inputs", "targets", "is_correct"]]
+        remove = [feat for feat in ds.features if feat not in [
+            "t5_inputs", "t5_targets",
+            "llama_inputs", "llama_targets"
+            "is_correct",
+        ]]
         out_ds = ds.map(map_fn, remove_columns=remove)
         out_ds.save_to_disk(os.path.join(args.save_path, phase, task_name))
         print(f"Tokenizing phase {phase} DONE: {os.path.join(args.save_path, phase, task_name)}")

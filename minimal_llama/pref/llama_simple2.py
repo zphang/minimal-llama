@@ -115,7 +115,7 @@ class LLaMAModel(nn.Module):
             })
         return kv_cache
 
-    def generate(self, input_ids, generation_length: 20):
+    def generate(self, input_ids, generation_length: int = 20):
         """Generate tokens with efficient caching of KV.
 
         TODO: Add stopping conditions
@@ -216,13 +216,21 @@ class LLaMAModel(nn.Module):
     def get_cos_sin(self, rope_embed_ids):
         cos = F.embedding(
             rope_embed_ids,
-            self.model.layers[0].self_attn.rotary_emb.cos_cached[0, 0]
+            self.model.layers[0].self_attn.rotary_emb.cos_cached[0, 0].to(rope_embed_ids.device)
         ).to(self.config.dtype)
         sin = F.embedding(
             rope_embed_ids,
-            self.model.layers[0].self_attn.rotary_emb.sin_cached[0, 0]
+            self.model.layers[0].self_attn.rotary_emb.sin_cached[0, 0].to(rope_embed_ids.device)
         ).to(self.config.dtype)
         return cos, sin
+
+    def gradient_checkpointing_enable(self):
+        self.config.gradient_checkpointing = True
+
+    def enable_input_require_grads(self):
+        def make_inputs_require_grads(module, input, output):
+            output.requires_grad_(True)
+        self.model.embed_tokens.register_forward_hook(make_inputs_require_grads)
 
 
 class LLaMAInnerModel(nn.Module):

@@ -14,6 +14,7 @@ from minimal_llama.pref.llama_simple2 import (
     create_rope_embed_ids,
     convert_mask_to_soft_mask,
     create_attention_mask,
+    create_generation_attention_mask,
 )
 
 
@@ -48,7 +49,6 @@ class LLaMAModel(nn.Module):
         # [batch_size, num_heads=1, q_len=seq_len, kv_len=seq_len]
         rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
         cos, sin = self.get_cos_sin(rope_embed_ids)
-        cos, sin = cos[:, None, :, :], sin[:, None, :, :]
 
         # 2) Forward pass
         # [batch_size, seq_len, hidden_dim]
@@ -61,24 +61,124 @@ class LLaMAModel(nn.Module):
         logits = self.lm_head(model_out["hidden_states"])
         return logits
 
-    def get_cos_sin(self, rope_embed_ids):
-        cos = F.embedding(
-            rope_embed_ids,
-            self.model.layers[0].self_attn.rotary_emb.cos_cached[0, 0].to(rope_embed_ids.device)
-        ).to(self.config.dtype)
-        sin = F.embedding(
-            rope_embed_ids,
-            self.model.layers[0].self_attn.rotary_emb.sin_cached[0, 0].to(rope_embed_ids.device)
-        ).to(self.config.dtype)
-        return cos, sin
+    def init_kv_cache(self, input_ids):
+        # noinspection GrazieInspection
+        """Initialize KV cache for decoding.
 
-    def gradient_checkpointing_enable(self):
-        self.config.gradient_checkpointing = True
+        A KV cache consists of a list of dicts (one per layer):
+            dict(
+              key = [batch_size, num_heads, kv_seq_len=0, head_dim]
+              value = [batch_size, num_heads, kv_seq_len=0, head_dim]
+            )
 
-    def enable_input_require_grads(self):
-        def make_inputs_require_grads(module, input, output):
-            output.requires_grad_(True)
-        self.model.embed_tokens.register_forward_hook(make_inputs_require_grads)
+        :param input_ids: [batch_size, dec_seq_len]
+        :return: 0-length kv_cache
+        """
+        kv_cache = []
+        batch_size = input_ids.shape[0]
+        num_heads = self.config.n_heads
+        head_dim = self.config.head_dim
+        for layer in self.model.layers:
+            device = layer.input_layernorm.weight.device
+            kv_cache.append({
+                "key": torch.zeros([batch_size, num_heads, 0, head_dim]).to(device),
+                "value": torch.zeros([batch_size, num_heads, 0, head_dim]).to(device),
+            })
+        return kv_cache
+
+    def generate(self,
+                 input_ids,
+                 initial_attention_mask,
+                 generation_length: int = 20):
+        """Generate tokens with efficient caching of KV.
+
+        TODO: Add stopping conditions
+        TODO: Add sampling capabilities
+
+        :param input_ids: [batch_size, enc_seq_len]
+        :param initial_attention_mask:
+        :param generation_length: int
+        :return: [batch_size, generation_length]
+        """
+        original_input_ids = input_ids
+        batch_size, seq_len = input_ids.shape
+        # noinspection PyUnresolvedReferences
+        num_valid_tokens = (input_ids != self.config.pad_token_id).long().sum(dim=1)
+
+        # 1) Setup
+        if input_ids is None:
+            # [batch_size, dec_seq_len=1]
+            input_ids = torch.LongTensor(
+                [[self.config.pad_token_id]] * batch_size
+            ).to(self.lm_head.weights.device)
+        # See: init_kv_cache. list[dict]
+        kv_cache = self.init_kv_cache(input_ids)
+        generated_token_ids_list = [original_input_ids]
+        total_seq_len = seq_len
+
+        # 2) First encoding
+        # [batch_size=1, num_heads=1, q_len=1, kv_len=1]
+        attention_mask = create_attention_mask(input_ids=input_ids, dtype=self.config.dtype)
+        # dict(
+        #   hidden_states = [batch_size, dec_seq_len=decode_step+1, hidden_dim]
+        #   kv_cache = list[dict(
+        #     key = [batch_size, num_heads, kv_seq_len=decode_step+1, head_dim]
+        #     value = [batch_size, num_heads, kv_seq_len=decode_step+1, head_dim]
+        #   )]
+        # )
+        rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
+        cos, sin = self.get_cos_sin(rope_embed_ids)
+        cos, sin = cos[:, None, :, :], sin[:, None, :, :]
+        model_out = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            cos=cos, sin=sin,
+            kv_cache=kv_cache,
+        )
+        logits = self.lm_head(model_out["hidden_states"])
+        kv_cache = model_out["kv_cache"]
+        generated_token_ids = logits.argmax(-1)[
+            torch.arange(batch_size, dtype=torch.long, device=input_ids.device),
+            num_valid_tokens-1,
+        ][:, None]
+        generated_token_ids_list.append(generated_token_ids)
+        input_ids = generated_token_ids
+
+        # 3) Subsequent steps
+        for decode_step in range(generation_length-1):
+            num_valid_tokens += 1
+            total_seq_len += 1
+            # [batch_size=1, num_heads=1, q_len=1, kv_len=1]
+            attention_mask = convert_mask_to_soft_mask(create_generation_attention_mask(
+                batch_size=batch_size,
+                seq_len=total_seq_len,
+                num_valid_tokens=num_valid_tokens,
+                device=input_ids.device,
+            ), dtype=self.config.dtype)
+            # dict(
+            #   hidden_states = [batch_size, dec_seq_len=decode_step+1, hidden_dim]
+            #   kv_cache = list[dict(
+            #     key = [batch_size, num_heads, kv_seq_len=decode_step+1, head_dim]
+            #     value = [batch_size, num_heads, kv_seq_len=decode_step+1, head_dim]
+            #   )]
+            # )
+            rope_embed_ids = create_rope_embed_ids(input_ids=input_ids) + num_valid_tokens[:, None]
+            cos, sin = self.get_cos_sin(rope_embed_ids)
+            cos, sin = cos[:, None, :, :], sin[:, None, :, :]
+            model_out = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                kv_cache=kv_cache,
+                cos=cos, sin=sin,
+            )
+            # [batch_size, dec_seq_len=1, vocab_size]
+            logits = self.lm_head(model_out["hidden_states"])
+            kv_cache = model_out["kv_cache"]
+            # [batch_size, dec_seq_len=1]
+            generated_token_ids = logits.argmax(-1)[:, -1:]
+            generated_token_ids_list.append(generated_token_ids)
+            input_ids = generated_token_ids
+        return torch.cat(generated_token_ids_list, dim=1)
 
 
 def create_model(model_name, hf_path, num_gist_tokens, device=None, dtype=torch.float16):
