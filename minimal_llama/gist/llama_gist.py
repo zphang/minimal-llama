@@ -81,15 +81,18 @@ class LLaMAModel(nn.Module):
         for layer in self.model.layers:
             device = layer.input_layernorm.weight.device
             kv_cache.append({
-                "key": torch.zeros([batch_size, num_heads, 0, head_dim]).to(device),
-                "value": torch.zeros([batch_size, num_heads, 0, head_dim]).to(device),
+                "key": torch.zeros([batch_size, num_heads, 0, head_dim]).to(
+                    device=device, dtype=self.config.dtype),
+                "value": torch.zeros([batch_size, num_heads, 0, head_dim]).to(
+                    device=device, dtype=self.config.dtype),
             })
         return kv_cache
 
     def generate(self,
                  input_ids,
                  initial_attention_mask,
-                 generation_length: int = 20):
+                 generation_length: int = 20,
+                 return_output_only=True):
         """Generate tokens with efficient caching of KV.
 
         TODO: Add stopping conditions
@@ -118,7 +121,8 @@ class LLaMAModel(nn.Module):
 
         # 2) First encoding
         # [batch_size=1, num_heads=1, q_len=1, kv_len=1]
-        attention_mask = create_attention_mask(input_ids=input_ids, dtype=self.config.dtype)
+        attention_mask = convert_mask_to_soft_mask(
+            initial_attention_mask[:, None, :, :], dtype=self.config.dtype)
         # dict(
         #   hidden_states = [batch_size, dec_seq_len=decode_step+1, hidden_dim]
         #   kv_cache = list[dict(
@@ -178,7 +182,29 @@ class LLaMAModel(nn.Module):
             generated_token_ids = logits.argmax(-1)[:, -1:]
             generated_token_ids_list.append(generated_token_ids)
             input_ids = generated_token_ids
-        return torch.cat(generated_token_ids_list, dim=1)
+        output = torch.cat(generated_token_ids_list, dim=1)
+        if return_output_only:
+            output = output[:, seq_len:]
+        return output
+
+    def get_cos_sin(self, rope_embed_ids):
+        cos = F.embedding(
+            rope_embed_ids,
+            self.model.layers[0].self_attn.rotary_emb.cos_cached[0, 0].to(rope_embed_ids.device)
+        ).to(self.config.dtype)
+        sin = F.embedding(
+            rope_embed_ids,
+            self.model.layers[0].self_attn.rotary_emb.sin_cached[0, 0].to(rope_embed_ids.device)
+        ).to(self.config.dtype)
+        return cos, sin
+
+    def gradient_checkpointing_enable(self):
+        self.config.gradient_checkpointing = True
+
+    def enable_input_require_grads(self):
+        def make_inputs_require_grads(module, input, output):
+            output.requires_grad_(True)
+        self.model.embed_tokens.register_forward_hook(make_inputs_require_grads)
 
 
 def create_model(model_name, hf_path, num_gist_tokens, device=None, dtype=torch.float16):
