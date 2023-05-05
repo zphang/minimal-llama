@@ -1,6 +1,7 @@
 import os
 import sys
 
+import re
 import datasets
 import torch
 import torch.nn as nn
@@ -13,12 +14,14 @@ from transformers import (
     HfArgumentParser,
 )
 import transformers
-from transformers.trainer_utils import get_last_checkpoint
 from torch.utils.data import Dataset
 import minimal_llama.gist.data.p3 as p3_datasets
 import minimal_llama.gist.llama_gist as llama_gist
 import proj_shared.assets_utils as assets_utils
 import proj_shared.io_utils as io_utils
+
+PREFIX_CHECKPOINT_DIR = "checkpoint"
+_re_checkpoint = re.compile(r"^" + PREFIX_CHECKPOINT_DIR + r"\-(\d+)$")
 
 
 @dataclass
@@ -35,6 +38,7 @@ class FinetuneArguments:
 
 @dataclass
 class GistArguments:
+    data_mode: str = field(default="multigist")
     max_num_examples: int = field(default=32)
     num_gist_tokens: int = field(default=8)
     max_sequence_length: int = field(default=512)
@@ -55,7 +59,10 @@ class ModifiedTrainer(Trainer):
             type_mask = inputs["type_mask"]
             loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
             all_loss = loss_fct(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
-            loss_weights_by_type = torch.Tensor([0.0, model.finetune_args.input_loss_weight, 1.0, 0.0]).float().cuda()
+            # Refer to type IDs in p3.py
+            loss_weights_by_type = torch.Tensor([
+                0.0, model.finetune_args.input_loss_weight, 1.0, 0.0, 0.0
+            ]).float().cuda()
             loss_weights = loss_weights_by_type[type_mask.reshape(-1)]
             loss = (all_loss * loss_weights).sum() / loss_weights.sum()
         else:
@@ -75,13 +82,13 @@ class ModifiedTrainer(Trainer):
         # If we are executing this function, we are the process zero, so we don't check for that.
         output_dir = output_dir if output_dir is not None else self.args.output_dir
         os.makedirs(output_dir, exist_ok=True)
-        torch.save(
+        io_utils.fsspec_torch_save(
             self.model.state_dict(),
             os.path.join(output_dir, f"checkpoint.p"),
         )
 
         # Good practice: save your training arguments together with the trained model
-        torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
+        io_utils.fsspec_torch_save(self.args, os.path.join(output_dir, "training_args.bin"))
 
 
 def data_collator(features: list) -> dict:
@@ -91,6 +98,18 @@ def data_collator(features: list) -> dict:
         for k in keys
     }
     return batch
+
+
+def get_last_checkpoint(folder):
+    content = io_utils.fsspec_listdir(folder)
+    checkpoints = [
+        path
+        for path in content
+        if _re_checkpoint.search(path) is not None and io_utils.fsspec_isdir(os.path.join(folder, path))
+    ]
+    if len(checkpoints) == 0:
+        return
+    return os.path.join(folder, max(checkpoints, key=lambda x: int(_re_checkpoint.search(x).groups()[0])))
 
 
 def last_checkpoint_handling(training_args):
@@ -140,6 +159,7 @@ def main():
     train_ds = p3_datasets.P3FewshotHyperTrainDataset(
         base_path=finetune_args.dataset_path,
         num_gist_tokens=gist_args.num_gist_tokens,
+        mode=gist_args.data_mode,
         full_sequence_length=gist_args.max_sequence_length,
         add_special_tokens=True,
         add_answer_indicator=finetune_args.add_answer_indicator,

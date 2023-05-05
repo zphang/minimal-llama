@@ -31,7 +31,7 @@ def main():
     def map_fn(example):
         out = {
             "t5_inputs": t5_tokenizer(example["inputs_pretokenized"], add_special_tokens=False)["input_ids"],
-            "t5_targets": llama_tokenizer(example["targets_pretokenized"], add_special_tokens=False)["input_ids"],
+            "t5_targets": t5_tokenizer(example["targets_pretokenized"], add_special_tokens=False)["input_ids"],
             "llama_inputs": llama_tokenizer(example["inputs_pretokenized"], add_special_tokens=False)["input_ids"],
             "llama_targets": llama_tokenizer(example["targets_pretokenized"], add_special_tokens=False)["input_ids"],
         }
