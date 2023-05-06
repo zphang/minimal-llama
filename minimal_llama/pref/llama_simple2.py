@@ -77,7 +77,6 @@ class LLaMAModel(nn.Module):
         attention_mask = create_attention_mask(input_ids=input_ids, dtype=self.config.dtype)
         rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
         cos, sin = self.get_cos_sin(rope_embed_ids)
-        cos, sin = cos[:, None, :, :], sin[:, None, :, :]
 
         # 2) Forward pass
         # [batch_size, seq_len, hidden_dim]
@@ -110,8 +109,8 @@ class LLaMAModel(nn.Module):
         for layer in self.model.layers:
             device = layer.input_layernorm.weight.device
             kv_cache.append({
-                "key": torch.zeros([batch_size, num_heads, 0, head_dim]).to(device),
-                "value": torch.zeros([batch_size, num_heads, 0, head_dim]).to(device),
+                "key": torch.zeros([batch_size, num_heads, 0, head_dim]).to(device=device, dtype=self.config.dtype),
+                "value": torch.zeros([batch_size, num_heads, 0, head_dim]).to(device=device, dtype=self.config.dtype),
             })
         return kv_cache
 
@@ -153,7 +152,6 @@ class LLaMAModel(nn.Module):
         # )
         rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
         cos, sin = self.get_cos_sin(rope_embed_ids)
-        cos, sin = cos[:, None, :, :], sin[:, None, :, :]
         model_out = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -197,7 +195,6 @@ class LLaMAModel(nn.Module):
             # )
             rope_embed_ids = create_rope_embed_ids(input_ids=input_ids) + num_valid_tokens[:, None]
             cos, sin = self.get_cos_sin(rope_embed_ids)
-            cos, sin = cos[:, None, :, :], sin[:, None, :, :]
             model_out = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -222,6 +219,7 @@ class LLaMAModel(nn.Module):
             rope_embed_ids,
             self.model.layers[0].self_attn.rotary_emb.sin_cached[0, 0].to(rope_embed_ids.device)
         ).to(self.config.dtype)
+        cos, sin = cos[:, None, :, :], sin[:, None, :, :]
         return cos, sin
 
     def gradient_checkpointing_enable(self):
