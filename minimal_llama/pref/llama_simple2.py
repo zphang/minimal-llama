@@ -167,13 +167,13 @@ class LLaMAModel(nn.Module):
         generated_token_ids_list.append(generated_token_ids)
         input_ids = generated_token_ids
 
-        # 2.1 shift KV cache
-        for layer_kv_cache in kv_cache:
-            for i in range(batch_size):
-                layer_kv_cache["key"] = shift_kv_cache_right(
-                    layer_kv_cache["key"], num_valid_tokens=num_valid_tokens)
-                layer_kv_cache["value"] = shift_kv_cache_right(
-                    layer_kv_cache["value"], num_valid_tokens=num_valid_tokens)
+        # # 2.1 shift KV cache
+        # for layer_kv_cache in kv_cache:
+        #     for i in range(batch_size):
+        #         layer_kv_cache["key"] = shift_kv_cache_right(
+        #             layer_kv_cache["key"], num_valid_tokens=num_valid_tokens)
+        #         layer_kv_cache["value"] = shift_kv_cache_right(
+        #             layer_kv_cache["value"], num_valid_tokens=num_valid_tokens)
 
         # 3) Subsequent steps
         for decode_step in range(generation_length-1):
@@ -275,7 +275,7 @@ class LLaMAInnerModel(nn.Module):
                     hidden_states,
                     attention_mask,
                     cos, sin,
-                    None,
+                    layer_kv_cache,
                 )
             else:
                 layer_out = layer(

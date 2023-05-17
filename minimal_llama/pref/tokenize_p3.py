@@ -30,15 +30,12 @@ def main():
     else:
         task_name = args.task_name
     print(f"Tokenizing task {task_name}")
-    llama_tokenizer = transformers.LlamaTokenizer.from_pretrained(args.tokenizer_path)
-    t5_tokenizer = transformers.T5TokenizerFast.from_pretrained("t5-base")
+    tokenizer = transformers.LlamaTokenizer.from_pretrained(args.tokenizer_path)
 
     def map_fn(example):
-        out = {
-            "t5_inputs": t5_tokenizer(example["inputs_pretokenized"], add_special_tokens=False)["input_ids"],
-            "t5_targets": t5_tokenizer(example["targets_pretokenized"], add_special_tokens=False)["input_ids"],
-            "llama_inputs": llama_tokenizer(example["inputs_pretokenized"], add_special_tokens=False)["input_ids"],
-            "llama_targets": llama_tokenizer(example["targets_pretokenized"], add_special_tokens=False)["input_ids"],
+        out =  {
+            "inputs": tokenizer(example["inputs_pretokenized"], add_special_tokens=False)["input_ids"],
+            "targets": tokenizer(example["targets_pretokenized"], add_special_tokens=False)["input_ids"],
         }
         if "is_correct" in example:
             out["is_correct"] = example["is_correct"]
@@ -50,11 +47,7 @@ def main():
             cache_dir="/home/zp489/scratch/working/2206/08_msft/p3/cache/",
             split=[phase],
         )[0]
-        remove = [feat for feat in ds.features if feat not in [
-            "t5_inputs", "t5_targets",
-            "llama_inputs", "llama_targets"
-            "is_correct",
-        ]]
+        remove = [feat for feat in ds.features if feat not in ["inputs", "targets", "is_correct"]]
         out_ds = ds.map(map_fn, remove_columns=remove)
         out_ds.save_to_disk(os.path.join(args.save_path, phase, task_name))
         print(f"Tokenizing phase {phase} DONE: {os.path.join(args.save_path, phase, task_name)}")

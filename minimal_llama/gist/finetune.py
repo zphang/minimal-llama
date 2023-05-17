@@ -92,15 +92,6 @@ class ModifiedTrainer(Trainer):
         io_utils.fsspec_torch_save(self.args, os.path.join(output_dir, "training_args.bin"))
 
 
-def data_collator(features: list) -> dict:
-    keys = features[0].keys()
-    batch = {
-        k: torch.stack([torch.LongTensor(f[k]) for f in features])
-        for k in keys
-    }
-    return batch
-
-
 def get_last_checkpoint(folder):
     content = io_utils.fsspec_listdir(folder)
     checkpoints = [
@@ -182,7 +173,7 @@ def main():
         model=model,
         args=training_args,
         train_dataset=train_ds,
-        data_collator=data_collator,
+        data_collator=p3_datasets.data_collator,
     )
     checkpoint = last_checkpoint_handling(training_args=training_args)
     if trainer.is_world_process_zero():
