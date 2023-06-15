@@ -294,7 +294,7 @@ class LLaMAInnerModel(nn.Module):
                     hidden_states=hidden_states,
                     cos=cos, sin=sin,
                     use_kv_cache=use_kv_cache,
-                    kv_cache=kv_cache,
+                    kv_cache=layer_kv_cache,
                     num_valid_tokens=num_valid_tokens,
                 )
 
@@ -448,19 +448,26 @@ class Attention(nn.Module):
         value_states = self.v_proj(hidden_states).view(
             batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos=cos, sin=sin)
-        if use_kv_cache and kv_cache is not None:
+        if use_kv_cache:
             key_states, value_states = self.append_to_kv_cache(
                 kv_cache=kv_cache,
                 new_key_state=key_states,
                 new_value_state=value_states,
                 num_valid_tokens=num_valid_tokens,
             )
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            is_causal=True,
-        )
+        if q_seq_len == key_states.shape[2]:
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query=query_states,
+                key=key_states,
+                value=value_states,
+                is_causal=True,
+            )
+        else:
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query=query_states,
+                key=key_states,
+                value=value_states,
+            )
         # (batch_size, q_seq_len, hidden_dim)
         attn_output = attn_output.transpose(1, 2).contiguous().view(
             batch_size, q_seq_len, hidden_dim,
@@ -487,11 +494,19 @@ class Attention(nn.Module):
         key_cache, value_cache = kv_cache["key"], kv_cache["value"]
         batch_size = key_cache.size(0)
         # Extend with dummy values
-        key_cache = torch.cat([key_cache, torch.zeros_like(new_key_state)], dim=2)
-        value_cache = torch.cat([key_cache, torch.zeros_like(new_value_state)], dim=2)
-        batch_index = torch.arange(batch_size).long().to(key_cache.device)
-        key_cache[batch_index, :, num_valid_tokens, :] = new_key_state.squeeze(2)
-        value_cache[batch_index, :, num_valid_tokens, :] = new_value_state.squeeze(2)
+        if key_cache.shape[2] == 0:
+            # First decoding step
+            key_cache = new_key_state
+            value_cache = new_value_state
+        else:
+            assert new_key_state.shape[2] == 1
+            key_cache = torch.cat([key_cache, torch.zeros_like(new_key_state)], dim=2)
+            value_cache = torch.cat([value_cache, torch.zeros_like(new_value_state)], dim=2)
+            batch_index = torch.arange(batch_size).long().to(key_cache.device)
+            key_cache[batch_index, :, num_valid_tokens-1, :] = new_key_state.squeeze(2)
+            value_cache[batch_index, :, num_valid_tokens-1, :] = new_value_state.squeeze(2)
+        # key_cache = torch.cat([key_cache, new_key_state], dim=2)
+        # value_cache = torch.cat([value_cache, new_value_state], dim=2)
         return key_cache, value_cache
 
 
