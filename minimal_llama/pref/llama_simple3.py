@@ -1,6 +1,5 @@
 import dataclasses
 
-import math
 import tqdm.auto as tqdm
 import os
 import torch
@@ -8,10 +7,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 import bitsandbytes as bnb
 from accelerate import init_empty_weights
-from typing import Union
 
-import proj_shared.io_utils as io_utils
+import minimal_llama.utils.io_utils as io_utils
 from transformers.utils.bitsandbytes import set_module_8bit_tensor_to_device
+
+if os.environ.get("CHECK_NAN"):
+    def check_nan(x):
+        if torch.isnan(x).any():
+            import pdb
+            pdb.set_trace()
+else:
+    # noinspection PyUnusedLocal
+    def check_nan(x):
+        pass
 
 
 @dataclasses.dataclass
@@ -65,18 +73,16 @@ class LLaMAModel(nn.Module):
         self.lm_head = NoInitLinear(config.dim, config.vocab_size, bias=False, dtype=config.dtype)
 
     def forward(self,
-                input_ids,
-                attention_mask=None):
+                input_ids):
         """Forward pass (with full decode sequence, intended for training or loss-scoring)
 
         :param input_ids: [batch_size, seq_len]
+            - Always right-padded. Masks are generated based on padding tokens
         :return: logits [batch_size, seq_len]
         """
         # 1) Create masks
         # decoder mask
         # [batch_size, num_heads=1, q_len=seq_len, kv_len=seq_len]
-        if attention_mask is None:
-            attention_mask = create_attention_mask(input_ids=input_ids, dtype=self.config.dtype)
         rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
         cos, sin = self.get_cos_sin(rope_embed_ids)
 
@@ -84,16 +90,16 @@ class LLaMAModel(nn.Module):
         # [batch_size, seq_len, hidden_dim]
         model_out = self.model(
             input_ids,
-            attention_mask=attention_mask,
             cos=cos, sin=sin,
+            use_kv_cache=False,
         )
         # [batch_size, seq_len, vocab_size]
         logits = self.lm_head(model_out["hidden_states"])
         return logits
 
-    def init_kv_cache(self, input_ids):
+    def init_kv_cache(self, batch_size):
         # noinspection GrazieInspection
-        """Initialize KV cache for decoding.
+        """Initialize an empty KV cache for decoding.
 
         A KV cache consists of a list of dicts (one per layer):
             dict(
@@ -101,11 +107,10 @@ class LLaMAModel(nn.Module):
               value = [batch_size, num_heads, kv_seq_len=0, head_dim]
             )
 
-        :param input_ids: [batch_size, dec_seq_len]
+        :param batch_size
         :return: 0-length kv_cache
         """
         kv_cache = []
-        batch_size = input_ids.shape[0]
         num_heads = self.config.n_heads
         head_dim = self.config.head_dim
         for layer in self.model.layers:
@@ -116,18 +121,21 @@ class LLaMAModel(nn.Module):
             })
         return kv_cache
 
-    def generate(self, input_ids, generation_length: int = 20):
+    def generate(self, input_ids, generation_length: int = 20,
+                 return_output_only=True):
         """Generate tokens with efficient caching of KV.
 
         TODO: Add stopping conditions
         TODO: Add sampling capabilities
 
-        :param input_ids: [batch_size, enc_seq_len]
+        :param input_ids: [batch_size, input_seq_len]
+            - Always right-padded. Masks are generated based on padding tokens
         :param generation_length: int
+        :param return_output_only: True = return continuation only. False = return whole sequence
         :return: [batch_size, generation_length]
         """
         original_input_ids = input_ids
-        batch_size, seq_len = input_ids.shape
+        batch_size, input_seq_len = input_ids.shape
         # noinspection PyUnresolvedReferences
         num_valid_tokens = (input_ids != self.config.pad_token_id).long().sum(dim=1)
 
@@ -138,13 +146,12 @@ class LLaMAModel(nn.Module):
                 [[self.config.pad_token_id]] * batch_size
             ).to(self.lm_head.weights.device)
         # See: init_kv_cache. list[dict]
-        kv_cache = self.init_kv_cache(input_ids)
+        kv_cache = self.init_kv_cache(batch_size)
         generated_token_ids_list = [original_input_ids]
-        total_seq_len = seq_len
+        total_seq_len = input_seq_len
 
         # 2) First encoding
         # [batch_size=1, num_heads=1, q_len=1, kv_len=1]
-        attention_mask = create_attention_mask(input_ids=input_ids, dtype=self.config.dtype)
         # dict(
         #   hidden_states = [batch_size, dec_seq_len=decode_step+1, hidden_dim]
         #   kv_cache = list[dict(
@@ -152,13 +159,14 @@ class LLaMAModel(nn.Module):
         #     value = [batch_size, num_heads, kv_seq_len=decode_step+1, head_dim]
         #   )]
         # )
-        rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
+        rope_embed_ids = create_rope_embed_ids(input_ids=input_ids, pad_token_id=self.config.pad_token_id)
         cos, sin = self.get_cos_sin(rope_embed_ids)
         model_out = self.model(
             input_ids=input_ids,
-            attention_mask=attention_mask,
             cos=cos, sin=sin,
+            use_kv_cache=True,
             kv_cache=kv_cache,
+            num_valid_tokens=num_valid_tokens,
         )
         logits = self.lm_head(model_out["hidden_states"])
         kv_cache = model_out["kv_cache"]
@@ -169,25 +177,12 @@ class LLaMAModel(nn.Module):
         generated_token_ids_list.append(generated_token_ids)
         input_ids = generated_token_ids
 
-        # # 2.1 shift KV cache
-        # for layer_kv_cache in kv_cache:
-        #     for i in range(batch_size):
-        #         layer_kv_cache["key"] = shift_kv_cache_right(
-        #             layer_kv_cache["key"], num_valid_tokens=num_valid_tokens)
-        #         layer_kv_cache["value"] = shift_kv_cache_right(
-        #             layer_kv_cache["value"], num_valid_tokens=num_valid_tokens)
-
         # 3) Subsequent steps
         for decode_step in range(generation_length-1):
             num_valid_tokens += 1
             total_seq_len += 1
             # [batch_size=1, num_heads=1, q_len=1, kv_len=1]
-            attention_mask = convert_mask_to_soft_mask(create_generation_attention_mask(
-                batch_size=batch_size,
-                seq_len=total_seq_len,
-                num_valid_tokens=num_valid_tokens,
-                device=input_ids.device,
-            ), dtype=self.config.dtype)
+
             # dict(
             #   hidden_states = [batch_size, dec_seq_len=decode_step+1, hidden_dim]
             #   kv_cache = list[dict(
@@ -195,13 +190,15 @@ class LLaMAModel(nn.Module):
             #     value = [batch_size, num_heads, kv_seq_len=decode_step+1, head_dim]
             #   )]
             # )
-            rope_embed_ids = create_rope_embed_ids(input_ids=input_ids) + num_valid_tokens[:, None]
+            rope_embed_ids = create_rope_embed_ids(input_ids=input_ids, pad_token_id=self.config.pad_token_id)
+            rope_embed_ids += num_valid_tokens[:, None]
             cos, sin = self.get_cos_sin(rope_embed_ids)
             model_out = self.model(
                 input_ids=input_ids,
-                attention_mask=attention_mask,
-                kv_cache=kv_cache,
                 cos=cos, sin=sin,
+                use_kv_cache=True,
+                kv_cache=kv_cache,
+                num_valid_tokens=num_valid_tokens,
             )
             # [batch_size, dec_seq_len=1, vocab_size]
             logits = self.lm_head(model_out["hidden_states"])
@@ -210,7 +207,10 @@ class LLaMAModel(nn.Module):
             generated_token_ids = logits.argmax(-1)[:, -1:]
             generated_token_ids_list.append(generated_token_ids)
             input_ids = generated_token_ids
-        return torch.cat(generated_token_ids_list, dim=1)
+        output = torch.cat(generated_token_ids_list, dim=1)
+        if return_output_only:
+            output = output[:, input_seq_len:]
+        return output
 
     def get_cos_sin(self, rope_embed_ids):
         cos = F.embedding(
@@ -244,18 +244,27 @@ class LLaMAInnerModel(nn.Module):
         ])
         self.norm = RMSNorm(dim=config.dim)
 
-    def forward(self,
-                input_ids,
-                attention_mask,
-                cos, sin,
-                kv_cache=None):
+    def forward(
+        self,
+        input_ids,
+        cos, sin,
+        use_kv_cache=False,
+        kv_cache=None,
+        num_valid_tokens=None
+    ):
         """
         :param input_ids: [batch_size, seq_len]
-        :param attention_mask: [batch_size=1, num_heads=1, seq_len, seq_len]
         :param kv_cache: See init_kv_cache.
             We use the presence of kv_cache to determine if we're generating
         :param cos:
         :param sin:
+        :param use_kv_cache: If True, we are going to maintain a kv_cache
+            if kv_cache is None (i.e. the first encoding step in decoding), the kv_cache is just the
+            based on the kv states.
+        :param kv_cache: {"key"/"value": [batch_size, num_heads, cache_seq_len, head_dim]}
+            Only used for decoding
+        :param num_valid_tokens: [batch_size]
+            Only used for decoding
         """
         hidden_states = self.embed_tokens(input_ids)
         hidden_states = hidden_states.to(self.config.dtype)
@@ -275,16 +284,18 @@ class LLaMAInnerModel(nn.Module):
                 layer_out = torch.utils.checkpoint.checkpoint(
                     layer,
                     hidden_states,
-                    attention_mask,
                     cos, sin,
+                    use_kv_cache,
                     layer_kv_cache,
+                    num_valid_tokens,
                 )
             else:
                 layer_out = layer(
                     hidden_states=hidden_states,
-                    attention_mask=attention_mask,
                     cos=cos, sin=sin,
-                    kv_cache=layer_kv_cache,
+                    use_kv_cache=use_kv_cache,
+                    kv_cache=kv_cache,
+                    num_valid_tokens=num_valid_tokens,
                 )
 
             hidden_states = layer_out["hidden_states"]
@@ -311,9 +322,10 @@ class LLaMALayer(nn.Module):
     def forward(
         self,
         hidden_states,
-        attention_mask,
         cos, sin,
+        use_kv_cache=False,
         kv_cache=None,
+        num_valid_tokens=None,
     ):
         # 1) Self-attention
         # [batch_size, seq_len, hidden_dim]
@@ -328,9 +340,10 @@ class LLaMALayer(nn.Module):
         check_nan(normed_hidden_states)
         raw_self_attn_output = self.self_attn(
             hidden_states=normed_hidden_states,
-            attention_mask=attention_mask,
-            kv_cache=kv_cache,
             cos=cos, sin=sin,
+            use_kv_cache=use_kv_cache,
+            kv_cache=kv_cache,
+            num_valid_tokens=num_valid_tokens,
         )
         # [batch_size, seq_len, hidden_dim]
         hidden_states = hidden_states + raw_self_attn_output["attn_output"]
@@ -408,10 +421,22 @@ class Attention(nn.Module):
             self.o_proj = NoInitLinear(config.dim, config.dim, bias=False, dtype=config.dtype)
         self.rotary_emb = RotaryEmbedding(dim=self.head_dim)
 
-    def forward(self, hidden_states, attention_mask, cos, sin, kv_cache=None):
+    def forward(self, hidden_states, cos, sin,
+                use_kv_cache=False,
+                kv_cache=None,
+                num_valid_tokens=None):
         """
-        precomputed_kv_hidden_states is for init (pre-compute KV activations, e.g. for added prefixes)
-        kv_cache is for generation (cached past KV)
+        :param hidden_states: [batch_size, seq_len, hidden_dim]
+        :param cos:
+        :param sin:
+        :param use_kv_cache: If True, we are going to maintain a kv_cache
+            if kv_cache is None (i.e. the first encoding step in decoding), the kv_cache is just the
+            based on the kv states.
+        :param kv_cache: {"key"/"value": [batch_size, num_heads, cache_seq_len, head_dim]}
+            Only used for decoding
+        :param num_valid_tokens: [batch_size]
+            Only used for decoding
+        :return:
         """
         batch_size, q_seq_len, hidden_dim = hidden_states.size()
 
@@ -423,15 +448,18 @@ class Attention(nn.Module):
         value_states = self.v_proj(hidden_states).view(
             batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos=cos, sin=sin)
-        if kv_cache:
-            key_states = torch.cat([kv_cache["key"], key_states], dim=2)
-            value_states = torch.cat([kv_cache["value"], value_states], dim=2)
-
+        if use_kv_cache and kv_cache is not None:
+            key_states, value_states = self.append_to_kv_cache(
+                kv_cache=kv_cache,
+                new_key_state=key_states,
+                new_value_state=value_states,
+                num_valid_tokens=num_valid_tokens,
+            )
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             query=query_states,
             key=key_states,
             value=value_states,
-            attn_mask=attention_mask,
+            is_causal=True,
         )
         # (batch_size, q_seq_len, hidden_dim)
         attn_output = attn_output.transpose(1, 2).contiguous().view(
@@ -439,11 +467,32 @@ class Attention(nn.Module):
         )
         attn_output = self.o_proj(attn_output)
         check_nan(attn_output)
-        if kv_cache:
+        if use_kv_cache:
             new_kv_cache = {"key": key_states, "value": value_states}
             return {"attn_output": attn_output, "kv_cache": new_kv_cache}
         else:
             return {"attn_output": attn_output}
+
+    @classmethod
+    def append_to_kv_cache(cls, kv_cache, new_key_state, new_value_state, num_valid_tokens):
+        """
+
+        :param kv_cache: {"key"/"value": [batch_size, num_heads, cache_seq_len, head_dim]}
+        :param new_key_state: [batch_size, num_heads, seq_len=1, head_dim]
+        :param new_value_state: [batch_size, num_heads, seq_len=1, head_dim]
+        :param num_valid_tokens: [batch_size]
+        :return:
+        """
+        # We need to do some fancy indexing, because we are appending to a right-padded cache
+        key_cache, value_cache = kv_cache["key"], kv_cache["value"]
+        batch_size = key_cache.size(0)
+        # Extend with dummy values
+        key_cache = torch.cat([key_cache, torch.zeros_like(new_key_state)], dim=2)
+        value_cache = torch.cat([key_cache, torch.zeros_like(new_value_state)], dim=2)
+        batch_index = torch.arange(batch_size).long().to(key_cache.device)
+        key_cache[batch_index, :, num_valid_tokens, :] = new_key_state.squeeze(2)
+        value_cache[batch_index, :, num_valid_tokens, :] = new_value_state.squeeze(2)
+        return key_cache, value_cache
 
 
 class RotaryEmbedding(torch.nn.Module):
@@ -491,52 +540,6 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     return q_embed, k_embed
 
 
-def create_attention_mask(input_ids,
-                          dtype=torch.float32,
-                          return_soft_mask=True):
-    """Create mask for decoder attention.
-
-    Decoder masks have two use-cases:
-
-    1) Training, where we see the full decoder sequence. In that case,
-       we want a causal mask.
-
-    2) Generation, where we only see one token at once. In that case,
-       it doesn't really matter what we give, we can just give a 1.
-       (i.e. seq_len = 1)
-
-    Note that in both cases we do not care about which decoder_input_ids
-    are valid, and also we can always simply broadcast over the batch size
-    and heads.
-
-    :param input_ids: [batch_size, seq_len]
-    :param dtype: dtype
-    :param return_soft_mask: whether to return mask or logits-mask
-    :return: float [batch_size=1, num_heads=1, q_len=seq_len, kv_len=seq_len]
-    """
-    batch_size, seq_length = input_ids.shape
-    # [seq_len]
-    seq_ids = torch.arange(seq_length, device=input_ids.device)
-    # [seq_len, seq_len]
-    causal_mask = seq_ids[None, :].repeat(seq_length, 1) <= seq_ids[:, None]
-    # [batch_size=1, num_heads=1, seq_len, seq_len]
-    causal_mask = causal_mask[None, None, :, :]
-    if return_soft_mask:
-        return convert_mask_to_soft_mask(causal_mask, dtype=dtype)
-    else:
-        return causal_mask
-
-
-def convert_mask_to_soft_mask(mask, dtype):
-    """Convert binary mask to mask that can be added to logits.
-
-    (i.e. 0 for attention, large negative for masked)
-    """
-    mask = mask.to(dtype=dtype)
-    mask = (1.0 - mask) * torch.finfo(dtype).min
-    return mask
-
-
 class NoInitLinear(nn.Linear):
     def reset_parameters(self) -> None:
         pass
@@ -557,12 +560,6 @@ def get_linear_class(use_8bit=False):
 class NoInitEmbedding(nn.Embedding):
     def reset_parameters(self) -> None:
         pass
-
-
-def check_nan(x):
-    if torch.isnan(x).any():
-        import pdb
-        pdb.set_trace()
 
 
 def create_model(model_name, hf_path, use_8bit=False, device=None):
@@ -598,51 +595,11 @@ def create_model(model_name, hf_path, use_8bit=False, device=None):
     return model
 
 
-def shift_kv_cache_right(layer_cache, num_valid_tokens):
-    """
-    :param layer_cache: left-aligned kv cache element, [batch_size, num_heads, seq_len, dim]
-    :param num_valid_tokens: [batch_size]
-    :return:
-    """
-    batch_size = layer_cache.shape[0]
-    # noinspection PyUnresolvedReferences
-    return torch.stack([
-        torch.cat([
-            layer_cache[i, :, num_valid_tokens[i]:, :],
-            layer_cache[i, :, :num_valid_tokens[i], :],
-        ], dim=1)
-        for i in range(batch_size)
-    ], dim=0)
-
-
-def create_generation_attention_mask(batch_size, seq_len, num_valid_tokens, device):
-    """
-    :param batch_size: int
-    :param seq_len: int
-    :param num_valid_tokens: [batch_size]
-    :param device:
-    :return:
-    """
-    # For right-aligned, based on num_valid_tokens
-    # noinspection PyTypeChecker
-    attn_mask = torch.zeros([batch_size, 1, 1, seq_len], dtype=bool)
-    for i in range(batch_size):
-        valid = num_valid_tokens[i]
-        # noinspection PyTypeChecker
-        # attn_mask[i, 0, -valid:, -valid:] = torch.tril(torch.ones([valid, valid], dtype=bool))
-        attn_mask[i, 0, 0, -valid:] = True
-    return attn_mask.to(device=device)
-
-
-def create_casual_attention_mask(seq_len, device):
-    # noinspection PyTypeChecker
-    attn_mask = torch.tril(torch.ones([seq_len, seq_len], dtype=bool))[None, None, :, :]
-    return attn_mask.to(device=device)
-
-
-def create_rope_embed_ids(input_ids):
-    pad_token_id = 0
-    max_position = 2047
-    x = (input_ids != pad_token_id).cumsum(-1) - 1
-    x[input_ids == pad_token_id] = max_position
-    return x
+def create_rope_embed_ids(input_ids, pad_token_id=0):
+    # Note: this is a dummy value. The embedding for this position is not used practically as
+    # the token will be masked out by the attention mask. This primarily serves for readability
+    # of the inputs.
+    dummy_position = 2047
+    rope_embed_ids = (input_ids != pad_token_id).cumsum(-1) - 1
+    rope_embed_ids[input_ids == pad_token_id] = dummy_position
+    return rope_embed_ids

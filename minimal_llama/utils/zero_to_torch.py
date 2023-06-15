@@ -409,7 +409,7 @@ def get_fp32_state_dict_from_zero_checkpoint(checkpoint_dir, tag=None):
     return _get_fp32_state_dict_from_zero_checkpoint(ds_checkpoint_dir)
 
 
-def convert_zero_checkpoint_to_fp32_state_dict(checkpoint_dir, output_file, fp16, tag=None):
+def convert_zero_checkpoint_to_fp32_state_dict(checkpoint_dir, output_file, fp16, bf16, tag=None):
     """
     Convert ZeRO 2 or 3 checkpoint into a single fp32 consolidated ``state_dict`` file that can be
     loaded with ``torch.load(file)`` + ``load_state_dict()`` and used for training without DeepSpeed.
@@ -424,6 +424,9 @@ def convert_zero_checkpoint_to_fp32_state_dict(checkpoint_dir, output_file, fp16
     if fp16:
         state_dict = {k: v.half() for k, v in state_dict.items()}
         print(f"Saving fp16 state dict to {output_file}")
+    if fp16:
+        state_dict = {k: v.to(torch.bfloat16) for k, v in state_dict.items()}
+        print(f"Saving bf16 state dict to {output_file}")
     else:
         print(f"Saving fp32 state dict to {output_file}")
     if not output_file.startswith("s3"):
@@ -538,9 +541,12 @@ if __name__ == "__main__":
         "path to the pytorch fp32 state_dict output file (e.g. path/checkpoint-12/pytorch_model.bin)"
     )
     parser.add_argument("--fp16", action='store_true')
+    parser.add_argument("--bf16", action='store_true')
     parser.add_argument("-d", "--debug", action='store_true', help="enable debug")
     args = parser.parse_args()
 
     debug = args.debug
 
-    convert_zero_checkpoint_to_fp32_state_dict(args.checkpoint_dir, args.output_file, fp16=args.fp16)
+    convert_zero_checkpoint_to_fp32_state_dict(
+        args.checkpoint_dir, args.output_file, fp16=args.fp16, bf16=args.bf16,
+    )
