@@ -419,7 +419,7 @@ class Attention(nn.Module):
             self.k_proj = NoInitLinear(config.dim, config.dim, bias=False, dtype=config.dtype)
             self.v_proj = NoInitLinear(config.dim, config.dim, bias=False, dtype=config.dtype)
             self.o_proj = NoInitLinear(config.dim, config.dim, bias=False, dtype=config.dtype)
-        self.rotary_emb = RotaryEmbedding(dim=self.head_dim)
+        self.rotary_emb = RotaryEmbedding(dim=self.head_dim, max_position_embeddings=config.max_seq_length)
 
     def forward(self, hidden_states, cos, sin,
                 use_kv_cache=False,
@@ -577,8 +577,9 @@ class NoInitEmbedding(nn.Embedding):
         pass
 
 
-def create_model(model_name, hf_path, use_8bit=False, device=None):
-    config = LLAMA_CONFIG_DICT[model_name]
+def create_model(model_name, hf_path, use_8bit=False, device=None, config=None):
+    if config is None:
+        config = LLAMA_CONFIG_DICT[model_name]
     weight_map = io_utils.read_json(os.path.join(hf_path, "pytorch_model.bin.index.json"))["weight_map"]
     filename_list = sorted(list(set(weight_map.values())))
     if device is None:
