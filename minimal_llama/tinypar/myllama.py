@@ -74,7 +74,7 @@ class RMSNorm(torch.nn.Module):
         self.eps = torch.tensor(eps)
         self.weight = nn.Parameter(torch.ones(dim, dtype=dtype))
 
-    @torch.compile
+    # @torch.compile
     def _norm(x, eps, weight):
         out = x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps).type_as(x)
         return out * weight
@@ -321,7 +321,7 @@ class SplitLlama(nn.Module):
         self.args = args
 
     # factored out for torch.compile
-    @torch.compile
+    # @torch.compile
     def transformer_block(self, x, start_pos, kv_freqs, q_freqs, mask):
         for layer in self.layers:
             x = layer(x, start_pos, kv_freqs, q_freqs, mask)
@@ -702,7 +702,8 @@ def inference_server(
 
 def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int,
          save_to: Path, data_path: str, distributed_adam=True):
-    rank = int(os.environ["SLURM_PROCID"])
+    # rank = int(os.environ["SLURM_PROCID"])
+    rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     gpus_per_node = int(os.environ["SLURM_GPUS_ON_NODE"])
     assert gpus_per_node == torch.cuda.device_count()
@@ -769,8 +770,8 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int,
 
     torch.backends.cudnn.benchmark = True
 
-    global_batch_size = 64
-    micro_batch_size = 2
+    global_batch_size = 8
+    micro_batch_size = 1
 
     setup_microbatch_calculator(
         rank=rank,
