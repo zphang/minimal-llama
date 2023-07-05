@@ -321,7 +321,7 @@ class SplitLlama(nn.Module):
         self.args = args
 
     # factored out for torch.compile
-    # @torch.compile
+    @torch.compile
     def transformer_block(self, x, start_pos, kv_freqs, q_freqs, mask):
         for layer in self.layers:
             x = layer(x, start_pos, kv_freqs, q_freqs, mask)

@@ -242,7 +242,7 @@ class LLaMAInnerModel(nn.Module):
             LLaMALayer(config=config)
             for _ in range(config.n_layers)
         ])
-        self.norm = RMSNorm(dim=config.dim)
+        self.norm = RMSNorm(dim=config.dim, dtype=config.dtype)
 
     def forward(
         self,
@@ -326,6 +326,7 @@ class LLaMALayer(nn.Module):
         use_kv_cache=False,
         kv_cache=None,
         num_valid_tokens=None,
+        offload_to_cpu=False,  # Needed for activation checkpointing? idk
     ):
         # 1) Self-attention
         # [batch_size, seq_len, hidden_dim]
@@ -400,6 +401,9 @@ class RMSNorm(torch.nn.Module):
     def forward(self, x):
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
+
+    def reset_parameters(self):
+        pass
 
 
 class Attention(nn.Module):
@@ -541,6 +545,9 @@ class RotaryEmbedding(torch.nn.Module):
             self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype, device=x.device),
         )
 
+    def reset_parameters(self):
+        pass
+
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
@@ -619,3 +626,5 @@ def create_rope_embed_ids(input_ids, pad_token_id=0):
     rope_embed_ids = (input_ids != pad_token_id).cumsum(-1) - 1
     rope_embed_ids[input_ids == pad_token_id] = dummy_position
     return rope_embed_ids
+
+
