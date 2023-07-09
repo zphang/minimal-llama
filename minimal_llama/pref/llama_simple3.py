@@ -9,7 +9,7 @@ import bitsandbytes as bnb
 from accelerate import init_empty_weights
 
 import minimal_llama.utils.io_utils as io_utils
-from transformers.utils.bitsandbytes import set_module_8bit_tensor_to_device
+from transformers.utils.bitsandbytes import set_module_quantized_tensor_to_device
 
 if os.environ.get("CHECK_NAN"):
     def check_nan(x):
@@ -33,7 +33,7 @@ class LLaMAConfig:
     pad_token_id: int = 0
     bos_token_id: int = 1
     eos_token_id: int = 2
-    use_8bit: bool = False
+    use_4bit: bool = False
     gradient_checkpointing: bool = False
 
     @property
@@ -376,14 +376,9 @@ class MLP(nn.Module):
         hidden_dim = int(2 * hidden_dim / 3)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
-        if config.use_8bit:
-            self.gate_proj = NoInit8bitLinear(dim, hidden_dim, bias=False, threshold=6.0, has_fp16_weights=False)
-            self.up_proj = NoInit8bitLinear(dim, hidden_dim, bias=False, threshold=6.0, has_fp16_weights=False)
-            self.down_proj = NoInit8bitLinear(hidden_dim, dim, bias=False, threshold=6.0, has_fp16_weights=False)
-        else:
-            self.gate_proj = NoInitLinear(dim, hidden_dim, bias=False, dtype=config.dtype)
-            self.up_proj = NoInitLinear(dim, hidden_dim, bias=False, dtype=config.dtype)
-            self.down_proj = NoInitLinear(hidden_dim, dim, bias=False, dtype=config.dtype)
+        self.gate_proj = create_linear(dim, hidden_dim, bias=False, dtype=config.dtype, use_4bit=config.use_4bit)
+        self.up_proj = create_linear(dim, hidden_dim, bias=False, dtype=config.dtype, use_4bit=config.use_4bit)
+        self.down_proj = create_linear(hidden_dim, dim, bias=False, dtype=config.dtype, use_4bit=config.use_4bit)
 
     def forward(self, x):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
@@ -413,16 +408,10 @@ class Attention(nn.Module):
         self.n_heads = config.n_heads
         self.head_dim = config.dim // config.n_heads
 
-        if config.use_8bit:
-            self.q_proj = NoInit8bitLinear(config.dim, config.dim, bias=False, threshold=6.0, has_fp16_weights=False)
-            self.k_proj = NoInit8bitLinear(config.dim, config.dim, bias=False, threshold=6.0, has_fp16_weights=False)
-            self.v_proj = NoInit8bitLinear(config.dim, config.dim, bias=False, threshold=6.0, has_fp16_weights=False)
-            self.o_proj = NoInit8bitLinear(config.dim, config.dim, bias=False, threshold=6.0, has_fp16_weights=False)
-        else:
-            self.q_proj = NoInitLinear(config.dim, config.dim, bias=False, dtype=config.dtype)
-            self.k_proj = NoInitLinear(config.dim, config.dim, bias=False, dtype=config.dtype)
-            self.v_proj = NoInitLinear(config.dim, config.dim, bias=False, dtype=config.dtype)
-            self.o_proj = NoInitLinear(config.dim, config.dim, bias=False, dtype=config.dtype)
+        self.q_proj = create_linear(config.dim, config.dim, bias=False, dtype=config.dtype, use_4bit=config.use_4bit)
+        self.k_proj = create_linear(config.dim, config.dim, bias=False, dtype=config.dtype, use_4bit=config.use_4bit)
+        self.v_proj = create_linear(config.dim, config.dim, bias=False, dtype=config.dtype, use_4bit=config.use_4bit)
+        self.o_proj = create_linear(config.dim, config.dim, bias=False, dtype=config.dtype, use_4bit=config.use_4bit)
         self.rotary_emb = RotaryEmbedding(dim=self.head_dim, max_position_embeddings=config.max_seq_length)
 
     def forward(self, hidden_states, cos, sin,
@@ -567,16 +556,24 @@ class NoInitLinear(nn.Linear):
         pass
 
 
-class NoInit8bitLinear(bnb.nn.Linear8bitLt):
+class NoInit4bitLinear(bnb.nn.Linear4bit):
+    source_cls = nn.Linear
+
     def reset_parameters(self) -> None:
         pass
 
 
-def get_linear_class(use_8bit=False):
-    if use_8bit:
-        return NoInit8bitLinear
+def create_linear(in_features: int, out_features: int, bias: bool, dtype: torch.Type,
+                  use_4bit: bool = False, double_quant: bool = True):
+    if use_4bit:
+        return NoInit4bitLinear(
+            in_features, out_features, bias=bias,
+            compute_dtype=dtype,
+            compress_statistics=double_quant,
+            quant_type="nf4",
+        )
     else:
-        return NoInitLinear
+        return NoInitLinear(in_features, out_features, bias=bias, dtype=dtype)
 
 
 class NoInitEmbedding(nn.Embedding):
@@ -584,7 +581,7 @@ class NoInitEmbedding(nn.Embedding):
         pass
 
 
-def create_model(model_name, hf_path, use_8bit=False, device=None, config=None):
+def create_model(model_name, hf_path, use_4bit=False, device=None, config=None):
     if config is None:
         config = LLAMA_CONFIG_DICT[model_name]
     weight_map = io_utils.read_json(os.path.join(hf_path, "pytorch_model.bin.index.json"))["weight_map"]
@@ -592,8 +589,8 @@ def create_model(model_name, hf_path, use_8bit=False, device=None, config=None):
     if device is None:
         # TODO: Local rank
         device = torch.device("cuda:0")
-    if use_8bit:
-        config = dataclasses.replace(config, use_8bit=True)
+    if use_4bit:
+        config = dataclasses.replace(config, use_4bit=True)
         with init_empty_weights():
             model = LLaMAModel(config=config)
         state_keys = set(model.state_dict())
@@ -601,7 +598,7 @@ def create_model(model_name, hf_path, use_8bit=False, device=None, config=None):
         for filename in tqdm.tqdm(filename_list):
             loaded = torch.load(os.path.join(hf_path, filename), map_location="cpu")
             for k, v in loaded.items():
-                set_module_8bit_tensor_to_device(model, tensor_name=k, device=device, value=v)
+                set_module_quantized_tensor_to_device(model, tensor_name=k, device=device, value=v)
                 state_keys.remove(k)
         assert not state_keys
     else:
