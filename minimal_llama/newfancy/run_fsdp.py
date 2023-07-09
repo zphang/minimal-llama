@@ -41,6 +41,7 @@ def run():
     parser.add_argument("--model_size", type=str, default="7b")
     parser.add_argument("--hf_path", type=str)
     parser.add_argument("--use_fp16", action="store_true")
+    parser.add_argument("--save_dir", type=str)
     parser.add_argument("--mixed_precision", action="store_true")
     parser.add_argument("--activation_checkpointing", action="store_true")
     parser.add_argument("--batch_size", type=int, default=4)
@@ -107,6 +108,12 @@ def run():
         if local_rank == 0:
             print("Mem:", torch.cuda.max_memory_allocated(device), loss.item())
         optimizer.step()
+
+    fsdp_utils.save_model_and_optimizer_sharded(
+        model, rank, save_using_num_threads=6,
+        save_dir=args.save_dir,
+        optim=optimizer,
+    )
 
     if local_rank == 0:
         print("Mem:", torch.cuda.max_memory_allocated(device))

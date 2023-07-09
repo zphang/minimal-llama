@@ -1,3 +1,4 @@
+import os
 import functools
 from pkg_resources import packaging
 
@@ -5,6 +6,12 @@ from pkg_resources import packaging
 import torch
 import torch.cuda.nccl as nccl
 import torch.distributed as dist
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    StateDictType,
+    FullStateDictConfig,  # general model non-sharded, non-flattened params
+    LocalStateDictConfig,  # flattened params, usable only by FSDP
+)
 from torch.distributed.fsdp.wrap import (
     transformer_auto_wrap_policy,
     size_based_auto_wrap_policy,
@@ -15,6 +22,12 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
     CheckpointImpl,
     apply_activation_checkpointing,
+)
+import torch.distributed.checkpoint as dist_cp
+import time
+from torch.distributed.checkpoint.default_planner import (
+    DefaultSavePlanner,
+    DefaultLoadPlanner,
 )
 
 import minimal_llama.newfancy.fsdp_policies as policies
@@ -89,3 +102,53 @@ def apply_fsdp_checkpointing(model):
     )
 
 
+def save_model_and_optimizer_sharded(model, rank, save_using_num_threads: int, save_dir, optim=None):
+    """save model and optimizer via sharded_state_dict to save_dir"""
+    if rank == 0:
+        print(f"Saving model to {save_dir}")
+        os.makedirs(save_dir, exist_ok=True)
+
+    distributed_writer = dist_cp.FileSystemWriter(
+        save_dir,
+    )
+    t0 = time.perf_counter()
+
+    with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
+
+        state_dict = {"model": model.state_dict()}
+        if optim is not None:
+            state_dict["optim"] = FSDP.optim_state_dict(model, optim)
+
+        dist_cp.save_state_dict(
+            state_dict=state_dict,
+            storage_writer=distributed_writer,
+            planner=DefaultSavePlanner(),
+
+        )
+    dist.barrier()
+    t1 = time.perf_counter()
+    if rank == 0:
+        print(f"Sharded state checkpoint saved to {save_dir}")
+        print(
+            f"Checkpoint Time = {t1 - t0:.4f}\n using {save_using_num_threads=} total threads"
+        )
+
+
+def save_optimizer_checkpoint(model, optimizer, rank, optimizer_save_path):
+    """save optimizer state via full state dict"""
+    # pull all sharded optimizer states to rank0 cpu...
+    optim_state = FSDP.full_optim_state_dict(model, optimizer)
+    if rank == 0:
+        torch.save(optim_state, optimizer_save_path)
+
+
+def load_optimizer_checkpoint(model, optimizer, rank, optimizer_load_path):
+    """load an fdsp optimizer full_state checkpoint using scatter method
+    this ensures only rank 0 loads the optimizer state dict and scatters to other ranks
+    """
+    full_osd = None
+    if rank == 0:
+        full_osd = torch.load(optimizer_load_path)
+    # called from all ranks, though only rank0 has a valid param for full_osd
+    sharded_osd = FSDP.scatter_full_optim_state_dict(full_osd, model)
+    optimizer.load_state_dict(sharded_osd)
