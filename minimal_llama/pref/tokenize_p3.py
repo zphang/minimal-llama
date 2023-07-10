@@ -33,7 +33,7 @@ def main():
     tokenizer = transformers.LlamaTokenizer.from_pretrained(args.tokenizer_path)
 
     def map_fn(example):
-        out =  {
+        out = {
             "inputs": tokenizer(example["inputs_pretokenized"], add_special_tokens=False)["input_ids"],
             "targets": tokenizer(example["targets_pretokenized"], add_special_tokens=False)["input_ids"],
         }

@@ -73,7 +73,8 @@ class LLaMAModel(nn.Module):
         self.lm_head = NoInitLinear(config.dim, config.vocab_size, bias=False, dtype=config.dtype)
 
     def forward(self,
-                input_ids):
+                input_ids,
+                attention_mask=None):
         """Forward pass (with full decode sequence, intended for training or loss-scoring)
 
         :param input_ids: [batch_size, seq_len]
@@ -92,6 +93,7 @@ class LLaMAModel(nn.Module):
             input_ids,
             cos=cos, sin=sin,
             use_kv_cache=False,
+            attention_mask=attention_mask,
         )
         # [batch_size, seq_len, vocab_size]
         logits = self.lm_head(model_out["hidden_states"])
@@ -250,7 +252,8 @@ class LLaMAInnerModel(nn.Module):
         cos, sin,
         use_kv_cache=False,
         kv_cache=None,
-        num_valid_tokens=None
+        num_valid_tokens=None,
+        attention_mask=None,
     ):
         """
         :param input_ids: [batch_size, seq_len]
@@ -265,6 +268,7 @@ class LLaMAInnerModel(nn.Module):
             Only used for decoding
         :param num_valid_tokens: [batch_size]
             Only used for decoding
+        :param attention_mask: [batch_size, num_heads, q_len, kv_len]
         """
         hidden_states = self.embed_tokens(input_ids)
         hidden_states = hidden_states.to(self.config.dtype)
@@ -288,6 +292,7 @@ class LLaMAInnerModel(nn.Module):
                     use_kv_cache,
                     layer_kv_cache,
                     num_valid_tokens,
+                    attention_mask,
                 )
             else:
                 layer_out = layer(
@@ -296,6 +301,7 @@ class LLaMAInnerModel(nn.Module):
                     use_kv_cache=use_kv_cache,
                     kv_cache=layer_kv_cache,
                     num_valid_tokens=num_valid_tokens,
+                    attention_mask=attention_mask,
                 )
 
             hidden_states = layer_out["hidden_states"]
@@ -326,6 +332,7 @@ class LLaMALayer(nn.Module):
         use_kv_cache=False,
         kv_cache=None,
         num_valid_tokens=None,
+        attention_mask=None,
         offload_to_cpu=False,  # Needed for activation checkpointing? idk
     ):
         # 1) Self-attention
@@ -345,6 +352,7 @@ class LLaMALayer(nn.Module):
             use_kv_cache=use_kv_cache,
             kv_cache=kv_cache,
             num_valid_tokens=num_valid_tokens,
+            attention_mask=attention_mask,
         )
         # [batch_size, seq_len, hidden_dim]
         hidden_states = hidden_states + raw_self_attn_output["attn_output"]
@@ -417,7 +425,8 @@ class Attention(nn.Module):
     def forward(self, hidden_states, cos, sin,
                 use_kv_cache=False,
                 kv_cache=None,
-                num_valid_tokens=None):
+                num_valid_tokens=None,
+                attention_mask=None,):
         """
         :param hidden_states: [batch_size, seq_len, hidden_dim]
         :param cos:
@@ -429,6 +438,7 @@ class Attention(nn.Module):
             Only used for decoding
         :param num_valid_tokens: [batch_size]
             Only used for decoding
+        :param attention_mask: [batch_size, num_heads, q_len, kv_len]
         :return:
         """
         batch_size, q_seq_len, hidden_dim = hidden_states.size()
@@ -449,17 +459,33 @@ class Attention(nn.Module):
                 num_valid_tokens=num_valid_tokens,
             )
         if q_seq_len == key_states.shape[2]:
-            attn_output = torch.nn.functional.scaled_dot_product_attention(
-                query=query_states,
-                key=key_states,
-                value=value_states,
-                is_causal=True,
-            )
+
+            if attention_mask is None:
+                with torch.backends.cuda.sdp_kernel(
+                    enable_math=False, enable_flash=True, enable_mem_efficient=False,
+                ):
+                    attn_output = torch.nn.functional.scaled_dot_product_attention(
+                        query=query_states,
+                        key=key_states,
+                        value=value_states,
+                        is_causal=True,
+                    )
+            else:
+                with torch.backends.cuda.sdp_kernel(
+                    enable_math=True, enable_flash=True, enable_mem_efficient=True,
+                ):
+                    attn_output = torch.nn.functional.scaled_dot_product_attention(
+                        query=query_states,
+                        key=key_states,
+                        value=value_states,
+                        attn_mask=attention_mask,
+                    )
         else:
             attn_output = torch.nn.functional.scaled_dot_product_attention(
                 query=query_states,
                 key=key_states,
                 value=value_states,
+                attn_mask=attention_mask,
             )
         # (batch_size, q_seq_len, hidden_dim)
         attn_output = attn_output.transpose(1, 2).contiguous().view(
