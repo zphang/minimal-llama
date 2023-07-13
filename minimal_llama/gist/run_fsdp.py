@@ -3,32 +3,18 @@ import os
 import tqdm.auto as tqdm
 import math
 import torch
-import functools
-from pkg_resources import packaging
-import torch
 import torch.optim as optim
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
-    CPUOffload,
-    MixedPrecision,
-    BackwardPrefetch,
     ShardingStrategy,
     FullStateDictConfig,
-    LocalStateDictConfig,
-    ShardedStateDictConfig,
     StateDictType,
-)
-from torch.distributed.fsdp.wrap import (
-    transformer_auto_wrap_policy,
-    size_based_auto_wrap_policy,
-    enable_wrap,
-    wrap,
 )
 import datasets
 import torch.nn.functional as F
 from torch.utils.data.distributed import DistributedSampler
 from torch.distributed.tensor.parallel.fsdp import enable_2d_with_fsdp
-import minimal_llama.gist.llama_simple3 as llama_simple3
+import minimal_llama.pref.llama_simple3 as llama_simple3
 
 import minimal_llama.utils.io_utils as io_utils
 from accelerate import init_empty_weights
@@ -115,34 +101,38 @@ def run():
         total_steps=args.total_steps, start_step=0, grad_accum_steps=args.grad_accum_steps,
     )
 
+    loss_list = []
     loss = None
+    optimizer.zero_grad()
     for batch_metadata, batch in train_iterator:
-        optimizer.zero_grad()
-        for elem in range(args.grad_accum_steps):
-            output = model(
-                input_ids=batch["input_ids"].to(device),
-                # input_ids=batch["input_ids"].clamp(0, 31999).to(device),
-                attention_mask=convert_mask_to_soft_mask(create_gist_attention_mask(
-                    batch["gist_token_type"],
-                ), dtype=model.config.dtype).to(device),
-            )
-            # loss = output.mean()
-            # print(output.view(-1, output.size(-1)).shape)
-            # print(batch["labels"].view(-1).to(device).shape)
-            loss = F.cross_entropy(
-                output.view(-1, output.size(-1)),
-                batch["labels"].view(-1).to(device),
-            )
-            loss.backward()
-        if local_rank == 0:
-            print("Mem:", torch.cuda.max_memory_allocated(device), loss.item())
-        optimizer.step()
+        output = model(
+            input_ids=batch["input_ids"].to(device),
+            # input_ids=batch["input_ids"].clamp(0, 31999).to(device),
+            attention_mask=convert_mask_to_soft_mask(create_gist_attention_mask(
+                batch["gist_token_type"],
+            ), dtype=model.config.dtype).to(device),
+        )
+        # loss = output.mean()
+        # print(output.view(-1, output.size(-1)).shape)
+        # print(batch["labels"].view(-1).to(device).shape)
+        loss = F.cross_entropy(
+            output.view(-1, output.size(-1)),
+            batch["labels"].view(-1).to(device),
+        )
+        loss.backward()
+        if batch_metadata["grad_accum_index"] == args.grad_accum_steps - 1:
+            optimizer.step()
+            optimizer.zero_grad()
+            if local_rank == 0:
+                print(batch_metadata["curr_step"], "Mem:", torch.cuda.max_memory_allocated(device), loss.item())
+                loss_list.append(loss.item())
 
     fsdp_utils.save_model_and_optimizer_sharded(
         model, rank, save_using_num_threads=6,
         save_dir=args.save_dir,
         optim=optimizer,
     )
+    io_utils.write_json(loss_list, os.path.join(args.save_dir, "loss.json"))
 
     if local_rank == 0:
         print("Mem:", torch.cuda.max_memory_allocated(device))
