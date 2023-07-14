@@ -142,6 +142,7 @@ class LLaMAModel(nn.Module):
         batch_size, input_seq_len = input_ids.shape
         # noinspection PyUnresolvedReferences
         num_valid_tokens = (input_ids != self.config.pad_token_id).long().sum(dim=1)
+        orig_num_valid_tokens = num_valid_tokens.clone()
 
         # 1) Setup
         if input_ids is None:
@@ -196,7 +197,7 @@ class LLaMAModel(nn.Module):
             # )
             rope_embed_ids = create_rope_embed_ids(input_ids=input_ids, pad_token_id=self.config.pad_token_id)
             decoding_attention_mask = create_decoding_mask(
-                num_valid_tokens=num_valid_tokens,
+                orig_num_valid_tokens=orig_num_valid_tokens,
                 max_seq_len=total_seq_len,
                 initial_max_len=original_input_ids.shape[1]
             ).to(input_ids.device)
@@ -508,32 +509,18 @@ class Attention(nn.Module):
             return {"attn_output": attn_output}
 
     @classmethod
-    def append_to_kv_cache(cls, kv_cache, new_key_state, new_value_state, num_valid_tokens):
+    def append_to_kv_cache(cls, kv_cache, new_key_state, new_value_state):
         """
 
         :param kv_cache: {"key"/"value": [batch_size, num_heads, cache_seq_len, head_dim]}
         :param new_key_state: [batch_size, num_heads, seq_len=1, head_dim]
         :param new_value_state: [batch_size, num_heads, seq_len=1, head_dim]
-        :param num_valid_tokens: [batch_size]
         :return:
         """
         # We need to do some fancy indexing, because we are appending to a right-padded cache
         key_cache, value_cache = kv_cache["key"], kv_cache["value"]
-        batch_size = key_cache.size(0)
-        # Extend with dummy values
-        if key_cache.shape[2] == 0:
-            # First decoding step
-            key_cache = new_key_state
-            value_cache = new_value_state
-        else:
-            assert new_key_state.shape[2] == 1
-            key_cache = torch.cat([key_cache, torch.zeros_like(new_key_state)], dim=2)
-            value_cache = torch.cat([value_cache, torch.zeros_like(new_value_state)], dim=2)
-            batch_index = torch.arange(batch_size).long().to(key_cache.device)
-            key_cache[batch_index, :, num_valid_tokens-1, :] = new_key_state.squeeze(2)
-            value_cache[batch_index, :, num_valid_tokens-1, :] = new_value_state.squeeze(2)
-        # key_cache = torch.cat([key_cache, new_key_state], dim=2)
-        # value_cache = torch.cat([value_cache, new_value_state], dim=2)
+        key_cache = torch.cat([key_cache, new_key_state], dim=2)
+        value_cache = torch.cat([value_cache, new_value_state], dim=2)
         return key_cache, value_cache
 
 
@@ -659,9 +646,16 @@ def create_rope_embed_ids(input_ids, pad_token_id=0):
     return rope_embed_ids
 
 
-def create_decoding_mask(num_valid_tokens, max_seq_len, initial_max_len):
-    batch_size = len(num_valid_tokens)
+def create_decoding_mask(orig_num_valid_tokens, max_seq_len, initial_max_len):
+    """Generate mask for decoding steps
+
+    :param orig_num_valid_tokens: array of number of valid tokens in initial encoding
+    :param max_seq_len: max seq len for this step
+    :param initial_max_len: max seq len in initial encoding
+    :return:
+    """
+    batch_size = len(orig_num_valid_tokens)
     mask = torch.ones([batch_size, 1, max_seq_len])
-    for i, nvt in enumerate(num_valid_tokens):
+    for i, nvt in enumerate(orig_num_valid_tokens):
         mask[i, :, nvt:initial_max_len] = 0
     return mask[:, None, -1:, ].bool()
