@@ -35,7 +35,6 @@ class LLaMAConfig:
     eos_token_id: int = 2
     use_4bit: bool = False
     gradient_checkpointing: bool = False
-    num_gist_tokens: int = 256
 
     @property
     def head_dim(self):
@@ -240,7 +239,7 @@ class LLaMAInnerModel(nn.Module):
     def __init__(self, config: LLaMAConfig):
         super().__init__()
         self.config = config
-        self.embed_tokens = nn.Embedding(config.vocab_size + config.num_gist_tokens, config.dim, dtype=config.dtype)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.dim, dtype=config.dtype)
         self.layers = nn.ModuleList([
             LLaMALayer(config=config)
             for _ in range(config.n_layers)

@@ -74,7 +74,7 @@ def run():
         limit_all_gathers=True,
     )
     if args.activation_checkpointing:
-        fsdp_utils.apply_fsdp_checkpointing(model)
+        fsdp_utils.apply_fsdp_checkpointing(model, layer_class=llama_simple3.LLaMALayer)
 
     with FSDP.state_dict_type(
         model, StateDictType.FULL_STATE_DICT, FullStateDictConfig(offload_to_cpu=True, rank0_only=True),

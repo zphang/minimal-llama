@@ -14,7 +14,7 @@ import datasets
 import torch.nn.functional as F
 from torch.utils.data.distributed import DistributedSampler
 from torch.distributed.tensor.parallel.fsdp import enable_2d_with_fsdp
-import minimal_llama.pref.llama_simple3 as llama_simple3
+import minimal_llama.gist.llama_simple3 as llama_simple3
 
 import minimal_llama.utils.io_utils as io_utils
 from accelerate import init_empty_weights
@@ -47,7 +47,8 @@ def run():
     rank = int(os.environ['RANK'])
     world_size = int(os.environ['WORLD_SIZE'])
     fsdp_utils.setup(rank=rank, world_size=world_size)
-    mixed_precision_policy, auto_wrap_policy = fsdp_utils.get_policies(args, rank)
+    mixed_precision_policy, auto_wrap_policy = fsdp_utils.get_policies(
+        args, rank, layer_class=llama_simple3.LLaMALayer)
     model_config = llama_simple3.LLAMA_CONFIG_DICT[args.model_size]
     model_config.num_gist_tokens = args.expand_embedding
     # model_config.num_gist_tokens = 0
@@ -67,7 +68,7 @@ def run():
         limit_all_gathers=True,
     )
     if args.activation_checkpointing:
-        fsdp_utils.apply_fsdp_checkpointing(model)
+        fsdp_utils.apply_fsdp_checkpointing(model, layer_class=llama_simple3.LLaMALayer)
 
     with FSDP.state_dict_type(
         model, StateDictType.FULL_STATE_DICT, FullStateDictConfig(offload_to_cpu=True, rank0_only=True),

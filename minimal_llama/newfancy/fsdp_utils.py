@@ -31,7 +31,6 @@ from torch.distributed.checkpoint.default_planner import (
 )
 
 import minimal_llama.newfancy.fsdp_policies as policies
-import minimal_llama.pref.llama_simple3 as llama_simple3
 
 
 def setup(rank, world_size):
@@ -53,7 +52,7 @@ def bfloat_support():
     )
 
 
-def get_policies(cfg, rank):
+def get_policies(cfg, rank, layer_class):
 
     """establish current policies for mixed precision and fsdp wrapping"""
 
@@ -78,15 +77,13 @@ def get_policies(cfg, rank):
 
     wrapping_policy = functools.partial(
         transformer_auto_wrap_policy,
-        transformer_layer_cls={
-            llama_simple3.LLaMALayer,
-        },
+        transformer_layer_cls={layer_class},
     )
 
     return mixed_precision_policy, wrapping_policy
 
 
-def apply_fsdp_checkpointing(model):
+def apply_fsdp_checkpointing(model, layer_class):
     """apply activation checkpointing to model
     returns None as model is updated directly
     """
@@ -96,7 +93,7 @@ def apply_fsdp_checkpointing(model):
         offload_to_cpu=False,
         checkpoint_impl=CheckpointImpl.NO_REENTRANT,
     )
-    check_fn = lambda submodule: isinstance(submodule, llama_simple3.LLaMALayer)  # noqa: E731
+    check_fn = lambda submodule: isinstance(submodule, layer_class)  # noqa: E731
     apply_activation_checkpointing(
         model, checkpoint_wrapper_fn=non_reentrant_wrapper, check_fn=check_fn
     )
