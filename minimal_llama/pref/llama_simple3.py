@@ -79,6 +79,7 @@ class LLaMAModel(nn.Module):
 
         :param input_ids: [batch_size, seq_len]
             - Always right-padded. Masks are generated based on padding tokens
+        :param attention_mask
         :return: logits [batch_size, seq_len]
         """
         # 1) Create masks
@@ -193,6 +194,11 @@ class LLaMAModel(nn.Module):
             #   )]
             # )
             rope_embed_ids = create_rope_embed_ids(input_ids=input_ids, pad_token_id=self.config.pad_token_id)
+            decoding_attention_mask = create_decoding_mask(
+                num_valid_tokens=num_valid_tokens,
+                max_seq_len=total_seq_len,
+                initial_max_len=original_input_ids.shape[1]
+            ).to(input_ids.device)
             rope_embed_ids += num_valid_tokens[:, None]
             cos, sin = self.get_cos_sin(rope_embed_ids)
             model_out = self.model(
@@ -201,6 +207,7 @@ class LLaMAModel(nn.Module):
                 use_kv_cache=True,
                 kv_cache=kv_cache,
                 num_valid_tokens=num_valid_tokens,
+                attention_mask=decoding_attention_mask,
             )
             # [batch_size, dec_seq_len=1, vocab_size]
             logits = self.lm_head(model_out["hidden_states"])
@@ -651,3 +658,9 @@ def create_rope_embed_ids(input_ids, pad_token_id=0):
     return rope_embed_ids
 
 
+def create_decoding_mask(num_valid_tokens, max_seq_len, initial_max_len):
+    batch_size = len(num_valid_tokens)
+    mask = torch.ones([batch_size, 1, max_seq_len])
+    for i, nvt in enumerate(num_valid_tokens):
+        mask[i, :, nvt:initial_max_len] = 0
+    return mask[:, None, -1:, ].bool()
