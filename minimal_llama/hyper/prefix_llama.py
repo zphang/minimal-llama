@@ -329,7 +329,8 @@ class LLaMAInnerModel(nn.Module):
                     layer_kv_cache,
                     num_valid_tokens,
                     attention_mask,
-                    prefixes,
+                    prefixes[layer_i] if prefixes else None,
+                    use_reentrant=False,
                 )
             else:
                 layer_out = layer(
