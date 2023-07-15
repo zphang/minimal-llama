@@ -465,7 +465,6 @@ class Attention(nn.Module):
                 kv_cache=kv_cache,
                 new_key_state=key_states,
                 new_value_state=value_states,
-                num_valid_tokens=num_valid_tokens,
             )
         if q_seq_len == key_states.shape[2]:
 

@@ -28,7 +28,7 @@ class LLaMAConfig:
     n_layers: int
     n_heads: int
     vocab_size: int = 32000
-    max_seq_length: int = 2048
+    max_seq_length: int = 2176
     dtype: torch.Type = torch.float16
     pad_token_id: int = 0
     bos_token_id: int = 1
@@ -46,6 +46,15 @@ class LLaMAConfig:
 
     def to_dict(self):
         return dataclasses.asdict(self)
+
+
+PREFIX_MODE_PREFIX = "prefix"
+PREFIX_MODE_NONE = "none"
+
+
+@dataclasses.dataclass
+class PrefixConfig:
+    prefix_mode = PREFIX_MODE_PREFIX
 
 
 LLAMA_7B_CONFIG = LLaMAConfig(
@@ -66,37 +75,53 @@ LLAMA_CONFIG_DICT = {
 
 
 class LLaMAModel(nn.Module):
-    def __init__(self, config: LLaMAConfig):
+    def __init__(self, config: LLaMAConfig, prefix_config: PrefixConfig):
         super().__init__()
         self.config = config
+        self.prefix_config = prefix_config
         self.model = LLaMAInnerModel(config)
         self.lm_head = NoInitLinear(config.dim, config.vocab_size, bias=False, dtype=config.dtype)
 
     def forward(self,
                 input_ids,
-                attention_mask=None):
+                attention_mask=None,
+                prefixes=None):
         """Forward pass (with full decode sequence, intended for training or loss-scoring)
 
         :param input_ids: [batch_size, seq_len]
             - Always right-padded. Masks are generated based on padding tokens
         :param attention_mask
+        :param prefixes len(layer) -> "key"/"value" -> [batch_size, seq_len, num_heads, head_dim]
         :return: logits [batch_size, seq_len]
         """
-        # 1) Create masks
-        # decoder mask
-        # [batch_size, num_heads=1, q_len=seq_len, kv_len=seq_len]
-        rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
-        cos, sin = self.get_cos_sin(rope_embed_ids)
-
-        # 2) Forward pass
-        # [batch_size, seq_len, hidden_dim]
-        model_out = self.model(
-            input_ids,
-            cos=cos, sin=sin,
-            use_kv_cache=False,
-            attention_mask=attention_mask,
-        )
-        # [batch_size, seq_len, vocab_size]
+        assert attention_mask is None
+        if self.prefix_config.prefix_mode == PREFIX_MODE_PREFIX:
+            # [batch_size, num_heads=1, q_len=seq_len, kv_len=seq_len]
+            prefix_length = prefixes[0]["key"].shape[2]
+            rope_embed_ids = create_rope_embed_ids(input_ids=input_ids) + prefix_length
+            cos, sin = self.get_cos_sin(rope_embed_ids)
+            attention_mask = create_prefix_train_attention_mask(input_ids, prefix_length)
+            # [batch_size, seq_len, hidden_dim]
+            model_out = self.model(
+                input_ids,
+                cos=cos, sin=sin,
+                use_kv_cache=True,
+                kv_cache=prefixes,
+                attention_mask=attention_mask,
+                prefixes=None,
+            )
+        elif self.prefix_config.prefix_mode == PREFIX_MODE_NONE:
+            # [batch_size, num_heads=1, q_len=seq_len, kv_len=seq_len]
+            rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
+            cos, sin = self.get_cos_sin(rope_embed_ids)
+            # [batch_size, seq_len, hidden_dim]
+            model_out = self.model(
+                input_ids,
+                cos=cos, sin=sin,
+                use_kv_cache=False,
+            )
+        else:
+            raise KeyError(self.prefix_config.prefix_mode)
         logits = self.lm_head(model_out["hidden_states"])
         return logits
 
@@ -262,6 +287,7 @@ class LLaMAInnerModel(nn.Module):
         kv_cache=None,
         num_valid_tokens=None,
         attention_mask=None,
+        prefixes=None,
     ):
         """
         :param input_ids: [batch_size, seq_len]
@@ -277,6 +303,7 @@ class LLaMAInnerModel(nn.Module):
         :param num_valid_tokens: [batch_size]
             Only used for decoding
         :param attention_mask: [batch_size, num_heads, q_len, kv_len]
+        :param prefixes [layer, kv, batch_size, num_heads, seq_len, head_dim]
         """
         hidden_states = self.embed_tokens(input_ids)
         hidden_states = hidden_states.to(self.config.dtype)
@@ -293,6 +320,7 @@ class LLaMAInnerModel(nn.Module):
                 layer_kv_cache = None
 
             if self.config.gradient_checkpointing:
+                # noinspection PyUnresolvedReferences
                 layer_out = torch.utils.checkpoint.checkpoint(
                     layer,
                     hidden_states,
@@ -301,6 +329,7 @@ class LLaMAInnerModel(nn.Module):
                     layer_kv_cache,
                     num_valid_tokens,
                     attention_mask,
+                    prefixes,
                 )
             else:
                 layer_out = layer(
@@ -310,6 +339,7 @@ class LLaMAInnerModel(nn.Module):
                     kv_cache=layer_kv_cache,
                     num_valid_tokens=num_valid_tokens,
                     attention_mask=attention_mask,
+                    layer_prefixes=prefixes[layer_i] if prefixes else None,
                 )
 
             hidden_states = layer_out["hidden_states"]
@@ -333,6 +363,7 @@ class LLaMALayer(nn.Module):
         self.input_layernorm = RMSNorm(dim=config.dim, dtype=config.dtype)
         self.post_attention_layernorm = RMSNorm(dim=config.dim, dtype=config.dtype)
 
+    # noinspection PyUnusedLocal
     def forward(
         self,
         hidden_states,
@@ -341,6 +372,7 @@ class LLaMALayer(nn.Module):
         kv_cache=None,
         num_valid_tokens=None,
         attention_mask=None,
+        layer_prefixes=None,
         offload_to_cpu=False,  # Needed for activation checkpointing? idk
     ):
         # 1) Self-attention
@@ -361,6 +393,7 @@ class LLaMALayer(nn.Module):
             kv_cache=kv_cache,
             num_valid_tokens=num_valid_tokens,
             attention_mask=attention_mask,
+            layer_prefixes=layer_prefixes,
         )
         # [batch_size, seq_len, hidden_dim]
         hidden_states = hidden_states + raw_self_attn_output["attn_output"]
@@ -403,6 +436,7 @@ class MLP(nn.Module):
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6, dtype=torch.float16):
         super().__init__()
+        self.dtype = dtype
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim, dtype=dtype))
 
@@ -410,8 +444,8 @@ class RMSNorm(torch.nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
-        output = self._norm(x.float()).type_as(x)
-        return output * self.weight
+        output = self._norm(x.float())
+        return (output * self.weight).to(self.dtype)
 
     def reset_parameters(self):
         pass
@@ -434,7 +468,8 @@ class Attention(nn.Module):
                 use_kv_cache=False,
                 kv_cache=None,
                 num_valid_tokens=None,
-                attention_mask=None,):
+                attention_mask=None,
+                layer_prefixes=None,):
         """
         :param hidden_states: [batch_size, seq_len, hidden_dim]
         :param cos:
@@ -447,6 +482,7 @@ class Attention(nn.Module):
         :param num_valid_tokens: [batch_size]
             Only used for decoding
         :param attention_mask: [batch_size, num_heads, q_len, kv_len]
+        :param layer_prefixes
         :return:
         """
         batch_size, q_seq_len, hidden_dim = hidden_states.size()
@@ -464,11 +500,11 @@ class Attention(nn.Module):
                 kv_cache=kv_cache,
                 new_key_state=key_states,
                 new_value_state=value_states,
-                num_valid_tokens=num_valid_tokens,
             )
         if q_seq_len == key_states.shape[2]:
 
             if attention_mask is None:
+                # noinspection PyUnresolvedReferences
                 with torch.backends.cuda.sdp_kernel(
                     enable_math=False, enable_flash=True, enable_mem_efficient=False,
                 ):
@@ -479,6 +515,7 @@ class Attention(nn.Module):
                         is_causal=True,
                     )
             else:
+                # noinspection PyUnresolvedReferences
                 with torch.backends.cuda.sdp_kernel(
                     enable_math=True, enable_flash=True, enable_mem_efficient=True,
                 ):
@@ -601,7 +638,8 @@ class NoInitEmbedding(nn.Embedding):
         pass
 
 
-def create_model(model_name, hf_path, use_4bit=False, device=None, config=None):
+def create_model(model_name, hf_path, use_4bit=False, device=None, config=None,
+                 prefix_config=PrefixConfig()):
     if config is None:
         config = LLAMA_CONFIG_DICT[model_name]
     weight_map = io_utils.read_json(os.path.join(hf_path, "pytorch_model.bin.index.json"))["weight_map"]
@@ -612,19 +650,21 @@ def create_model(model_name, hf_path, use_4bit=False, device=None, config=None):
     if use_4bit:
         config = dataclasses.replace(config, use_4bit=True)
         with init_empty_weights():
-            model = LLaMAModel(config=config)
+            model = LLaMAModel(config=config, prefix_config=prefix_config)
         state_keys = set(model.state_dict())
         filename_list = sorted(list(set(weight_map.values())))
         for filename in tqdm.tqdm(filename_list):
             loaded = torch.load(os.path.join(hf_path, filename), map_location="cpu")
             for k, v in loaded.items():
+                if "lm_head" in k or "layer_norm" in k:
+                    v = v.to(config.dtype)
                 set_module_quantized_tensor_to_device(model, tensor_name=k, device=device, value=v)
                 state_keys.remove(k)
         assert not state_keys
     else:
         # noinspection PyUnresolvedReferences
         torch.set_default_tensor_type(torch.cuda.HalfTensor)
-        model = LLaMAModel(config=config).cuda()
+        model = LLaMAModel(config=config, prefix_config=prefix_config).cuda()
         torch.set_default_tensor_type(torch.FloatTensor)
         state_keys = set(model.state_dict())
         for filename in tqdm.tqdm(filename_list):
@@ -658,3 +698,18 @@ def create_decoding_mask(orig_num_valid_tokens, max_seq_len, initial_max_len):
     for i, nvt in enumerate(orig_num_valid_tokens):
         mask[i, :, nvt:initial_max_len] = 0
     return mask[:, None, -1:, ].bool()
+
+
+def create_prefix_train_attention_mask(input_ids, prefix_length):
+    """Create attention mask for prefix training
+
+    :param input_ids: input ids
+    :param prefix_length:
+    :return:
+    """
+    batch_size, seq_len = input_ids.shape
+    input_mask = torch.ones([seq_len, seq_len], dtype=torch.bool)
+    input_mask.tril_()
+    prefix_mask = torch.ones([seq_len, prefix_length], dtype=torch.bool)
+    full_mask = torch.cat([prefix_mask, input_mask], dim=1)
+    return full_mask[None, None, :, :].to(input_ids.device)
