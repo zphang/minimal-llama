@@ -105,8 +105,14 @@ def run():
                 loss_list.append(loss.item())
         completed_steps = batch_metadata["curr_step"] + 1
         if completed_steps % args.save_freq == 0:
+            if args.peft_type == "prefix":
+                model_state_dict = prefix_maker.state_dict()
+            elif args.peft_type == "lora":
+                model_state_dict = {k: v for k, v in model.state_dict().items() if v.requires_grad}
+            else:
+                raise KeyError(args.peft_type)
             torch.save({
-                "model": prefix_maker.state_dict(),
+                "model": model_state_dict,
                 "optimizer": optimizer.state_dict(),
             }, os.path.join(args.save_dir, f"checkpoint_{completed_steps:05d}.pt"))
             io_utils.write_json(loss_list, os.path.join(args.save_dir, f"loss_{completed_steps:05d}.json"))
