@@ -1,3 +1,4 @@
+import math
 import dataclasses
 
 import tqdm.auto as tqdm
@@ -8,6 +9,7 @@ import torch.nn.functional as F
 import bitsandbytes as bnb
 from accelerate import init_empty_weights
 
+from typing import Optional
 import minimal_llama.utils.io_utils as io_utils
 from transformers.utils.bitsandbytes import set_module_quantized_tensor_to_device
 
@@ -36,6 +38,8 @@ class LLaMAConfig:
     use_4bit: bool = False
     gradient_checkpointing: bool = False
     num_gist_tokens: int = 256
+    lora_rank: int = 8
+    device: Optional[torch.device] = None
 
     @property
     def head_dim(self):
@@ -71,16 +75,19 @@ class LLaMAModel(nn.Module):
         super().__init__()
         self.config = config
         self.model = LLaMAInnerModel(config)
-        self.lm_head = NoInitLinear(config.dim, config.vocab_size, bias=False, dtype=config.dtype)
+        self.lm_head = create_linear(config.dim, config.vocab_size, dtype=config.dtype,
+                                     use_4bit=config.use_4bit, rank=config.lora_rank, device=config.device)
 
     def forward(self,
                 input_ids,
-                attention_mask=None):
+                attention_mask=None,
+                use_pefts=False):
         """Forward pass (with full decode sequence, intended for training or loss-scoring)
 
         :param input_ids: [batch_size, seq_len]
             - Always right-padded. Masks are generated based on padding tokens
         :param attention_mask
+        :param use_pefts
         :return: logits [batch_size, seq_len]
         """
         # 1) Create masks
@@ -96,9 +103,10 @@ class LLaMAModel(nn.Module):
             cos=cos, sin=sin,
             use_kv_cache=False,
             attention_mask=attention_mask,
+            use_pefts=use_pefts,
         )
         # [batch_size, seq_len, vocab_size]
-        logits = self.lm_head(model_out["hidden_states"])
+        logits = self.lm_head(model_out["hidden_states"], use_lora=use_pefts)
         return logits
 
     def init_kv_cache(self, batch_size):
@@ -239,7 +247,7 @@ class LLaMAModel(nn.Module):
         self.config.gradient_checkpointing = True
 
     def enable_input_require_grads(self):
-        def make_inputs_require_grads(module, input, output):
+        def make_inputs_require_grads(module, inputs, output):
             output.requires_grad_(True)
         self.model.embed_tokens.register_forward_hook(make_inputs_require_grads)
 
@@ -248,7 +256,11 @@ class LLaMAInnerModel(nn.Module):
     def __init__(self, config: LLaMAConfig):
         super().__init__()
         self.config = config
-        self.embed_tokens = nn.Embedding(config.vocab_size + config.num_gist_tokens, config.dim, dtype=config.dtype)
+        self.embed_tokens = NoInitExtendedEmbedding(
+            config.vocab_size, config.dim,
+            additional_tokens=config.num_gist_tokens,
+            dtype=config.dtype,
+        )
         self.layers = nn.ModuleList([
             LLaMALayer(config=config)
             for _ in range(config.n_layers)
@@ -263,6 +275,7 @@ class LLaMAInnerModel(nn.Module):
         kv_cache=None,
         num_valid_tokens=None,
         attention_mask=None,
+        use_pefts=False,
     ):
         """
         :param input_ids: [batch_size, seq_len]
@@ -277,9 +290,10 @@ class LLaMAInnerModel(nn.Module):
             Only used for decoding
         :param num_valid_tokens: [batch_size]
             Only used for decoding
+        :param use_pefts
         :param attention_mask: [batch_size, num_heads, q_len, kv_len]
         """
-        hidden_states = self.embed_tokens(input_ids)
+        hidden_states = self.embed_tokens(input_ids, use_extended=use_pefts)
         hidden_states = hidden_states.to(self.config.dtype)
 
         new_kv_cache = []
@@ -294,6 +308,7 @@ class LLaMAInnerModel(nn.Module):
                 layer_kv_cache = None
 
             if self.config.gradient_checkpointing:
+                # noinspection PyUnresolvedReferences
                 layer_out = torch.utils.checkpoint.checkpoint(
                     layer,
                     hidden_states,
@@ -302,6 +317,8 @@ class LLaMAInnerModel(nn.Module):
                     layer_kv_cache,
                     num_valid_tokens,
                     attention_mask,
+                    use_pefts,
+                    use_reentrant=False,
                 )
             else:
                 layer_out = layer(
@@ -311,6 +328,8 @@ class LLaMAInnerModel(nn.Module):
                     kv_cache=layer_kv_cache,
                     num_valid_tokens=num_valid_tokens,
                     attention_mask=attention_mask,
+                    use_pefts=use_pefts,
+                    use_reentrant=False,
                 )
 
             hidden_states = layer_out["hidden_states"]
@@ -342,6 +361,7 @@ class LLaMALayer(nn.Module):
         kv_cache=None,
         num_valid_tokens=None,
         attention_mask=None,
+        use_pefts=False,
         offload_to_cpu=False,  # Needed for activation checkpointing? idk
     ):
         # 1) Self-attention
@@ -362,13 +382,14 @@ class LLaMALayer(nn.Module):
             kv_cache=kv_cache,
             num_valid_tokens=num_valid_tokens,
             attention_mask=attention_mask,
+            use_pefts=use_pefts,
         )
         # [batch_size, seq_len, hidden_dim]
         hidden_states = hidden_states + raw_self_attn_output["attn_output"]
         check_nan(hidden_states)
         # 2) FFN
         # [batch_size, seq_len, hidden_dim]
-        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states), use_pefts=use_pefts)
         check_nan(hidden_states)
         if kv_cache:
             return {
@@ -393,12 +414,19 @@ class MLP(nn.Module):
         hidden_dim = int(2 * hidden_dim / 3)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
-        self.gate_proj = create_linear(dim, hidden_dim, bias=False, dtype=config.dtype, use_4bit=config.use_4bit)
-        self.up_proj = create_linear(dim, hidden_dim, bias=False, dtype=config.dtype, use_4bit=config.use_4bit)
-        self.down_proj = create_linear(hidden_dim, dim, bias=False, dtype=config.dtype, use_4bit=config.use_4bit)
+        self.gate_proj = create_linear(dim, hidden_dim, dtype=config.dtype, use_4bit=config.use_4bit,
+                                       rank=config.lora_rank)
+        self.up_proj = create_linear(dim, hidden_dim, dtype=config.dtype, use_4bit=config.use_4bit,
+                                     rank=config.lora_rank)
+        self.down_proj = create_linear(hidden_dim, dim, dtype=config.dtype, use_4bit=config.use_4bit,
+                                       rank=config.lora_rank)
 
-    def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+    def forward(self, x, use_pefts=False):
+        return self.down_proj(
+            F.silu(self.gate_proj(x, use_lora=use_pefts))
+            * self.up_proj(x, use_lora=use_pefts),
+            use_lora=use_pefts,
+        )
 
 
 class RMSNorm(torch.nn.Module):
@@ -425,17 +453,22 @@ class Attention(nn.Module):
         self.n_heads = config.n_heads
         self.head_dim = config.dim // config.n_heads
 
-        self.q_proj = create_linear(config.dim, config.dim, bias=False, dtype=config.dtype, use_4bit=config.use_4bit)
-        self.k_proj = create_linear(config.dim, config.dim, bias=False, dtype=config.dtype, use_4bit=config.use_4bit)
-        self.v_proj = create_linear(config.dim, config.dim, bias=False, dtype=config.dtype, use_4bit=config.use_4bit)
-        self.o_proj = create_linear(config.dim, config.dim, bias=False, dtype=config.dtype, use_4bit=config.use_4bit)
+        self.q_proj = create_linear(config.dim, config.dim, dtype=config.dtype, use_4bit=config.use_4bit,
+                                    rank=config.lora_rank)
+        self.k_proj = create_linear(config.dim, config.dim, dtype=config.dtype, use_4bit=config.use_4bit,
+                                    rank=config.lora_rank)
+        self.v_proj = create_linear(config.dim, config.dim, dtype=config.dtype, use_4bit=config.use_4bit,
+                                    rank=config.lora_rank)
+        self.o_proj = create_linear(config.dim, config.dim, dtype=config.dtype, use_4bit=config.use_4bit,
+                                    rank=config.lora_rank)
         self.rotary_emb = RotaryEmbedding(dim=self.head_dim, max_position_embeddings=config.max_seq_length)
 
     def forward(self, hidden_states, cos, sin,
                 use_kv_cache=False,
                 kv_cache=None,
                 num_valid_tokens=None,
-                attention_mask=None,):
+                attention_mask=None,
+                use_pefts=False):
         """
         :param hidden_states: [batch_size, seq_len, hidden_dim]
         :param cos:
@@ -448,16 +481,17 @@ class Attention(nn.Module):
         :param num_valid_tokens: [batch_size]
             Only used for decoding
         :param attention_mask: [batch_size, num_heads, q_len, kv_len]
+        :param use_pefts
         :return:
         """
         batch_size, q_seq_len, hidden_dim = hidden_states.size()
 
         # (batch_size, num_heads, q_seq_len, head_dim)
-        query_states = self.q_proj(hidden_states).view(
+        query_states = self.q_proj(hidden_states, use_lora=use_pefts).view(
             batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(
+        key_states = self.k_proj(hidden_states, use_lora=use_pefts).view(
             batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(
+        value_states = self.v_proj(hidden_states, use_lora=use_pefts).view(
             batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos=cos, sin=sin)
         if use_kv_cache:
@@ -469,6 +503,7 @@ class Attention(nn.Module):
         if q_seq_len == key_states.shape[2]:
 
             if attention_mask is None:
+                # noinspection PyUnresolvedReferences
                 with torch.backends.cuda.sdp_kernel(
                     enable_math=False, enable_flash=True, enable_mem_efficient=False,
                 ):
@@ -479,6 +514,7 @@ class Attention(nn.Module):
                         is_causal=True,
                     )
             else:
+                # noinspection PyUnresolvedReferences
                 with torch.backends.cuda.sdp_kernel(
                     enable_math=True, enable_flash=True, enable_mem_efficient=True,
                 ):
@@ -499,7 +535,7 @@ class Attention(nn.Module):
         attn_output = attn_output.transpose(1, 2).contiguous().view(
             batch_size, q_seq_len, hidden_dim,
         )
-        attn_output = self.o_proj(attn_output)
+        attn_output = self.o_proj(attn_output, use_lora=use_pefts)
         check_nan(attn_output)
         if use_kv_cache:
             new_kv_cache = {"key": key_states, "value": value_states}
@@ -571,39 +607,63 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     return q_embed, k_embed
 
 
-class NoInitLinear(nn.Linear):
-    def reset_parameters(self) -> None:
-        pass
+class NoInitLoraLinear(nn.Linear):
+
+    def __init__(self,
+                 in_features: int, out_features: int,
+                 rank: int, alpha: int = 16,
+                 device=None, dtype=None) -> None:
+        super().__init__(
+            in_features=in_features, out_features=out_features, bias=False,
+            device=device, dtype=dtype,
+        )
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        self.rank = rank
+        self.alpha = alpha
+        self.lora_a = nn.Parameter(torch.empty((rank, self.in_features), **factory_kwargs))
+        self.lora_b = nn.Parameter(torch.empty((self.out_features, rank), **factory_kwargs))
+        self.scaling = self.alpha / self.rank
+
+    def forward(self, x: torch.Tensor, use_lora: bool = True) -> torch.Tensor:
+        out = super().forward(x)
+        if use_lora:
+            return out + self.scaling * (
+                F.linear(F.linear(x, self.lora_a), self.lora_b)
+            )
+        else:
+            return out
+
+    def reset_lora_parameters(self):
+        nn.init.zeros_(self.lora_b)
+        nn.init.kaiming_uniform_(self.lora_a, a=math.sqrt(5))
 
 
-class NoInit4bitLinear(bnb.nn.Linear4bit):
+class NoInitLora4bitLinear(bnb.nn.Linear4bit):
     source_cls = nn.Linear
 
-    def reset_parameters(self) -> None:
-        pass
-
-
-class NoInitLoraLinear(nn.Module):
-
     def __init__(self,
-                 in_features: int, out_features: int,
-                 rank: int, scaling: float, alpha: int = 16,
-                 device=None, dtype=None) -> None:
-        super().__init__()
-        factory_kwargs = {'device': device, 'dtype': dtype}
-        self.in_features = in_features
-        self.out_features = out_features
+                 input_features: int, output_features: int,
+                 rank: int, alpha: int = 16,
+                 compute_dtype=None,
+                 compress_statistics=True,
+                 quant_type="fp4",
+                 lora_device=None) -> None:
+        super().__init__(
+            input_features=input_features, output_features=output_features,
+            bias=False,
+            compute_dtype=compute_dtype,
+            compress_statistics=compress_statistics,
+            quant_type=quant_type,
+        )
+        factory_kwargs = {'device': lora_device, 'dtype': compute_dtype}
         self.rank = rank
         self.alpha = alpha
-
-        self.weight = nn.Parameter(torch.empty((out_features, in_features), **factory_kwargs))
         self.lora_a = nn.Parameter(torch.empty((rank, self.in_features), **factory_kwargs))
         self.lora_b = nn.Parameter(torch.empty((self.out_features, rank), **factory_kwargs))
         self.scaling = self.alpha / self.rank
-        self.reset_parameters()
 
     def forward(self, x: torch.Tensor, use_lora: bool = True) -> torch.Tensor:
-        out = F.linear(x, self.lora_a, None)
+        out = super().forward(x)
         if use_lora:
             return out + self.scaling * (
                 F.linear(F.linear(x, self.lora_a), self.lora_b)
@@ -614,56 +674,63 @@ class NoInitLoraLinear(nn.Module):
     def reset_parameters(self) -> None:
         pass
 
-
-class NoInit4bitLoraLinear(nn.Module):
-
-    def __init__(self,
-                 in_features: int, out_features: int,
-                 rank: int, scaling: float, alpha: int = 16,
-                 device=None, dtype=None) -> None:
-        super().__init__()
-        factory_kwargs = {'device': device, 'dtype': dtype}
-        self.in_features = in_features
-        self.out_features = out_features
-        self.rank = rank
-        self.alpha = alpha
-
-        self.weight = nn.Parameter(torch.empty((out_features, in_features), **factory_kwargs))
-        self.lora_a = nn.Parameter(torch.empty((rank, self.in_features), **factory_kwargs))
-        self.lora_b = nn.Parameter(torch.empty((self.out_features, rank), **factory_kwargs))
-        self.scaling = self.alpha / self.rank
-        self.reset_parameters()
-
-    def forward(self, x: torch.Tensor, use_lora: bool = True) -> torch.Tensor:
-        out = F.linear(x, self.lora_a, None)
-        if use_lora:
-            return out + self.scaling * (
-                F.linear(F.linear(x, self.lora_a), self.lora_b)
-            )
-        else:
-            return out
-
-    def reset_parameters(self) -> None:
-        pass
+    def reset_lora_parameters(self):
+        if self.lora_b.device == torch.device("meta"):
+            # meta devices are weirdly broken; no better way to move off meta device
+            self.lora_b = nn.Parameter(torch.empty_like(self.lora_b.data, device=self.weight.device))
+            self.lora_a = nn.Parameter(torch.empty_like(self.lora_a.data, device=self.weight.device))
+        nn.init.zeros_(self.lora_b)
+        nn.init.kaiming_uniform_(self.lora_a, a=math.sqrt(5))
 
 
-
-def create_linear(in_features: int, out_features: int, bias: bool, dtype: torch.Type,
-                  use_4bit: bool = False, double_quant: bool = True):
+def create_linear(in_features: int, out_features: int, dtype: torch.Type,
+                  use_4bit: bool = False, double_quant: bool = True,
+                  rank: int = 8, device: Optional[torch.device] = None) -> nn.Module:
     if use_4bit:
-        return NoInit4bitLinear(
-            in_features, out_features, bias=bias,
+        return NoInitLora4bitLinear(
+            in_features, out_features,
             compute_dtype=dtype,
             compress_statistics=double_quant,
             quant_type="nf4",
+            rank=rank,
+            lora_device=device,
         )
     else:
-        return NoInitLinear(in_features, out_features, bias=bias, dtype=dtype)
+        return NoInitLoraLinear(in_features, out_features, dtype=dtype, rank=rank)
 
 
-class NoInitEmbedding(nn.Embedding):
+class NoInitExtendedEmbedding(nn.Embedding):
+    def __init__(self, num_embeddings: int, embedding_dim: int, additional_tokens: int, dtype=None,
+                 device: Optional[torch.device] = None) -> None:
+        super().__init__(num_embeddings, embedding_dim, dtype=dtype, device=device)
+        self.additional_tokens = additional_tokens
+        self.weight.requires_grad_(False)
+        self.extended_weight = nn.Parameter(torch.empty([
+            self.additional_tokens, embedding_dim
+        ], device=device), requires_grad=True)
+
+    def forward(self, input_ids: torch.Tensor, use_extended: bool = False) -> torch.Tensor:
+        if not use_extended:
+            return super().forward(input_ids)
+
+        regular_input_ids = input_ids.clamp(max=self.num_embeddings - 1)
+        is_regular = (input_ids < self.num_embeddings)
+        regular_embedded = super().forward(regular_input_ids)
+        regular_embedded = regular_embedded * is_regular[:, :, None]
+
+        extended_input_ids = (input_ids - self.num_embeddings).clamp(min=0)
+        extended_embedded = F.embedding(extended_input_ids, self.extended_weight)
+        extended_embedded = extended_embedded * (~is_regular)[:, :, None]
+        return regular_embedded + extended_embedded
+
     def reset_parameters(self) -> None:
         pass
+
+    def reset_extended_embeddings(self):
+        if self.extended_weight.device == torch.device("meta"):
+            self.extended_weight = nn.Parameter(
+                torch.empty_like(self.extended_weight.data, device=self.weight.device))
+        nn.init.normal_(self.extended_weight)
 
 
 def create_model(model_name, hf_path, use_4bit=False, device=None, config=None):
@@ -674,6 +741,7 @@ def create_model(model_name, hf_path, use_4bit=False, device=None, config=None):
     if device is None:
         # TODO: Local rank
         device = torch.device("cuda:0")
+    config.device = device
     if use_4bit:
         config = dataclasses.replace(config, use_4bit=True)
         with init_empty_weights():
@@ -683,9 +751,12 @@ def create_model(model_name, hf_path, use_4bit=False, device=None, config=None):
         for filename in tqdm.tqdm(filename_list):
             loaded = torch.load(os.path.join(hf_path, filename), map_location="cpu")
             for k, v in loaded.items():
-                if "lm_head" in k or "layer_norm" in k:
+                if "lm_head" in k or "layernorm" in k or ".norm" in k:
                     v = v.to(config.dtype)
                 set_module_quantized_tensor_to_device(model, tensor_name=k, device=device, value=v)
+                state_keys.remove(k)
+        for k in list(state_keys):
+            if "lora" in k or "extended" in k:
                 state_keys.remove(k)
         assert not state_keys
     else:
@@ -699,7 +770,28 @@ def create_model(model_name, hf_path, use_4bit=False, device=None, config=None):
             model.load_state_dict(loaded, strict=False)
             for k in loaded:
                 state_keys.remove(k)
+
+    initialize_pefts(model)
+
     return model
+
+
+def initialize_pefts(model):
+    model.model.embed_tokens.reset_extended_embeddings()
+    for layer in model.model.layers:
+        layer.self_attn.q_proj.reset_lora_parameters()
+        layer.self_attn.k_proj.reset_lora_parameters()
+        layer.self_attn.v_proj.reset_lora_parameters()
+        layer.self_attn.o_proj.reset_lora_parameters()
+        layer.mlp.gate_proj.reset_lora_parameters()
+        layer.mlp.up_proj.reset_lora_parameters()
+        layer.mlp.down_proj.reset_lora_parameters()
+    model.lm_head.reset_lora_parameters()
+    for k, v in model.named_parameters():
+        if "lora" in k or "extended" in k:
+            v.requires_grad_(True)
+        else:
+            v.requires_grad_(False)
 
 
 def create_rope_embed_ids(input_ids, pad_token_id=0):

@@ -301,6 +301,7 @@ class LLaMAInnerModel(nn.Module):
                     layer_kv_cache,
                     num_valid_tokens,
                     attention_mask,
+                    use_reentrant=False,
                 )
             else:
                 layer_out = layer(
@@ -310,6 +311,7 @@ class LLaMAInnerModel(nn.Module):
                     kv_cache=layer_kv_cache,
                     num_valid_tokens=num_valid_tokens,
                     attention_mask=attention_mask,
+                    use_reentrant=False,
                 )
 
             hidden_states = layer_out["hidden_states"]
@@ -617,7 +619,7 @@ def create_model(model_name, hf_path, use_4bit=False, device=None, config=None):
         for filename in tqdm.tqdm(filename_list):
             loaded = torch.load(os.path.join(hf_path, filename), map_location="cpu")
             for k, v in loaded.items():
-                if "lm_head" in k or "layer_norm" in k:
+                if "lm_head" in k or "layernorm" in k or ".norm" in k:
                     v = v.to(config.dtype)
                 set_module_quantized_tensor_to_device(model, tensor_name=k, device=device, value=v)
                 state_keys.remove(k)
