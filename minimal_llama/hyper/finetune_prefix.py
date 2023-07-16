@@ -10,6 +10,7 @@ import bitsandbytes.optim
 
 import minimal_llama.hyper.prefix_llama as prefix_llama
 import minimal_llama.hyper.prefix_makers as prefix_makers
+import minimal_llama.hyper.lora_llama as lora_llama
 
 
 def run():
@@ -18,6 +19,7 @@ def run():
     parser.add_argument("--dataset_path", type=str)
     parser.add_argument("--save_dir", type=str)
     parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--peft_type", type=str, default="prefix")
     parser.add_argument("--num_prefix_tokens", type=int, default=16)
     parser.add_argument("--prefix_type", type=str, default="mlp")
     parser.add_argument("--batch_size", type=int, default=4)
@@ -33,23 +35,36 @@ def run():
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
 
-    config = prefix_llama.LLAMA_7B_CONFIG
-    config.dtype = torch.bfloat16
-    config.gradient_checkpointing = True
-    model = prefix_llama.create_model(
-        "7b",
-        config=config,
-        hf_path=args.hf_path,
-        device=device,
-        use_4bit=True,
-    )
-    prefix_maker = prefix_makers.create_prefix_maker(
-        num_tokens=args.num_prefix_tokens,
-        config=config,
-        prefix_type=args.prefix_type,
-    ).to(device)
-    # optimizer = optim.AdamW(prefix_maker.parameters(), lr=args.lr)
-    optimizer = bitsandbytes.optim.AdamW(prefix_maker.parameters(), lr=args.lr, is_paged=True, optim_bits=32)
+    if args.peft_type == "prefix":
+        config = prefix_llama.LLAMA_7B_CONFIG
+        config.dtype = torch.bfloat16
+        config.gradient_checkpointing = True
+        model = prefix_llama.create_model(
+            "7b",
+            config=config,
+            hf_path=args.hf_path,
+            device=device,
+            use_4bit=True,
+        )
+        prefix_maker = prefix_makers.create_prefix_maker(
+            num_tokens=args.num_prefix_tokens,
+            config=config,
+            prefix_type=args.prefix_type,
+        ).to(device)
+        optimizer = bitsandbytes.optim.AdamW(prefix_maker.parameters(), lr=args.lr, is_paged=True, optim_bits=32)
+    elif args.peft_type == "lora":
+        config = lora_llama.LLAMA_7B_CONFIG
+        config.dtype = torch.bfloat16
+        config.gradient_checkpointing = True
+        model = lora_llama.create_model(
+            "7b",
+            config=config,
+            hf_path=args.hf_path,
+            use_4bit=True,
+        )
+        optimizer = bitsandbytes.optim.AdamW(model.parameters(), lr=args.lr, is_paged=True, optim_bits=32)
+    else:
+        raise KeyError(args.peft_type)
 
     ds = datasets.load_from_disk(args.dataset_path)
     train_iterator = get_train_iterator(
@@ -64,11 +79,19 @@ def run():
     loss = None
     optimizer.zero_grad()
     for batch_metadata, batch in train_iterator:
-        prefixes = prefix_maker(batch_size=batch["input_ids"].shape[0])
-        output = model(
-            input_ids=batch["input_ids"][:, :-1].to(device),
-            prefixes=prefixes,
-        )
+        if args.peft_type == "prefix":
+            prefixes = prefix_maker(batch_size=batch["input_ids"].shape[0])
+            output = model(
+                input_ids=batch["input_ids"][:, :-1].to(device),
+                prefixes=prefixes,
+            )
+        elif args.peft_type == "lora":
+            output = model(
+                input_ids=batch["input_ids"][:, :-1].to(device),
+                use_pefts=True,
+            )
+        else:
+            raise KeyError(args.peft_type)
         loss = F.cross_entropy(
             output.view(-1, output.size(-1)),
             batch["labels"][:, 1:].reshape(-1).to(device),
@@ -88,8 +111,15 @@ def run():
             }, os.path.join(args.save_dir, f"checkpoint_{completed_steps:05d}.pt"))
             io_utils.write_json(loss_list, os.path.join(args.save_dir, f"loss_{completed_steps:05d}.json"))
 
+    if args.peft_type == "prefix":
+        model_state_dict = prefix_maker.state_dict()
+    elif args.peft_type == "lora":
+        model_state_dict = {k: v for k, v in model.state_dict().items() if v.requires_grad}
+    else:
+        raise KeyError(args.peft_type)
+
     torch.save({
-        "model": prefix_maker.state_dict(),
+        "model": model_state_dict,
         "optimizer": optimizer.state_dict(),
     }, os.path.join(args.save_dir, "checkpoint_final.pt"))
     io_utils.write_json(loss_list, os.path.join(args.save_dir, "loss_final.json"))
