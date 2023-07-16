@@ -293,6 +293,7 @@ class LLaMAInnerModel(nn.Module):
                 layer_kv_cache = None
 
             if self.config.gradient_checkpointing:
+                # noinspection PyUnresolvedReferences
                 layer_out = torch.utils.checkpoint.checkpoint(
                     layer,
                     hidden_states,
@@ -311,7 +312,6 @@ class LLaMAInnerModel(nn.Module):
                     kv_cache=layer_kv_cache,
                     num_valid_tokens=num_valid_tokens,
                     attention_mask=attention_mask,
-                    use_reentrant=False,
                 )
 
             hidden_states = layer_out["hidden_states"]
@@ -470,6 +470,7 @@ class Attention(nn.Module):
         if q_seq_len == key_states.shape[2]:
 
             if attention_mask is None:
+                # noinspection PyUnresolvedReferences
                 with torch.backends.cuda.sdp_kernel(
                     enable_math=False, enable_flash=True, enable_mem_efficient=False,
                 ):
@@ -480,6 +481,7 @@ class Attention(nn.Module):
                         is_causal=True,
                     )
             else:
+                # noinspection PyUnresolvedReferences
                 with torch.backends.cuda.sdp_kernel(
                     enable_math=True, enable_flash=True, enable_mem_efficient=True,
                 ):

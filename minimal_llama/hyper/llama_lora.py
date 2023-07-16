@@ -76,7 +76,7 @@ class LLaMAModel(nn.Module):
         self.config = config
         self.model = LLaMAInnerModel(config)
         self.lm_head = create_linear(config.dim, config.vocab_size, dtype=config.dtype,
-                                     use_4bit=config.use_4bit, rank=config.lora_rank, device=config.device)
+                                     use_4bit=True, use_lora=False, device=config.device)
 
     def forward(self,
                 input_ids,
@@ -106,7 +106,7 @@ class LLaMAModel(nn.Module):
             use_pefts=use_pefts,
         )
         # [batch_size, seq_len, vocab_size]
-        logits = self.lm_head(model_out["hidden_states"], use_lora=use_pefts)
+        logits = self.lm_head(model_out["hidden_states"])
         return logits
 
     def init_kv_cache(self, batch_size):
@@ -134,7 +134,7 @@ class LLaMAModel(nn.Module):
         return kv_cache
 
     def generate(self, input_ids, generation_length: int = 20,
-                 return_output_only=True):
+                 return_output_only=True, use_pefts=False):
         """Generate tokens with efficient caching of KV.
 
         TODO: Add stopping conditions
@@ -144,6 +144,7 @@ class LLaMAModel(nn.Module):
             - Always right-padded. Masks are generated based on padding tokens
         :param generation_length: int
         :param return_output_only: True = return continuation only. False = return whole sequence
+        :param use_pefts
         :return: [batch_size, generation_length]
         """
         original_input_ids = input_ids
@@ -180,6 +181,7 @@ class LLaMAModel(nn.Module):
             use_kv_cache=True,
             kv_cache=kv_cache,
             num_valid_tokens=num_valid_tokens,
+            use_pefts=use_pefts,
         )
         logits = self.lm_head(model_out["hidden_states"])
         kv_cache = model_out["kv_cache"]
@@ -218,6 +220,7 @@ class LLaMAModel(nn.Module):
                 kv_cache=kv_cache,
                 num_valid_tokens=num_valid_tokens,
                 attention_mask=decoding_attention_mask,
+                use_pefts=use_pefts,
             )
             # [batch_size, dec_seq_len=1, vocab_size]
             logits = self.lm_head(model_out["hidden_states"])
@@ -329,7 +332,6 @@ class LLaMAInnerModel(nn.Module):
                     num_valid_tokens=num_valid_tokens,
                     attention_mask=attention_mask,
                     use_pefts=use_pefts,
-                    use_reentrant=False,
                 )
 
             hidden_states = layer_out["hidden_states"]
@@ -607,7 +609,19 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     return q_embed, k_embed
 
 
-class NoInitLoraLinear(nn.Linear):
+class NoInitLinear(nn.Linear):
+    def reset_parameters(self) -> None:
+        pass
+
+
+class NoInit4bitLinear(bnb.nn.Linear4bit):
+    source_cls = nn.Linear
+
+    def reset_parameters(self) -> None:
+        pass
+
+
+class NoInitLoraLinear(NoInitLinear):
 
     def __init__(self,
                  in_features: int, out_features: int,
@@ -634,11 +648,15 @@ class NoInitLoraLinear(nn.Linear):
             return out
 
     def reset_lora_parameters(self):
+        if self.lora_b.device == torch.device("meta"):
+            # meta devices are weirdly broken; no better way to move off meta device
+            self.lora_b = nn.Parameter(torch.empty_like(self.lora_b.data, device=self.weight.device))
+            self.lora_a = nn.Parameter(torch.empty_like(self.lora_a.data, device=self.weight.device))
         nn.init.zeros_(self.lora_b)
         nn.init.kaiming_uniform_(self.lora_a, a=math.sqrt(5))
 
 
-class NoInitLora4bitLinear(bnb.nn.Linear4bit):
+class NoInitLora4bitLinear(NoInit4bitLinear):
     source_cls = nn.Linear
 
     def __init__(self,
@@ -671,9 +689,6 @@ class NoInitLora4bitLinear(bnb.nn.Linear4bit):
         else:
             return out
 
-    def reset_parameters(self) -> None:
-        pass
-
     def reset_lora_parameters(self):
         if self.lora_b.device == torch.device("meta"):
             # meta devices are weirdly broken; no better way to move off meta device
@@ -685,18 +700,30 @@ class NoInitLora4bitLinear(bnb.nn.Linear4bit):
 
 def create_linear(in_features: int, out_features: int, dtype: torch.Type,
                   use_4bit: bool = False, double_quant: bool = True,
+                  use_lora=True,
                   rank: int = 8, device: Optional[torch.device] = None) -> nn.Module:
     if use_4bit:
-        return NoInitLora4bitLinear(
-            in_features, out_features,
-            compute_dtype=dtype,
-            compress_statistics=double_quant,
-            quant_type="nf4",
-            rank=rank,
-            lora_device=device,
-        )
+        if use_lora:
+            return NoInitLora4bitLinear(
+                in_features, out_features,
+                compute_dtype=dtype,
+                compress_statistics=double_quant,
+                quant_type="nf4",
+                rank=rank,
+                lora_device=device,
+            )
+        else:
+            return NoInit4bitLinear(
+                in_features, out_features, bias=False,
+                compute_dtype=dtype,
+                compress_statistics=double_quant,
+                quant_type="nf4",
+            )
     else:
-        return NoInitLoraLinear(in_features, out_features, dtype=dtype, rank=rank)
+        if use_lora:
+            return NoInitLoraLinear(in_features, out_features, dtype=dtype, rank=rank)
+        else:
+            return NoInitLinear(in_features, out_features, bias=False, dtype=dtype)
 
 
 class NoInitExtendedEmbedding(nn.Embedding):
@@ -786,7 +813,7 @@ def initialize_pefts(model):
         layer.mlp.gate_proj.reset_lora_parameters()
         layer.mlp.up_proj.reset_lora_parameters()
         layer.mlp.down_proj.reset_lora_parameters()
-    model.lm_head.reset_lora_parameters()
+    # model.lm_head.reset_lora_parameters()
     for k, v in model.named_parameters():
         if "lora" in k or "extended" in k:
             v.requires_grad_(True)

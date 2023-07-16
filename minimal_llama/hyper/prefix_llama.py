@@ -150,7 +150,7 @@ class LLaMAModel(nn.Module):
         return kv_cache
 
     def generate(self, input_ids, generation_length: int = 20,
-                 return_output_only=True):
+                 return_output_only=True, use_pefts=False):
         """Generate tokens with efficient caching of KV.
 
         TODO: Add stopping conditions

@@ -20,7 +20,7 @@ def main():
         [2259, 1704, 29885, 547],
     ]).to(device)
 
-    input_ids3 = torch.LongTensor([
+    input_ids4 = torch.LongTensor([
         [2261,  547, 0, 0] + [0] * 100,
         [2259, 1704, 29885, 547] + [0] * 100,
     ]).to(device)
@@ -28,7 +28,7 @@ def main():
     out1 = model.generate(input_ids1, generation_length=16)
     out2 = model.generate(input_ids2, generation_length=16)
     out3 = model.generate(input_ids3, generation_length=16)
-    out4 = model.generate(input_ids3, generation_length=16)
+    out4 = model.generate(input_ids4, generation_length=16)
 
     if (
         out1.cpu() == torch.LongTensor([[
