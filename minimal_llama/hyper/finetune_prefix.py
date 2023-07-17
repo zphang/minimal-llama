@@ -11,6 +11,7 @@ import bitsandbytes.optim
 import minimal_llama.hyper.prefix_llama as prefix_llama
 import minimal_llama.hyper.prefix_makers as prefix_makers
 import minimal_llama.hyper.lora_llama as lora_llama
+import minimal_llama.utils.torch_utils as torch_utils
 
 
 def run():
@@ -108,7 +109,7 @@ def run():
             if args.peft_type == "prefix":
                 model_state_dict = prefix_maker.state_dict()
             elif args.peft_type == "lora":
-                model_state_dict = {k: v for k, v in model.state_dict().items() if v.requires_grad}
+                model_state_dict = torch_utils.get_requires_grad(model)
             else:
                 raise KeyError(args.peft_type)
             torch.save({
@@ -120,7 +121,7 @@ def run():
     if args.peft_type == "prefix":
         model_state_dict = prefix_maker.state_dict()
     elif args.peft_type == "lora":
-        model_state_dict = {k: v for k, v in model.state_dict().items() if v.requires_grad}
+        model_state_dict = torch_utils.get_requires_grad(model)
     else:
         raise KeyError(args.peft_type)
 

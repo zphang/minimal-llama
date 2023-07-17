@@ -134,7 +134,7 @@ class LLaMAModel(nn.Module):
         return kv_cache
 
     def generate(self, input_ids, generation_length: int = 20,
-                 return_output_only=True, use_pefts=False):
+                 return_output_only=True, use_pefts=False, stop_on_eos=True):
         """Generate tokens with efficient caching of KV.
 
         TODO: Add stopping conditions
@@ -145,6 +145,7 @@ class LLaMAModel(nn.Module):
         :param generation_length: int
         :param return_output_only: True = return continuation only. False = return whole sequence
         :param use_pefts
+        :param stop_on_eos
         :return: [batch_size, generation_length]
         """
         original_input_ids = input_ids
@@ -152,6 +153,7 @@ class LLaMAModel(nn.Module):
         # noinspection PyUnresolvedReferences
         num_valid_tokens = (input_ids != self.config.pad_token_id).long().sum(dim=1)
         orig_num_valid_tokens = num_valid_tokens.clone()
+        seen_eos = torch.zeros([batch_size], dtype=torch.bool).to(device=input_ids.device)
 
         # 1) Setup
         if input_ids is None:
@@ -191,9 +193,12 @@ class LLaMAModel(nn.Module):
         ][:, None]
         generated_token_ids_list.append(generated_token_ids)
         input_ids = generated_token_ids
+        seen_eos = seen_eos | (generated_token_ids == self.config.eos_token_id)
 
         # 3) Subsequent steps
         for decode_step in range(generation_length-1):
+            if stop_on_eos and seen_eos.all():
+                break
             num_valid_tokens += 1
             total_seq_len += 1
             # [batch_size=1, num_heads=1, q_len=1, kv_len=1]
@@ -229,6 +234,7 @@ class LLaMAModel(nn.Module):
             generated_token_ids = logits.argmax(-1)[:, -1:]
             generated_token_ids_list.append(generated_token_ids)
             input_ids = generated_token_ids
+            seen_eos = seen_eos | (generated_token_ids == self.config.eos_token_id)
         output = torch.cat(generated_token_ids_list, dim=1)
         if return_output_only:
             output = output[:, input_seq_len:]
