@@ -110,6 +110,8 @@ def run():
                 model_state_dict = prefix_maker.state_dict()
             elif args.peft_type == "lora":
                 model_state_dict = torch_utils.get_requires_grad(model)
+                if not model_state_dict:
+                    raise RuntimeError()
             else:
                 raise KeyError(args.peft_type)
             torch.save({

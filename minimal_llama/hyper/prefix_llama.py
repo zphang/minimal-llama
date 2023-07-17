@@ -150,7 +150,7 @@ class LLaMAModel(nn.Module):
         return kv_cache
 
     def generate(self, input_ids, generation_length: int = 20,
-                 return_output_only=True, use_pefts=False):
+                 return_output_only=True, prefixes=None, stop_on_eos=True):
         """Generate tokens with efficient caching of KV.
 
         TODO: Add stopping conditions
@@ -160,6 +160,8 @@ class LLaMAModel(nn.Module):
             - Always right-padded. Masks are generated based on padding tokens
         :param generation_length: int
         :param return_output_only: True = return continuation only. False = return whole sequence
+        :param prefixes
+        :param stop_on_eos
         :return: [batch_size, generation_length]
         """
         original_input_ids = input_ids
@@ -167,6 +169,7 @@ class LLaMAModel(nn.Module):
         # noinspection PyUnresolvedReferences
         num_valid_tokens = (input_ids != self.config.pad_token_id).long().sum(dim=1)
         orig_num_valid_tokens = num_valid_tokens.clone()
+        seen_eos = torch.zeros([batch_size], dtype=torch.bool).to(device=input_ids.device)
 
         # 1) Setup
         if input_ids is None:
@@ -175,7 +178,12 @@ class LLaMAModel(nn.Module):
                 [[self.config.pad_token_id]] * batch_size
             ).to(self.lm_head.weights.device)
         # See: init_kv_cache. list[dict]
-        kv_cache = self.init_kv_cache(batch_size)
+        if self.prefix_config.prefix_mode == PREFIX_MODE_PREFIX:
+            kv_cache = prefixes
+        elif self.prefix_config.prefix_mode == PREFIX_MODE_NONE:
+            kv_cache = self.init_kv_cache(batch_size)
+        else:
+            raise KeyError()
         generated_token_ids_list = [original_input_ids]
         total_seq_len = input_seq_len
 
@@ -188,13 +196,22 @@ class LLaMAModel(nn.Module):
         #     value = [batch_size, num_heads, kv_seq_len=decode_step+1, head_dim]
         #   )]
         # )
-        rope_embed_ids = create_rope_embed_ids(input_ids=input_ids, pad_token_id=self.config.pad_token_id)
+        if self.prefix_config.prefix_mode == PREFIX_MODE_PREFIX:
+            prefix_length = prefixes[0]["key"].shape[2]
+            rope_embed_ids = create_rope_embed_ids(input_ids=input_ids) + prefix_length
+            attention_mask = create_prefix_train_attention_mask(input_ids, prefix_length)
+        elif self.prefix_config.prefix_mode == PREFIX_MODE_NONE:
+            rope_embed_ids = create_rope_embed_ids(input_ids=input_ids, pad_token_id=self.config.pad_token_id)
+            attention_mask = None
+        else:
+            raise KeyError(self.prefix_config.prefix_mode)
         cos, sin = self.get_cos_sin(rope_embed_ids)
         model_out = self.model(
             input_ids=input_ids,
             cos=cos, sin=sin,
             use_kv_cache=True,
             kv_cache=kv_cache,
+            attention_mask=attention_mask,
             num_valid_tokens=num_valid_tokens,
         )
         logits = self.lm_head(model_out["hidden_states"])
@@ -205,9 +222,12 @@ class LLaMAModel(nn.Module):
         ][:, None]
         generated_token_ids_list.append(generated_token_ids)
         input_ids = generated_token_ids
+        seen_eos = seen_eos | (generated_token_ids == self.config.eos_token_id)
 
         # 3) Subsequent steps
         for decode_step in range(generation_length-1):
+            if stop_on_eos and seen_eos.all():
+                break
             num_valid_tokens += 1
             total_seq_len += 1
             # [batch_size=1, num_heads=1, q_len=1, kv_len=1]
@@ -219,12 +239,24 @@ class LLaMAModel(nn.Module):
             #     value = [batch_size, num_heads, kv_seq_len=decode_step+1, head_dim]
             #   )]
             # )
-            rope_embed_ids = create_rope_embed_ids(input_ids=input_ids, pad_token_id=self.config.pad_token_id)
-            decoding_attention_mask = create_decoding_mask(
-                orig_num_valid_tokens=orig_num_valid_tokens,
-                max_seq_len=total_seq_len,
-                initial_max_len=original_input_ids.shape[1]
-            ).to(input_ids.device)
+            if self.prefix_config.prefix_mode == PREFIX_MODE_PREFIX:
+                prefix_length = prefixes[0]["key"].shape[2]
+                rope_embed_ids = create_rope_embed_ids(
+                    input_ids=input_ids, pad_token_id=self.config.pad_token_id) + prefix_length
+                decoding_attention_mask = create_decoding_mask(
+                    orig_num_valid_tokens=orig_num_valid_tokens + prefix_length,
+                    max_seq_len=total_seq_len + prefix_length,
+                    initial_max_len=original_input_ids.shape[1] + prefix_length,
+                ).to(input_ids.device)
+            elif self.prefix_config.prefix_mode == PREFIX_MODE_NONE:
+                rope_embed_ids = create_rope_embed_ids(input_ids=input_ids, pad_token_id=self.config.pad_token_id)
+                decoding_attention_mask = create_decoding_mask(
+                    orig_num_valid_tokens=orig_num_valid_tokens,
+                    max_seq_len=total_seq_len,
+                    initial_max_len=original_input_ids.shape[1]
+                ).to(input_ids.device)
+            else:
+                raise KeyError(self.prefix_config.prefix_mode)
             rope_embed_ids += num_valid_tokens[:, None]
             cos, sin = self.get_cos_sin(rope_embed_ids)
             model_out = self.model(
@@ -242,6 +274,7 @@ class LLaMAModel(nn.Module):
             generated_token_ids = logits.argmax(-1)[:, -1:]
             generated_token_ids_list.append(generated_token_ids)
             input_ids = generated_token_ids
+            seen_eos = seen_eos | (generated_token_ids == self.config.eos_token_id)
         output = torch.cat(generated_token_ids_list, dim=1)
         if return_output_only:
             output = output[:, input_seq_len:]
