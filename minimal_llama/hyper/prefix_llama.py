@@ -193,10 +193,10 @@ class LLaMAModel(nn.Module):
         # See: init_kv_cache. list[dict]
         if self.prefix_config.prefix_mode == PREFIX_MODE_PREFIX:
             kv_cache = prefixes
-        elif self.prefix_config.prefix_mode == PREFIX_MODE_NONE:
+        elif self.prefix_config.prefix_mode in (PREFIX_MODE_NONE, PREFIX_MODE_LM_ADAPTER, PREFIX_MODE_LM_ADAPTER_H):
             kv_cache = self.init_kv_cache(batch_size)
         else:
-            raise KeyError()
+            raise KeyError(self.prefix_config.prefix_mode)
         generated_token_ids_list = [original_input_ids]
         total_seq_len = input_seq_len
 
@@ -213,7 +213,7 @@ class LLaMAModel(nn.Module):
             prefix_length = prefixes[0]["key"].shape[2]
             rope_embed_ids = create_rope_embed_ids(input_ids=input_ids) + prefix_length
             attention_mask = create_prefix_train_attention_mask(input_ids, prefix_length)
-        elif self.prefix_config.prefix_mode == PREFIX_MODE_NONE:
+        elif self.prefix_config.prefix_mode in (PREFIX_MODE_NONE, PREFIX_MODE_LM_ADAPTER, PREFIX_MODE_LM_ADAPTER_H):
             rope_embed_ids = create_rope_embed_ids(input_ids=input_ids, pad_token_id=self.config.pad_token_id)
             attention_mask = None
         else:
@@ -226,6 +226,10 @@ class LLaMAModel(nn.Module):
             kv_cache=kv_cache,
             attention_mask=attention_mask,
             num_valid_tokens=num_valid_tokens,
+            prefixes=(
+                prefixes if self.prefix_config.prefix_mode in (PREFIX_MODE_LM_ADAPTER, PREFIX_MODE_LM_ADAPTER_H)
+                else None
+            ),
         )
         logits = self.lm_head(model_out["hidden_states"])
         kv_cache = model_out["kv_cache"]
@@ -261,7 +265,7 @@ class LLaMAModel(nn.Module):
                     max_seq_len=total_seq_len + prefix_length,
                     initial_max_len=original_input_ids.shape[1] + prefix_length,
                 ).to(input_ids.device)
-            elif self.prefix_config.prefix_mode == PREFIX_MODE_NONE:
+            elif self.prefix_config.prefix_mode in (PREFIX_MODE_NONE, PREFIX_MODE_LM_ADAPTER, PREFIX_MODE_LM_ADAPTER_H):
                 rope_embed_ids = create_rope_embed_ids(input_ids=input_ids, pad_token_id=self.config.pad_token_id)
                 decoding_attention_mask = create_decoding_mask(
                     orig_num_valid_tokens=orig_num_valid_tokens,
@@ -279,6 +283,10 @@ class LLaMAModel(nn.Module):
                 kv_cache=kv_cache,
                 num_valid_tokens=num_valid_tokens,
                 attention_mask=decoding_attention_mask,
+                prefixes=(
+                    prefixes if self.prefix_config.prefix_mode in (PREFIX_MODE_LM_ADAPTER, PREFIX_MODE_LM_ADAPTER_H)
+                    else None
+                ),
             )
             # [batch_size, dec_seq_len=1, vocab_size]
             logits = self.lm_head(model_out["hidden_states"])
