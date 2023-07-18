@@ -22,13 +22,16 @@ def run():
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--peft_type", type=str, default="prefix")
     parser.add_argument("--num_prefix_tokens", type=int, default=16)
-    parser.add_argument("--prefix_type", type=str, default="mlp")
+    parser.add_argument("--prefix_mode", type=str, default=prefix_llama.PREFIX_MODE_PREFIX)
+    parser.add_argument("--prefix_maker_mode", type=str, default="mlp")
+    parser.add_argument("--prefix_include_gates", action="store_true", default=False)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--grad_accum_steps", type=int, default=1)
     parser.add_argument("--total_steps", type=int, default=3000)
     parser.add_argument("--save_freq", type=int, default=500)
     parser.add_argument("--num_workers", type=int, default=8)
     args = parser.parse_args()
+    assert args.prefix_maker_mode in ["plain", "mlp", "hidden_states"]
 
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     rank = int(os.environ.get('RANK', 0))
@@ -46,11 +49,13 @@ def run():
             hf_path=args.hf_path,
             device=device,
             use_4bit=True,
+            prefix_config=prefix_llama.PrefixConfig(prefix_mode=args.prefix_mode),
         )
         prefix_maker = prefix_makers.create_prefix_maker(
             num_tokens=args.num_prefix_tokens,
             config=config,
-            prefix_type=args.prefix_type,
+            prefix_type=args.prefix_maker_mode,
+            include_gates=args.prefix_include_gates,
         ).to(device)
         optimizer = bitsandbytes.optim.AdamW(prefix_maker.parameters(), lr=args.lr, is_paged=True, optim_bits=32)
     elif args.peft_type == "lora":

@@ -50,11 +50,13 @@ class LLaMAConfig:
 
 PREFIX_MODE_PREFIX = "prefix"
 PREFIX_MODE_NONE = "none"
+PREFIX_MODE_LM_ADAPTER = "lm_adapter"
+PREFIX_MODE_LM_ADAPTER_H = "lm_adapter_h"
 
 
 @dataclasses.dataclass
 class PrefixConfig:
-    prefix_mode = PREFIX_MODE_PREFIX
+    prefix_mode: str = PREFIX_MODE_PREFIX
 
 
 LLAMA_7B_CONFIG = LLaMAConfig(
@@ -79,7 +81,7 @@ class LLaMAModel(nn.Module):
         super().__init__()
         self.config = config
         self.prefix_config = prefix_config
-        self.model = LLaMAInnerModel(config)
+        self.model = LLaMAInnerModel(config, prefix_config=prefix_config)
         self.lm_head = NoInitLinear(config.dim, config.vocab_size, bias=False, dtype=config.dtype)
 
     def forward(self,
@@ -119,6 +121,17 @@ class LLaMAModel(nn.Module):
                 input_ids,
                 cos=cos, sin=sin,
                 use_kv_cache=False,
+            )
+        elif self.prefix_config.prefix_mode in [PREFIX_MODE_LM_ADAPTER, PREFIX_MODE_LM_ADAPTER_H]:
+            # [batch_size, num_heads=1, q_len=seq_len, kv_len=seq_len]
+            rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
+            cos, sin = self.get_cos_sin(rope_embed_ids)
+            # [batch_size, seq_len, hidden_dim]
+            model_out = self.model(
+                input_ids,
+                cos=cos, sin=sin,
+                use_kv_cache=False,
+                prefixes=prefixes,
             )
         else:
             raise KeyError(self.prefix_config.prefix_mode)
@@ -302,12 +315,13 @@ class LLaMAModel(nn.Module):
 
 
 class LLaMAInnerModel(nn.Module):
-    def __init__(self, config: LLaMAConfig):
+    def __init__(self, config: LLaMAConfig, prefix_config: PrefixConfig):
         super().__init__()
         self.config = config
+        self.prefix_config = prefix_config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.dim, dtype=config.dtype)
         self.layers = nn.ModuleList([
-            LLaMALayer(config=config)
+            LLaMALayer(config=config, prefix_config=prefix_config)
             for _ in range(config.n_layers)
         ])
         self.norm = RMSNorm(dim=config.dim, dtype=config.dtype)
@@ -389,10 +403,11 @@ class LLaMAInnerModel(nn.Module):
 
 
 class LLaMALayer(nn.Module):
-    def __init__(self, config: LLaMAConfig):
+    def __init__(self, config: LLaMAConfig, prefix_config: PrefixConfig):
         super().__init__()
         self.config = config
-        self.self_attn = Attention(config=config)
+        self.prefix_config = prefix_config
+        self.self_attn = Attention(config=config, prefix_config=prefix_config)
         self.mlp = MLP(config=config)
         self.input_layernorm = RMSNorm(dim=config.dim, dtype=config.dtype)
         self.post_attention_layernorm = RMSNorm(dim=config.dim, dtype=config.dtype)
@@ -486,9 +501,10 @@ class RMSNorm(torch.nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, config: LLaMAConfig):
+    def __init__(self, config: LLaMAConfig, prefix_config: PrefixConfig):
         super().__init__()
         self.config = config
+        self.prefix_config = prefix_config
         self.n_heads = config.n_heads
         self.head_dim = config.dim // config.n_heads
 
@@ -567,6 +583,32 @@ class Attention(nn.Module):
                 attn_mask=attention_mask,
             )
         # (batch_size, q_seq_len, hidden_dim)
+
+        if self.prefix_config.prefix_mode in [PREFIX_MODE_LM_ADAPTER, PREFIX_MODE_LM_ADAPTER_H]:
+
+            if self.prefix_config.prefix_mode == PREFIX_MODE_LM_ADAPTER:
+                adapter_key = layer_prefixes["key"]
+                adapter_value = layer_prefixes["value"]
+            elif self.prefix_config.prefix_mode == PREFIX_MODE_LM_ADAPTER_H:
+                prefix_seq_len = layer_prefixes["hidden_states"].size(1)
+                adapter_key = self.k_proj(layer_prefixes["hidden_states"]).view(
+                    batch_size, prefix_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+                adapter_value = self.k_proj(layer_prefixes["hidden_states"]).view(
+                    batch_size, prefix_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+            else:
+                raise KeyError(self.prefix_config.prefix_mode)
+
+            # noinspection PyUnresolvedReferences
+            with torch.backends.cuda.sdp_kernel(
+                enable_math=False, enable_flash=True, enable_mem_efficient=False,
+            ):
+                lma_output = torch.nn.functional.scaled_dot_product_attention(
+                    query=query_states,
+                    key=adapter_key,
+                    value=adapter_value,
+                )
+                attn_output = attn_output + lma_output * layer_prefixes["gate"][None, :, None, None]
+
         attn_output = attn_output.transpose(1, 2).contiguous().view(
             batch_size, q_seq_len, hidden_dim,
         )
