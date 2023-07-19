@@ -7,6 +7,7 @@ from torch.utils.data.distributed import DistributedSampler
 import minimal_llama.utils.io_utils as io_utils
 import datasets
 import bitsandbytes.optim
+import wandb
 
 import minimal_llama.hyper.prefix_llama as prefix_llama
 import minimal_llama.hyper.prefix_makers as prefix_makers
@@ -25,11 +26,13 @@ def run():
     parser.add_argument("--prefix_mode", type=str, default=prefix_llama.PREFIX_MODE_PREFIX)
     parser.add_argument("--prefix_maker_mode", type=str, default="mlp")
     parser.add_argument("--prefix_include_gates", action="store_true", default=False)
+    parser.add_argument("--lora_rank", type=int, default=8)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--grad_accum_steps", type=int, default=1)
     parser.add_argument("--total_steps", type=int, default=3000)
     parser.add_argument("--save_freq", type=int, default=500)
     parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--run_name", type=str, default=None)
     args = parser.parse_args()
     assert args.prefix_maker_mode in ["plain", "mlp", "hidden_states"]
 
@@ -38,6 +41,23 @@ def run():
     world_size = int(os.environ.get('WORLD_SIZE', 1))
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
+
+    if rank == 0:
+        wandb.init(
+            name=args.run_name,
+            project="hyper2",
+            config={
+                "total_steps": args.total_steps,
+                "lr": args.lr,
+                "full_batch_size": args.batch_size * args.grad_accum_steps,
+                "peft_type": args.peft_type,
+                "num_prefix_tokens": args.num_prefix_tokens,
+                "prefix_mode": args.prefix_mode,
+                "prefix_maker_mode": args.prefix_maker_mode,
+                "prefix_include_gates": args.prefix_include_gates,
+                "lora_rank": args.lora_rank,
+            },
+        )
 
     if args.peft_type == "prefix":
         config = prefix_llama.LLAMA_7B_CONFIG
@@ -62,6 +82,7 @@ def run():
         config = lora_llama.LLAMA_7B_CONFIG
         config.dtype = torch.bfloat16
         config.gradient_checkpointing = True
+        config.lora_rank = args.lora_rank
         model = lora_llama.create_model(
             "7b",
             config=config,
@@ -72,16 +93,35 @@ def run():
     else:
         raise KeyError(args.peft_type)
 
+    # Loading
+    if os.path.exists(os.path.join(args.save_dir, "train_state.json")):
+        train_state = io_utils.read_json(os.path.join(args.save_dir, "train_state.json"))
+        completed_steps = train_state["completed_steps"]
+        load_path = os.path.join(args.save_dir, f"checkpoint_{completed_steps:05d}.pt")
+        print("Resuming from", load_path)
+        loaded = torch.load(load_path)
+        if args.peft_type == "prefix":
+            prefix_maker = prefix_maker.load_state_dict(loaded["model"])
+        elif args.peft_type == "lora":
+            model = model.load_state_dict(loaded["model"], strict=False)
+        else:
+            raise KeyError(args.peft_type)
+        optimizer.load_state_dict(loaded["optimizer"])
+        loss_list = io_utils.read_json(os.path.join(args.save_dir, f"loss_{completed_steps:05d}.json"))
+    else:
+        train_state = {"completed_steps": 0}
+        os.makedirs(args.save_dir, exist_ok=True)
+        loss_list = []
+
     ds = datasets.load_from_disk(args.dataset_path)
     train_iterator = get_train_iterator(
         ds,
         rank=rank, world_size=world_size,
         batch_size=args.batch_size, num_workers=args.num_workers,
-        total_steps=args.total_steps, start_step=0, grad_accum_steps=args.grad_accum_steps,
+        total_steps=args.total_steps,
+        start_step=train_state["completed_steps"],
+        grad_accum_steps=args.grad_accum_steps,
     )
-
-    os.makedirs(args.save_dir, exist_ok=True)
-    loss_list = []
     loss = None
     optimizer.zero_grad()
     for batch_metadata, batch in train_iterator:
@@ -102,6 +142,8 @@ def run():
             output.view(-1, output.size(-1)),
             batch["labels"][:, 1:].reshape(-1).to(device),
         )
+        if rank == 0:
+            wandb.log({"loss": loss.item()})
         loss.backward()
         if batch_metadata["grad_accum_index"] == args.grad_accum_steps - 1:
             optimizer.step()
@@ -124,6 +166,7 @@ def run():
                 "optimizer": optimizer.state_dict(),
             }, os.path.join(args.save_dir, f"checkpoint_{completed_steps:05d}.pt"))
             io_utils.write_json(loss_list, os.path.join(args.save_dir, f"loss_{completed_steps:05d}.json"))
+            io_utils.write_json({"completed_steps": completed_steps}, os.path.join(args.save_dir, f"train_state.json"))
 
     if args.peft_type == "prefix":
         model_state_dict = prefix_maker.state_dict()
