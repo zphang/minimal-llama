@@ -101,9 +101,9 @@ def run():
         print("Resuming from", load_path)
         loaded = torch.load(load_path)
         if args.peft_type == "prefix":
-            prefix_maker = prefix_maker.load_state_dict(loaded["model"])
+            prefix_maker.load_state_dict(loaded["model"])
         elif args.peft_type == "lora":
-            model = model.load_state_dict(loaded["model"], strict=False)
+            model.load_state_dict(loaded["model"], strict=False)
         else:
             raise KeyError(args.peft_type)
         optimizer.load_state_dict(loaded["optimizer"])
@@ -120,6 +120,7 @@ def run():
         batch_size=args.batch_size, num_workers=args.num_workers,
         total_steps=args.total_steps,
         start_step=train_state["completed_steps"],
+        seed=train_state["completed_steps"],  # use steps as stand-in for seed
         grad_accum_steps=args.grad_accum_steps,
     )
     loss = None
@@ -143,7 +144,7 @@ def run():
             batch["labels"][:, 1:].reshape(-1).to(device),
         )
         if rank == 0:
-            wandb.log({"loss": loss.item()})
+            wandb.log({"loss": loss.item(), "step": batch_metadata["curr_step"]})
         loss.backward()
         if batch_metadata["grad_accum_index"] == args.grad_accum_steps - 1:
             optimizer.step()
@@ -202,7 +203,8 @@ def get_train_iterator(dataset,
                        rank: int, world_size: int,
                        batch_size: int, num_workers: int,
                        total_steps: int,
-                       start_step: int = 0, grad_accum_steps: int = 1):
+                       start_step: int = 0, grad_accum_steps: int = 1,
+                       seed: int  = 0):
     total_micro_steps = total_steps * grad_accum_steps
     start_micro_step = start_step * grad_accum_steps
     sampler = DistributedSampler(
@@ -210,6 +212,7 @@ def get_train_iterator(dataset,
         rank=rank,
         num_replicas=world_size,
         shuffle=True,
+        seed=seed,
     )
     data_loader = torch.utils.data.DataLoader(
         dataset,

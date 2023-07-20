@@ -29,11 +29,16 @@ def run():
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--generation_length", type=int, default=128)
     parser.add_argument("--eval_nat_inst", action="store_true", default=False)
+    parser.add_argument("--filename", type=str, default="gen_data")
     args = parser.parse_args()
     assert args.prefix_maker_mode in ["plain", "mlp", "hidden_states"]
 
-    torch.cuda.set_device(0)
-    device = torch.device("cuda", 0)
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    rank = int(os.environ.get('RANK', 0))
+    world_size = int(os.environ.get('WORLD_SIZE', 1))
+    print(f"Local rank: {local_rank}, rank: {rank}, world size: {world_size}")
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
     loaded = torch.load(args.load_path, map_location="cpu")
     tokenizer = transformers.LlamaTokenizer.from_pretrained(args.hf_path)
 
@@ -68,6 +73,7 @@ def run():
             config=config,
             hf_path=args.hf_path,
             use_4bit=True,
+            device=device,
         )
         load_outcome = model.load_state_dict(loaded["model"], strict=False)
         assert not load_outcome.unexpected_keys
@@ -76,6 +82,10 @@ def run():
         raise KeyError(args.peft_type)
 
     ds = datasets.load_from_disk(args.dataset_path)
+    if world_size > 1:
+        indices = list(range(rank, len(ds), world_size))
+        print(f"[Rank {rank}] evaluating on", indices[:3], "...", indices[-3:])
+        ds = ds.select(indices)
     dataloader = torch.utils.data.DataLoader(
         ds,
         batch_size=args.batch_size,
@@ -85,7 +95,8 @@ def run():
     os.makedirs(args.save_dir, exist_ok=True)
 
     eval_data = {}
-    for batch in tqdm.tqdm(dataloader):
+    iterator = tqdm.tqdm(dataloader) if rank == 0 else dataloader
+    for batch in iterator:
         converted_batch = convert_batch_for_generation(batch)
         if args.peft_type == "prefix":
             if prefixes is None or prefixes[0]["key"].shape[0] != converted_batch["input_ids"].shape[0]:
@@ -122,10 +133,16 @@ def run():
                 eval_data["predictions"] = []
             eval_data["predictions"] += predictions
 
-    io_utils.write_json(
-        eval_data,
-        os.path.join(args.save_dir, "gen_data.json"),
-    )
+    if world_size > 1:
+        io_utils.write_json(
+            eval_data,
+            os.path.join(args.save_dir, f"{args.filename}_shard_{rank:03d}.json"),
+        )
+    else:
+        io_utils.write_json(
+            eval_data,
+            os.path.join(args.save_dir, f"{args.filename}.json"),
+        )
 
     if args.eval_nat_inst:
         metric = datasets.load_metric("rouge")
