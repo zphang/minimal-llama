@@ -16,6 +16,7 @@ import minimal_llama.utils.torch_utils as torch_utils
 
 def run():
     parser = argparse.ArgumentParser()
+
     parser.add_argument("--hf_path", type=str)
     parser.add_argument("--load_path", type=str)
     parser.add_argument("--dataset_path", type=str)
@@ -25,11 +26,13 @@ def run():
     parser.add_argument("--prefix_mode", type=str, default=prefix_llama.PREFIX_MODE_PREFIX)
     parser.add_argument("--prefix_maker_mode", type=str, default="mlp")
     parser.add_argument("--prefix_include_gates", action="store_true", default=False)
+    parser.add_argument("--lora_rank", type=int, default=8)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--generation_length", type=int, default=128)
     parser.add_argument("--eval_nat_inst", action="store_true", default=False)
     parser.add_argument("--filename", type=str, default="gen_data")
+    parser.add_argument("--model_size", type=str, default="7b")
     args = parser.parse_args()
     assert args.prefix_maker_mode in ["plain", "mlp", "hidden_states"]
 
@@ -47,10 +50,10 @@ def run():
     prefix_maker = None
 
     if args.peft_type == "prefix":
-        config = prefix_llama.LLAMA_7B_CONFIG
+        config = prefix_llama.LLAMA_CONFIG_DICT[args.model_size]
         config.dtype = torch.bfloat16
         model = prefix_llama.create_model(
-            "7b",
+            args.model_size,
             config=config,
             hf_path=args.hf_path,
             device=device,
@@ -66,10 +69,11 @@ def run():
         prefix_maker.load_state_dict(loaded["model"])
         prefixes = prefix_maker(args.batch_size)
     elif args.peft_type == "lora":
-        config = lora_llama.LLAMA_7B_CONFIG
+        config = lora_llama.LLAMA_CONFIG_DICT[args.model_size]
         config.dtype = torch.bfloat16
+        config.lora_rank = args.lora_rank
         model = lora_llama.create_model(
-            "7b",
+            args.model_size,
             config=config,
             hf_path=args.hf_path,
             use_4bit=True,

@@ -33,6 +33,7 @@ def run():
     parser.add_argument("--save_freq", type=int, default=500)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--run_name", type=str, default=None)
+    parser.add_argument("--model_size", type=str, default="7b")
     args = parser.parse_args()
     assert args.prefix_maker_mode in ["plain", "mlp", "hidden_states"]
 
@@ -60,11 +61,11 @@ def run():
         )
 
     if args.peft_type == "prefix":
-        config = prefix_llama.LLAMA_7B_CONFIG
+        config = prefix_llama.LLAMA_CONFIG_DICT[args.model_size]
         config.dtype = torch.bfloat16
         config.gradient_checkpointing = True
         model = prefix_llama.create_model(
-            "7b",
+            args.model_size,
             config=config,
             hf_path=args.hf_path,
             device=device,
@@ -79,12 +80,12 @@ def run():
         ).to(device)
         optimizer = bitsandbytes.optim.AdamW(prefix_maker.parameters(), lr=args.lr, is_paged=True, optim_bits=32)
     elif args.peft_type == "lora":
-        config = lora_llama.LLAMA_7B_CONFIG
+        config = lora_llama.LLAMA_CONFIG_DICT[args.model_size]
         config.dtype = torch.bfloat16
         config.gradient_checkpointing = True
         config.lora_rank = args.lora_rank
         model = lora_llama.create_model(
-            "7b",
+            args.model_size,
             config=config,
             hf_path=args.hf_path,
             use_4bit=True,

@@ -64,6 +64,11 @@ LLAMA_7B_CONFIG = LLaMAConfig(
     n_layers=32,
     n_heads=32,
 )
+LLAMA_13B_CONFIG = LLaMAConfig(
+    dim=5120,
+    n_layers=40,
+    n_heads=40,
+)
 DEBUG_CONFIG = LLaMAConfig(
     dim=64,
     n_layers=3,
@@ -72,6 +77,7 @@ DEBUG_CONFIG = LLaMAConfig(
 
 LLAMA_CONFIG_DICT = {
     "7b": LLAMA_7B_CONFIG,
+    "13b": LLAMA_13B_CONFIG,
     "debug": DEBUG_CONFIG,
 }
 
