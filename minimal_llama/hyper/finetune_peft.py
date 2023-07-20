@@ -34,6 +34,7 @@ def run():
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--model_size", type=str, default="7b")
+    parser.add_argument("--lr_scheduler", action="store_true")
     args = parser.parse_args()
     assert args.prefix_maker_mode in ["plain", "mlp", "hidden_states"]
 
@@ -94,6 +95,15 @@ def run():
     else:
         raise KeyError(args.peft_type)
 
+    if args.lr_scheduler:
+        scheduler = torch_utils.get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=args.total_steps // 10,
+            num_training_steps=args.total_steps,
+        )
+    else:
+        scheduler = None
+
     # Loading
     if os.path.exists(os.path.join(args.save_dir, "train_state.json")):
         train_state = io_utils.read_json(os.path.join(args.save_dir, "train_state.json"))
@@ -108,6 +118,8 @@ def run():
         else:
             raise KeyError(args.peft_type)
         optimizer.load_state_dict(loaded["optimizer"])
+        if scheduler is not None:
+            scheduler.load_state_dict(loaded["scheduler"])
         loss_list = io_utils.read_json(os.path.join(args.save_dir, f"loss_{completed_steps:05d}.json"))
     else:
         train_state = {"completed_steps": 0}
@@ -150,6 +162,8 @@ def run():
         if batch_metadata["grad_accum_index"] == args.grad_accum_steps - 1:
             optimizer.step()
             optimizer.zero_grad()
+            if scheduler:
+                scheduler.step()
             if local_rank == 0:
                 print(batch_metadata["curr_step"], "Mem:", torch.cuda.max_memory_allocated(device), loss.item())
                 loss_list.append(loss.item())
@@ -166,6 +180,7 @@ def run():
             torch.save({
                 "model": model_state_dict,
                 "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict() if scheduler else None,
             }, os.path.join(args.save_dir, f"checkpoint_{completed_steps:05d}.pt"))
             io_utils.write_json(loss_list, os.path.join(args.save_dir, f"loss_{completed_steps:05d}.json"))
             io_utils.write_json({"completed_steps": completed_steps}, os.path.join(args.save_dir, f"train_state.json"))
@@ -179,7 +194,6 @@ def run():
 
     torch.save({
         "model": model_state_dict,
-        "optimizer": optimizer.state_dict(),
     }, os.path.join(args.save_dir, "checkpoint_final.pt"))
     io_utils.write_json(loss_list, os.path.join(args.save_dir, "loss_final.json"))
 
