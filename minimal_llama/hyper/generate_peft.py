@@ -147,39 +147,38 @@ def run():
             eval_data,
             os.path.join(args.save_dir, f"{args.filename}.json"),
         )
-
-    if args.eval_nat_inst:
-        metric = datasets.load_metric("rouge")
-        all_results = []
-        for task_name, task_data in eval_data.items():
-            raw_scores = metric.compute(
-                predictions=task_data["predictions"],
-                references=task_data["references"],
+        if args.eval_nat_inst:
+            metric = datasets.load_metric("rouge")
+            all_results = []
+            for task_name, task_data in eval_data.items():
+                raw_scores = metric.compute(
+                    predictions=task_data["predictions"],
+                    references=task_data["references"],
+                )
+                granular_scores = {
+                    "rouge1-precision": float(raw_scores["rouge1"].mid.precision),
+                    "rouge1-recall": float(raw_scores["rouge1"].mid.recall),
+                    "rouge1-fmeasure": float(raw_scores["rouge1"].mid.fmeasure),
+                    "rouge2-precision": float(raw_scores["rouge2"].mid.precision),
+                    "rouge2-recall": float(raw_scores["rouge2"].mid.recall),
+                    "rouge2-fmeasure": float(raw_scores["rouge2"].mid.fmeasure),
+                    "rougeL-precision": float(raw_scores["rougeL"].mid.precision),
+                    "rougeL-recall": float(raw_scores["rougeL"].mid.recall),
+                    "rougeL-fmeasure": float(raw_scores["rougeL"].mid.fmeasure),
+                    "rougeLsum-precision": float(raw_scores["rougeLsum"].mid.precision),
+                    "rougeLsum-recall": float(raw_scores["rougeLsum"].mid.recall),
+                    "rougeLsum-fmeasure": float(raw_scores["rougeLsum"].mid.fmeasure),
+                }
+                scalar_score = granular_scores["rougeL-fmeasure"]
+                all_results.append({
+                    "task_name": task_name,
+                    "score": scalar_score,
+                    "metrics": granular_scores,
+                })
+            io_utils.write_json(
+                all_results,
+                os.path.join(args.save_dir, "nat_inst_eval_results.json"),
             )
-            granular_scores = {
-                "rouge1-precision": float(raw_scores["rouge1"].mid.precision),
-                "rouge1-recall": float(raw_scores["rouge1"].mid.recall),
-                "rouge1-fmeasure": float(raw_scores["rouge1"].mid.fmeasure),
-                "rouge2-precision": float(raw_scores["rouge2"].mid.precision),
-                "rouge2-recall": float(raw_scores["rouge2"].mid.recall),
-                "rouge2-fmeasure": float(raw_scores["rouge2"].mid.fmeasure),
-                "rougeL-precision": float(raw_scores["rougeL"].mid.precision),
-                "rougeL-recall": float(raw_scores["rougeL"].mid.recall),
-                "rougeL-fmeasure": float(raw_scores["rougeL"].mid.fmeasure),
-                "rougeLsum-precision": float(raw_scores["rougeLsum"].mid.precision),
-                "rougeLsum-recall": float(raw_scores["rougeLsum"].mid.recall),
-                "rougeLsum-fmeasure": float(raw_scores["rougeLsum"].mid.fmeasure),
-            }
-            scalar_score = granular_scores["rougeL-fmeasure"]
-            all_results.append({
-                "task_name": task_name,
-                "score": scalar_score,
-                "metrics": granular_scores,
-            })
-        io_utils.write_json(
-            all_results,
-            os.path.join(args.save_dir, "nat_inst_eval_results.json"),
-        )
 
 
 def clean_predictions(model_out, tokenizer):

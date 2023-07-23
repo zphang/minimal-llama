@@ -124,7 +124,7 @@ def run():
     else:
         scheduler = None
 
-    print(f"Rank: {accelerator.process_index}", model.model.layers[0].self_attn.q_proj.lora_a.mean())
+    # print(f"Rank: {accelerator.process_index}", model.model.layers[0].self_attn.q_proj.lora_a.mean())
 
     # Loading
     if os.path.exists(os.path.join(args.save_dir, "train_state.json")):
@@ -170,6 +170,7 @@ def run():
     loss = None
     optimizer.zero_grad()
     for batch_metadata, batch in train_iterator:
+        # print(f"Rank: {accelerator.process_index}", batch["input_ids"][0, 0:8])
         with accelerator.accumulate(model):
             if args.peft_type == "prefix":
                 prefixes = prefix_maker(batch_size=batch["input_ids"].shape[0])
@@ -188,7 +189,7 @@ def run():
                 output.view(-1, output.size(-1)),
                 batch["labels"][:, 1:].reshape(-1).to(device),
             )
-            print(f"Rank: {accelerator.process_index}, Loss: {loss}, Step: {batch_metadata['curr_step']}")
+            # print(f"Rank: {accelerator.process_index}, Loss: {loss}, Step: {batch_metadata['curr_step']}")
             if torch.isnan(loss):
                 raise RuntimeError(f"NaN on rank {accelerator.process_index}")
             accelerator.backward(loss)
@@ -197,8 +198,8 @@ def run():
             if scheduler:
                 scheduler.step()
         if use_wandb:
-            global_loss = accelerator.reduce(loss, "mean")
-            wandb.log({"loss": global_loss.item(), "step": batch_metadata["curr_step"]})
+            # global_loss = accelerator.reduce(loss, "mean")
+            wandb.log({"loss": loss.item(), "step": batch_metadata["curr_step"], "lr": optimizer.param_groups[0]["lr"]})
         if batch_metadata["grad_accum_index"] == args.grad_accum_steps - 1:
             print0(batch_metadata["curr_step"], "Mem:", torch.cuda.max_memory_allocated(device), loss.item())
         completed_steps = batch_metadata["curr_step"] + 1
@@ -258,9 +259,10 @@ def get_train_iterator(dataset,
         pin_memory=True,
         drop_last=True,
         collate_fn=data_collator,
+        sampler=sampler,
         # shuffle=False,
     )
-    num_batches_per_epoch = len(dataset) // batch_size
+    num_batches_per_epoch = len(dataset) // batch_size // world_size
     curr_epoch = start_micro_step // num_batches_per_epoch
     curr_micro_step = curr_epoch * num_batches_per_epoch
     epoch_ceil = math.ceil(total_micro_steps / num_batches_per_epoch)
