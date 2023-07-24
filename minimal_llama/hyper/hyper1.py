@@ -100,7 +100,18 @@ class LLaMAModel(nn.Module):
         :param hyper_attention_mask
         :return: logits [batch_size, seq_len]
         """
-        # 1) Hyper Forward pass
+        hyper_model_out = self.hyper_forward_pass(
+            hyper_input_ids=hyper_input_ids,
+            hyper_attention_mask=hyper_attention_mask,
+        )
+        logits = self.downstream_forward_pass(
+            input_ids=input_ids,
+            gist_cache=hyper_model_out["gist_cache"],
+            t_offset=hyper_model_out["t_offset"],
+        )
+        return logits
+
+    def hyper_forward_pass(self, hyper_input_ids, hyper_attention_mask):
         rope_embed_ids = create_rope_embed_ids(input_ids=hyper_input_ids)
         cos, sin = self.get_cos_sin(rope_embed_ids)
         hyper_model_out = self.model(
@@ -111,9 +122,12 @@ class LLaMAModel(nn.Module):
             mode=MODE_HYPER,
         )
         t_offset = 1 + hyper_input_ids.argmax(-1)
+        hyper_model_out["t_offset"] = t_offset
+        return hyper_model_out
 
+    def downstream_forward_pass(self, input_ids, gist_cache, t_offset):
         # 2) Downstream Forward pass
-        prefixes = hyper_model_out["gist_cache"]
+        prefixes = gist_cache
         prefix_length = prefixes[0]["key"].shape[2]
         rope_embed_ids = (create_rope_embed_ids(input_ids=input_ids) + prefix_length + t_offset).clamp(
             max=self.config.max_seq_length - 1,
@@ -846,7 +860,7 @@ def create_model(model_name, hf_path, use_4bit=False, device=None, config=None):
         # torch.set_default_tensor_type(torch.cuda.HalfTensor)
         # model = LLaMAModel(config=config).cuda()
         # torch.set_default_tensor_type(torch.FloatTensor)
-        model = LLaMAModel(config=config)
+        model = LLaMAModel(config=config).to(device)
         if model_name == "debug":
             return model
         state_keys = set(model.state_dict())
