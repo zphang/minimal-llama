@@ -118,8 +118,8 @@ def run():
     if args.lr_scheduler:
         scheduler = torch_utils.get_linear_schedule_with_warmup(
             optimizer,
-            num_warmup_steps=args.total_steps // 10,
-            num_training_steps=args.total_steps,
+            num_warmup_steps=(args.total_steps * accelerator.num_processes // 10),
+            num_training_steps=args.total_steps * accelerator.num_processes,
         )
     else:
         scheduler = None
@@ -197,11 +197,13 @@ def run():
             optimizer.zero_grad()
             if scheduler:
                 scheduler.step()
-        if use_wandb:
-            # global_loss = accelerator.reduce(loss, "mean")
-            wandb.log({"loss": loss.item(), "step": batch_metadata["curr_step"], "lr": optimizer.param_groups[0]["lr"]})
+
         if batch_metadata["grad_accum_index"] == args.grad_accum_steps - 1:
             print0(batch_metadata["curr_step"], "Mem:", torch.cuda.max_memory_allocated(device), loss.item())
+            if use_wandb:
+                # global_loss = accelerator.reduce(loss, "mean")
+                wandb.log({
+                    "loss": loss.item(), "step": batch_metadata["curr_step"], "lr": optimizer.param_groups[0]["lr"]})
         completed_steps = batch_metadata["curr_step"] + 1
         if completed_steps % args.save_freq == 0:
             save_checkpoint(

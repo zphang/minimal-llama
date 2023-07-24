@@ -91,18 +91,15 @@ class LLaMAModel(nn.Module):
 
     def forward(self,
                 hyper_input_ids,
-                input_ids,
-                hyper_attention_mask):
+                input_ids):
         """Forward pass (with full decode sequence, intended for training or loss-scoring)
         :param hyper_input_ids: [batch_size, seq_len]
         :param input_ids: [batch_size, seq_len]
             - Always right-padded. Masks are generated based on padding tokens
-        :param hyper_attention_mask
         :return: logits [batch_size, seq_len]
         """
         hyper_model_out = self.hyper_forward_pass(
             hyper_input_ids=hyper_input_ids,
-            hyper_attention_mask=hyper_attention_mask,
         )
         logits = self.downstream_forward_pass(
             input_ids=input_ids,
@@ -111,14 +108,13 @@ class LLaMAModel(nn.Module):
         )
         return logits
 
-    def hyper_forward_pass(self, hyper_input_ids, hyper_attention_mask):
+    def hyper_forward_pass(self, hyper_input_ids):
         rope_embed_ids = create_rope_embed_ids(input_ids=hyper_input_ids)
         cos, sin = self.get_cos_sin(rope_embed_ids)
         hyper_model_out = self.model(
             hyper_input_ids,
             cos=cos, sin=sin,
             # use_kv_cache=False,
-            attention_mask=hyper_attention_mask,
             mode=MODE_HYPER,
         )
         t_offset = 1 + hyper_input_ids.argmax(-1)
@@ -127,8 +123,10 @@ class LLaMAModel(nn.Module):
 
     def downstream_forward_pass(self, input_ids, gist_cache, t_offset):
         # 2) Downstream Forward pass
-        prefixes = gist_cache
-        prefix_length = prefixes[0]["key"].shape[2]
+        t_offset = t_offset[:, None]
+        prefix_length = gist_cache[0]["key"].shape[2]
+        # TODO: We don't actually want to clamp, we want to expend to ensure it can fit both hyper
+        #       and regular IDs, and then throw an error if it still doesn't fit
         rope_embed_ids = (create_rope_embed_ids(input_ids=input_ids) + prefix_length + t_offset).clamp(
             max=self.config.max_seq_length - 1,
         )
@@ -139,7 +137,7 @@ class LLaMAModel(nn.Module):
             input_ids,
             cos=cos, sin=sin,
             # use_kv_cache=True,
-            kv_cache=prefixes,
+            kv_cache=gist_cache,
             attention_mask=attention_mask,
             mode=MODE_DOWNSTREAM_TRAIN,
         )
@@ -171,8 +169,10 @@ class LLaMAModel(nn.Module):
             })
         return kv_cache
 
-    def generate(self, input_ids, generation_length: int = 20,
-                 return_output_only=True, use_pefts=False, stop_on_eos=True):
+    def downstream_generate(self,
+                            input_ids, gist_cache, t_offset,
+                            generation_length: int = 20,
+                            return_output_only=True, stop_on_eos=True):
         """Generate tokens with efficient caching of KV.
 
         TODO: Add stopping conditions
@@ -180,9 +180,10 @@ class LLaMAModel(nn.Module):
 
         :param input_ids: [batch_size, input_seq_len]
             - Always right-padded. Masks are generated based on padding tokens
+        :param gist_cache:
+        :param t_offset: [batch_size]
         :param generation_length: int
         :param return_output_only: True = return continuation only. False = return whole sequence
-        :param use_pefts
         :param stop_on_eos
         :return: [batch_size, generation_length]
         """
@@ -192,6 +193,8 @@ class LLaMAModel(nn.Module):
         num_valid_tokens = (input_ids != self.config.pad_token_id).long().sum(dim=1)
         orig_num_valid_tokens = num_valid_tokens.clone()
         seen_eos = torch.zeros([batch_size], dtype=torch.bool).to(device=input_ids.device)
+        t_offset = t_offset[:, None]
+        prefix_length = gist_cache[0]["key"].shape[2]
 
         # 1) Setup
         if input_ids is None:
@@ -200,7 +203,6 @@ class LLaMAModel(nn.Module):
                 [[self.config.pad_token_id]] * batch_size
             ).to(self.lm_head.weights.device)
         # See: init_kv_cache. list[dict]
-        kv_cache = self.init_kv_cache(batch_size)
         generated_token_ids_list = [original_input_ids]
         total_seq_len = input_seq_len
 
@@ -213,15 +215,18 @@ class LLaMAModel(nn.Module):
         #     value = [batch_size, num_heads, kv_seq_len=decode_step+1, head_dim]
         #   )]
         # )
-        rope_embed_ids = create_rope_embed_ids(input_ids=input_ids, pad_token_id=self.config.pad_token_id)
+        rope_embed_ids = (create_rope_embed_ids(input_ids=input_ids) + prefix_length + t_offset).clamp(
+            max=self.config.max_seq_length - 1,
+        )
         cos, sin = self.get_cos_sin(rope_embed_ids)
+        attention_mask = create_prefix_train_attention_mask(input_ids, prefix_length)
         model_out = self.model(
             input_ids=input_ids,
             cos=cos, sin=sin,
-            use_kv_cache=True,
-            kv_cache=kv_cache,
+            mode=MODE_DOWNSTREAM_ENCODE,
+            attention_mask=attention_mask,
+            kv_cache=gist_cache,
             num_valid_tokens=num_valid_tokens,
-            use_pefts=use_pefts,
         )
         logits = self.lm_head(model_out["hidden_states"])
         kv_cache = model_out["kv_cache"]
@@ -250,20 +255,19 @@ class LLaMAModel(nn.Module):
             # )
             rope_embed_ids = create_rope_embed_ids(input_ids=input_ids, pad_token_id=self.config.pad_token_id)
             decoding_attention_mask = create_decoding_mask(
-                orig_num_valid_tokens=orig_num_valid_tokens,
-                max_seq_len=total_seq_len,
-                initial_max_len=original_input_ids.shape[1]
+                orig_num_valid_tokens=orig_num_valid_tokens + prefix_length,
+                max_seq_len=total_seq_len + prefix_length,
+                initial_max_len=original_input_ids.shape[1] + prefix_length,
             ).to(input_ids.device)
-            rope_embed_ids += num_valid_tokens[:, None]
+            rope_embed_ids += num_valid_tokens[:, None] + prefix_length + t_offset
             cos, sin = self.get_cos_sin(rope_embed_ids)
             model_out = self.model(
                 input_ids=input_ids,
                 cos=cos, sin=sin,
-                use_kv_cache=True,
+                mode=MODE_DOWNSTREAM_DECODE,
                 kv_cache=kv_cache,
                 num_valid_tokens=num_valid_tokens,
                 attention_mask=decoding_attention_mask,
-                use_pefts=use_pefts,
             )
             # [batch_size, dec_seq_len=1, vocab_size]
             logits = self.lm_head(model_out["hidden_states"])

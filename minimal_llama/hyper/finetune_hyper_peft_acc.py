@@ -13,7 +13,7 @@ import datasets.distributed
 
 import minimal_llama.hyper.prefix_llama as prefix_llama
 import minimal_llama.hyper.prefix_makers as prefix_makers
-import minimal_llama.hyper.lora_llama as lora_llama
+import minimal_llama.hyper.hyper1 as hyper1
 import minimal_llama.utils.torch_utils as torch_utils
 
 
@@ -23,11 +23,6 @@ def run():
     parser.add_argument("--dataset_path", type=str)
     parser.add_argument("--save_dir", type=str)
     parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--peft_type", type=str, default="prefix")
-    parser.add_argument("--num_prefix_tokens", type=int, default=16)
-    parser.add_argument("--prefix_mode", type=str, default=prefix_llama.PREFIX_MODE_PREFIX)
-    parser.add_argument("--prefix_maker_mode", type=str, default="mlp")
-    parser.add_argument("--prefix_include_gates", action="store_true", default=False)
     parser.add_argument("--lora_rank", type=int, default=8)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--grad_accum_steps", type=int, default=1)
@@ -39,15 +34,16 @@ def run():
     parser.add_argument("--lr_scheduler", action="store_true")
     parser.add_argument("--no_wandb", action="store_true", default=False)
     args = parser.parse_args()
-    assert args.prefix_maker_mode in ["plain", "mlp", "hidden_states"]
     torch.manual_seed(0)
 
     # Initialize Accelerate
+    ddp_kwargs = accelerate.DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = accelerate.Accelerator(
         mixed_precision="bf16",
         # mixed_precision="no",
         dispatch_batches=False,
         gradient_accumulation_steps=args.grad_accum_steps,
+        kwargs_handlers=[ddp_kwargs],
     )
     device = accelerator.device
     print0 = accelerator.on_local_main_process(print)
@@ -67,59 +63,30 @@ def run():
                 "total_steps": args.total_steps,
                 "lr": args.lr,
                 "full_batch_size": args.batch_size * args.grad_accum_steps,
-                "peft_type": args.peft_type,
-                "num_prefix_tokens": args.num_prefix_tokens,
-                "prefix_mode": args.prefix_mode,
-                "prefix_maker_mode": args.prefix_maker_mode,
-                "prefix_include_gates": args.prefix_include_gates,
                 "lora_rank": args.lora_rank,
             },
         )
 
-    if args.peft_type == "prefix":
-        config = prefix_llama.LLAMA_CONFIG_DICT[args.model_size]
-        config.dtype = torch.bfloat16
-        config.gradient_checkpointing = True
-        model = prefix_llama.create_model(
-            args.model_size,
-            config=config,
-            hf_path=args.hf_path,
-            device=device,
-            use_4bit=True,
-            prefix_config=prefix_llama.PrefixConfig(prefix_mode=args.prefix_mode),
-        )
-        prefix_maker = prefix_makers.create_prefix_maker(
-            num_tokens=args.num_prefix_tokens,
-            config=config,
-            prefix_type=args.prefix_maker_mode,
-            include_gates=args.prefix_include_gates,
-        ).to(device)
-        # optimizer = bitsandbytes.optim.AdamW(prefix_maker.parameters(), lr=args.lr, is_paged=True, optim_bits=32)
-        optimizer = torch.optim.Adam(prefix_maker.parameters(), lr=args.lr, betas=(0.9, 0.99))
-        save_model = prefix_maker
-    elif args.peft_type == "lora":
-        config = lora_llama.LLAMA_CONFIG_DICT[args.model_size]
-        config.dtype = torch.bfloat16
-        config.gradient_checkpointing = True
-        config.lora_rank = args.lora_rank
-        model = lora_llama.create_model(
-            args.model_size,
-            config=config,
-            hf_path=args.hf_path,
-            use_4bit=True,
-            device=device,
-        )
-        # optimizer = bitsandbytes.optim.AdamW(model.parameters(), lr=args.lr, is_paged=True, optim_bits=32)
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.99))
-        save_model = model
-    else:
-        raise KeyError(args.peft_type)
+    config = hyper1.LLAMA_CONFIG_DICT[args.model_size]
+    config.dtype = torch.bfloat16
+    config.gradient_checkpointing = True
+    config.lora_rank = args.lora_rank
+    model = hyper1.create_model(
+        "7b",
+        config=config,
+        hf_path=args.hf_path,
+        use_4bit=True,
+        device=device,
+    )
+    # optimizer = bitsandbytes.optim.AdamW(model.parameters(), lr=args.lr, is_paged=True, optim_bits=32)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.99))
+    save_model = model
 
     if args.lr_scheduler:
         scheduler = torch_utils.get_linear_schedule_with_warmup(
             optimizer,
-            num_warmup_steps=args.total_steps // 10,
-            num_training_steps=args.total_steps,
+            num_warmup_steps=(args.total_steps * accelerator.num_processes // 10),
+            num_training_steps=args.total_steps * accelerator.num_processes,
         )
     else:
         scheduler = None
@@ -133,13 +100,7 @@ def run():
         load_path = os.path.join(args.save_dir, f"checkpoint_{completed_steps:05d}.pt")
         print0("Resuming from", load_path)
         loaded = torch.load(load_path)
-        if args.peft_type == "prefix":
-            # noinspection PyUnboundLocalVariable
-            prefix_maker.load_state_dict(loaded["model"])
-        elif args.peft_type == "lora":
-            model.load_state_dict(loaded["model"], strict=False)
-        else:
-            raise KeyError(args.peft_type)
+        model.load_state_dict(loaded["model"], strict=False)
         optimizer.load_state_dict(loaded["optimizer"])
         if scheduler is not None:
             scheduler.load_state_dict(loaded["scheduler"])
@@ -172,21 +133,12 @@ def run():
     for batch_metadata, batch in train_iterator:
         # print(f"Rank: {accelerator.process_index}", batch["input_ids"][0, 0:8])
         with accelerator.accumulate(model):
-            if args.peft_type == "prefix":
-                prefixes = prefix_maker(batch_size=batch["input_ids"].shape[0])
-                output = model(
-                    input_ids=batch["input_ids"][:, :-1].to(device),
-                    prefixes=prefixes,
-                )
-            elif args.peft_type == "lora":
-                output = model(
-                    input_ids=batch["input_ids"][:, :-1].to(device),
-                    use_pefts=True,
-                )
-            else:
-                raise KeyError(args.peft_type)
+            logits = model(
+                hyper_input_ids=batch["hyper_input_ids"].to(device),
+                input_ids=batch["input_ids"][:, :-1].to(device),
+            )
             loss = F.cross_entropy(
-                output.view(-1, output.size(-1)),
+                logits.view(-1, logits.size(-1)),
                 batch["labels"][:, 1:].reshape(-1).to(device),
             )
             # print(f"Rank: {accelerator.process_index}, Loss: {loss}, Step: {batch_metadata['curr_step']}")
@@ -197,11 +149,11 @@ def run():
             optimizer.zero_grad()
             if scheduler:
                 scheduler.step()
+        if batch_metadata["grad_accum_index"] == args.grad_accum_steps - 1:
+            print0(batch_metadata["curr_step"], "Mem:", torch.cuda.max_memory_allocated(device), loss.item())
         if use_wandb:
             # global_loss = accelerator.reduce(loss, "mean")
             wandb.log({"loss": loss.item(), "step": batch_metadata["curr_step"], "lr": optimizer.param_groups[0]["lr"]})
-        if batch_metadata["grad_accum_index"] == args.grad_accum_steps - 1:
-            print0(batch_metadata["curr_step"], "Mem:", torch.cuda.max_memory_allocated(device), loss.item())
         completed_steps = batch_metadata["curr_step"] + 1
         if completed_steps % args.save_freq == 0:
             save_checkpoint(
