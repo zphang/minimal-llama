@@ -5,14 +5,11 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data.distributed import DistributedSampler
 import minimal_llama.utils.io_utils as io_utils
-import bitsandbytes.optim
 import wandb
 import accelerate
 import datasets
 import datasets.distributed
 
-import minimal_llama.hyper.prefix_llama as prefix_llama
-import minimal_llama.hyper.prefix_makers as prefix_makers
 import minimal_llama.hyper.hyper1 as hyper1
 import minimal_llama.utils.torch_utils as torch_utils
 
@@ -37,6 +34,7 @@ def run():
     torch.manual_seed(0)
 
     # Initialize Accelerate
+    # Needed because technically some LoRA weights aren't actually used (final attn-O and MLP)
     ddp_kwargs = accelerate.DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = accelerate.Accelerator(
         mixed_precision="bf16",
@@ -49,12 +47,6 @@ def run():
     print0 = accelerator.on_local_main_process(print)
     use_wandb = not args.no_wandb and accelerator.is_main_process
 
-    # local_rank = int(os.environ.get('LOCAL_RANK', 0))
-    # rank = int(os.environ.get('RANK', 0))
-    # world_size = int(os.environ.get('WORLD_SIZE', 1))
-    # torch.cuda.set_device(local_rank)
-    # device = torch.device("cuda", local_rank)
-
     if use_wandb:
         wandb.init(
             name=args.run_name,
@@ -62,7 +54,7 @@ def run():
             config={
                 "total_steps": args.total_steps,
                 "lr": args.lr,
-                "full_batch_size": args.batch_size * args.grad_accum_steps,
+                "full_batch_size": args.batch_size * args.grad_accum_steps * accelerator.num_processes,
                 "lora_rank": args.lora_rank,
             },
         )
@@ -85,6 +77,8 @@ def run():
     if args.lr_scheduler:
         scheduler = torch_utils.get_linear_schedule_with_warmup(
             optimizer,
+            # num_warmup_steps=(args.total_steps * args.grad_accum_steps // 10),
+            # num_training_steps=args.total_steps * args.grad_accum_steps,
             num_warmup_steps=(args.total_steps * accelerator.num_processes // 10),
             num_training_steps=args.total_steps * accelerator.num_processes,
         )
@@ -151,9 +145,11 @@ def run():
                 scheduler.step()
         if batch_metadata["grad_accum_index"] == args.grad_accum_steps - 1:
             print0(batch_metadata["curr_step"], "Mem:", torch.cuda.max_memory_allocated(device), loss.item())
-        if use_wandb:
-            # global_loss = accelerator.reduce(loss, "mean")
-            wandb.log({"loss": loss.item(), "step": batch_metadata["curr_step"], "lr": optimizer.param_groups[0]["lr"]})
+            if use_wandb:
+                # global_loss = accelerator.reduce(loss, "mean")
+                wandb.log({
+                    "loss": loss.item(), "step": batch_metadata["curr_step"], "lr": optimizer.param_groups[0]["lr"]
+                })
         completed_steps = batch_metadata["curr_step"] + 1
         if completed_steps % args.save_freq == 0:
             save_checkpoint(
