@@ -5,10 +5,6 @@ import tqdm.auto as tqdm
 import os
 import math
 
-"""
-Note, this version follows the HF format and doesn't offset input_ids and labels.
-"""
-
 
 @dataclass
 class TokenizeArguments:

@@ -25,7 +25,6 @@ def run():
     parser.add_argument("--filename", type=str, default="gen_data")
     parser.add_argument("--model_size", type=str, default="7b")
     args = parser.parse_args()
-    assert args.prefix_maker_mode in ["plain", "mlp", "hidden_states"]
 
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     rank = int(os.environ.get('RANK', 0))
@@ -67,15 +66,16 @@ def run():
     iterator = tqdm.tqdm(dataloader) if rank == 0 else dataloader
     for batch in iterator:
         converted_batch = convert_batch_for_generation(batch)
-        hyper_model_out = model.hyper_forward_pass(
-            batch["hyper_input_ids"].cuda()
-        )
-        generated = model.downstream_generate(
-            input_ids=converted_batch["input_ids"].cuda(),
-            gist_cache=hyper_model_out["gist_cache"],
-            t_offset=hyper_model_out["t_offset"],
-            generation_length=128,
-        )
+        with torch.inference_mode():
+            hyper_model_out = model.hyper_forward_pass(
+                batch["hyper_input_ids"].cuda()
+            )
+            generated = model.downstream_generate(
+                input_ids=converted_batch["input_ids"].cuda(),
+                gist_cache=hyper_model_out["gist_cache"],
+                t_offset=hyper_model_out["t_offset"],
+                generation_length=128,
+            )
 
         predictions = clean_predictions(generated, tokenizer=tokenizer)
         references = clean_labels(batch["labels"], tokenizer=tokenizer)

@@ -11,6 +11,7 @@ import datasets
 import datasets.distributed
 
 import minimal_llama.hyper.hyper1 as hyper1
+import minimal_llama.hyper.data.hyper_dataset as hyper_dataset
 import minimal_llama.utils.torch_utils as torch_utils
 
 
@@ -18,6 +19,7 @@ def run():
     parser = argparse.ArgumentParser()
     parser.add_argument("--hf_path", type=str)
     parser.add_argument("--dataset_path", type=str)
+    parser.add_argument("--dataset_type", type=str, default="pre")
     parser.add_argument("--save_dir", type=str)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--lora_rank", type=int, default=8)
@@ -31,7 +33,7 @@ def run():
     parser.add_argument("--lr_scheduler", action="store_true")
     parser.add_argument("--no_wandb", action="store_true", default=False)
     args = parser.parse_args()
-    torch.manual_seed(0)
+    torch.manual_seed(1)
 
     # Initialize Accelerate
     # Needed because technically some LoRA weights aren't actually used (final attn-O and MLP)
@@ -109,16 +111,31 @@ def run():
         # noinspection PyTypeChecker
         model, optimizer = accelerator.prepare(model, optimizer)
 
-    ds = datasets.load_from_disk(args.dataset_path)
-    train_iterator = get_train_iterator(
-        ds,
-        rank=accelerator.process_index, world_size=accelerator.num_processes,
-        batch_size=args.batch_size, num_workers=args.num_workers,
-        total_steps=args.total_steps,
-        start_step=train_state["completed_steps"],
-        seed=train_state["completed_steps"],  # use steps as stand-in for seed
-        grad_accum_steps=args.grad_accum_steps,
-    )
+    if args.dataset_type == "pre":
+        ds = datasets.load_from_disk(args.dataset_path)
+        train_iterator = get_train_iterator(
+            ds,
+            rank=accelerator.process_index, world_size=accelerator.num_processes,
+            batch_size=args.batch_size, num_workers=args.num_workers,
+            total_steps=args.total_steps,
+            start_step=train_state["completed_steps"],
+            seed=train_state["completed_steps"],  # use steps as stand-in for seed
+            grad_accum_steps=args.grad_accum_steps,
+        )
+    elif args.dataset_type == "hyper":
+        ds = hyper_dataset.FewshotHyperTrainDataset(
+            args.dataset_path, seed_offset=accelerator.process_index * 1000)
+        train_iterator = get_hyper_train_iterator(
+            ds,
+            rank=accelerator.process_index, world_size=accelerator.num_processes,
+            batch_size=args.batch_size, num_workers=args.num_workers,
+            total_steps=args.total_steps,
+            start_step=train_state["completed_steps"],
+            seed=train_state["completed_steps"],  # use steps as stand-in for seed
+            grad_accum_steps=args.grad_accum_steps,
+        )
+    else:
+        raise KeyError(args.dataset_type)
     torch.cuda.empty_cache()
     accelerator.wait_for_everyone()
 
@@ -137,6 +154,10 @@ def run():
             )
             # print(f"Rank: {accelerator.process_index}, Loss: {loss}, Step: {batch_metadata['curr_step']}")
             if torch.isnan(loss):
+                unwrapped_model = accelerator.unwrap_model(save_model)
+                model_state_dict = torch_utils.get_requires_grad(unwrapped_model)
+                torch.save(model_state_dict, "/fsx/zphang/working/2307/14_hyper/testing/checkpoint.p")
+                torch.save(batch, "/fsx/zphang/working/2307/14_hyper/testing/bad_batch.p")
                 raise RuntimeError(f"NaN on rank {accelerator.process_index}")
             accelerator.backward(loss)
             optimizer.step()
@@ -239,6 +260,43 @@ def get_train_iterator(dataset,
             curr_micro_step += 1
             if curr_micro_step == total_micro_steps:
                 return
+
+
+def get_hyper_train_iterator(dataset,
+                             rank: int, world_size: int,
+                             batch_size: int, num_workers: int,
+                             total_steps: int,
+                             start_step: int = 0, grad_accum_steps: int = 1,
+                             seed: int = 0):
+    total_micro_steps = total_steps * grad_accum_steps
+    start_micro_step = start_step * grad_accum_steps
+    curr_micro_step = start_micro_step
+    data_loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True,
+        collate_fn=data_collator,
+    )
+
+    if rank == 0:
+        print("total_micro_steps: {}, start_micro_step: {}".format(total_micro_steps + 1, start_micro_step + 1))
+        print("curr_micro_step: {}".format(curr_micro_step + 1))
+        print("Macro Step={}".format(curr_micro_step // grad_accum_steps + 1))
+    for micro_batch in data_loader:
+        metadata = {
+            "curr_micro_step": curr_micro_step,
+            "curr_step": curr_micro_step // grad_accum_steps,
+            "grad_accum_index": curr_micro_step % grad_accum_steps,
+            # Use completed_steps for checkpoint naming
+            "completed_steps": curr_micro_step // grad_accum_steps + 1,
+        }
+        if curr_micro_step >= start_micro_step:
+            yield metadata, micro_batch
+        curr_micro_step += 1
+        if curr_micro_step == total_micro_steps:
+            return
 
 
 def save_checkpoint(accelerator, save_model, optimizer, scheduler, save_dir, completed_steps):
