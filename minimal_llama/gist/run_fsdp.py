@@ -1,5 +1,6 @@
 import argparse
 import os
+import numpy as np
 import tqdm.auto as tqdm
 import math
 import torch
@@ -17,8 +18,10 @@ from torch.distributed.tensor.parallel.fsdp import enable_2d_with_fsdp
 import minimal_llama.gist.llama_simple3 as llama_simple3
 
 import minimal_llama.utils.io_utils as io_utils
+import minimal_llama.utils.torch_utils as torch_utils
 from accelerate import init_empty_weights
 import minimal_llama.newfancy.fsdp_utils as fsdp_utils
+import wandb
 
 FSDP_IS_AVAILABLE = enable_2d_with_fsdp()
 
@@ -26,6 +29,7 @@ FSDP_IS_AVAILABLE = enable_2d_with_fsdp()
 def run():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tokenizer_path", type=str)
+    parser.add_argument("--run_name", type=str)
     parser.add_argument("--model_size", type=str, default="7b")
     parser.add_argument("--hf_path", type=str)
     parser.add_argument("--dataset_path", type=str)
@@ -39,6 +43,8 @@ def run():
     parser.add_argument("--total_steps", type=int, default=10)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--expand_embedding", type=int, default=256)
+    parser.add_argument("--num_gist_tokens", type=int, default=8)
+    parser.add_argument("--no_wandb", action="store_true", default=False)
     # parser.add_argument("--save_path", type=str)
     args = parser.parse_args()
 
@@ -56,6 +62,18 @@ def run():
         model_config.dtype = torch.bfloat16
     with init_empty_weights():
         model = llama_simple3.LLaMAModel(config=model_config)
+
+    use_wandb = not args.no_wandb and rank == 0
+    if use_wandb:
+        wandb.init(
+            name=args.run_name,
+            project="hyper2",
+            config={
+                "total_steps": args.total_steps,
+                "lr": args.lr,
+                "full_batch_size": args.batch_size * args.grad_accum_steps * world_size,
+            },
+        )
 
     # See: https://github.com/HamidShojanazeri/examples/blob/FSDP_example/distributed/FSDP/T5_training.py
     model = FSDP(
@@ -93,8 +111,16 @@ def run():
 
     device = torch.device(f"cuda:{local_rank}")
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+    scheduler = torch_utils.get_linear_schedule_with_warmup(
+        optimizer,
+        # num_warmup_steps=(args.total_steps * args.grad_accum_steps // 10),
+        # num_training_steps=args.total_steps * args.grad_accum_steps,
+        num_warmup_steps=(args.total_steps // 10),
+        num_training_steps=args.total_steps,
+    )
 
     ds = datasets.load_from_disk(args.dataset_path)
+    ds = GistDatasetWrapper(ds, num_gist_tokens=args.num_gist_tokens)
     train_iterator = get_train_iterator(
         ds,
         rank=rank, world_size=world_size,
@@ -102,16 +128,13 @@ def run():
         total_steps=args.total_steps, start_step=0, grad_accum_steps=args.grad_accum_steps,
     )
 
-    loss_list = []
-    loss = None
     optimizer.zero_grad()
+    loss = None
     for batch_metadata, batch in train_iterator:
         output = model(
             input_ids=batch["input_ids"].to(device),
             # input_ids=batch["input_ids"].clamp(0, 31999).to(device),
-            attention_mask=convert_mask_to_soft_mask(create_gist_attention_mask(
-                batch["gist_token_type"],
-            ), dtype=model.config.dtype).to(device),
+            attention_mask=batch["attention_mask"].to(device),
         )
         # loss = output.mean()
         # print(output.view(-1, output.size(-1)).shape)
@@ -124,20 +147,49 @@ def run():
         if batch_metadata["grad_accum_index"] == args.grad_accum_steps - 1:
             optimizer.step()
             optimizer.zero_grad()
+            scheduler.step()
+            if use_wandb:
+                wandb.log({
+                    "loss": loss.item(), "step": batch_metadata["curr_step"], "lr": optimizer.param_groups[0]["lr"]
+                })
             if local_rank == 0:
                 print(batch_metadata["curr_step"], "Mem:", torch.cuda.max_memory_allocated(device), loss.item())
-                loss_list.append(loss.item())
 
     fsdp_utils.save_model_and_optimizer_sharded(
         model, rank, save_using_num_threads=6,
         save_dir=args.save_dir,
         optim=optimizer,
     )
-    io_utils.write_json(loss_list, os.path.join(args.save_dir, "loss.json"))
 
     if local_rank == 0:
         print("Mem:", torch.cuda.max_memory_allocated(device))
         print("Done", loss.item())
+
+
+class GistDatasetWrapper(torch.utils.data.Dataset):
+
+    def __init__(self, ds, num_gist_tokens: int = 16):
+        self.ds = ds
+        self.num_gist_tokens = num_gist_tokens
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, index):
+        ex = self.ds[index]
+        input_ids = ex["input_ids"][:-1]
+        labels = [
+            x if 0 < x < 32_000 else -100
+            for x in ex["input_ids"][1:]
+        ]
+        return {
+            "input_ids": input_ids,
+            "attention_mask": create_multigist_attention_mask(
+                input_ids,
+                num_gist_tokens=self.num_gist_tokens,
+            ),
+            "labels": labels,
+        }
 
 
 def convert_mask_to_soft_mask(mask, dtype):
@@ -163,14 +215,23 @@ def create_gist_attention_mask(gist_token_type):
     return torch.stack(mask_list)[:, None]
 
 
+def create_multigist_attention_mask(input_ids, num_gist_tokens):
+    first_gist_token_id = 32_000
+    input_len = len(input_ids)
+    mask = torch.ones([input_len, input_len]).tril().bool()
+    plain_indices = np.arange(input_len)
+    for first_token_idx in plain_indices[input_ids == first_gist_token_id]:
+        x0 = first_token_idx + num_gist_tokens
+        y1 = first_token_idx
+        mask[x0:, :y1] = False
+    return mask[None]
+
+
 def data_collator(features: list) -> dict:
-    keys = features[0].keys()
     batch = {
-        k: torch.stack([
-            torch.LongTensor(f[k])
-            for f in features
-        ])
-        for k in keys
+        "input_ids": torch.stack([torch.LongTensor(f["input_ids"]) for f in features]),
+        "labels": torch.stack([torch.LongTensor(f["labels"]) for f in features]),
+        "attention_mask": torch.stack([torch.BoolTensor(f["attention_mask"]) for f in features]),
     }
     return batch
 
@@ -179,7 +240,8 @@ def get_train_iterator(dataset,
                        rank: int, world_size: int,
                        batch_size: int, num_workers: int,
                        total_steps: int,
-                       start_step: int = 0, grad_accum_steps: int = 1):
+                       start_step: int = 0, grad_accum_steps: int = 1,
+                       seed: int = 0):
     total_micro_steps = total_steps * grad_accum_steps
     start_micro_step = start_step * grad_accum_steps
     sampler = DistributedSampler(
@@ -187,6 +249,7 @@ def get_train_iterator(dataset,
         rank=rank,
         num_replicas=world_size,
         shuffle=True,
+        seed=seed,
     )
     data_loader = torch.utils.data.DataLoader(
         dataset,
@@ -195,9 +258,10 @@ def get_train_iterator(dataset,
         pin_memory=True,
         drop_last=True,
         collate_fn=data_collator,
+        sampler=sampler,
         # shuffle=False,
     )
-    num_batches_per_epoch = len(dataset) // batch_size
+    num_batches_per_epoch = len(dataset) // batch_size // world_size
     curr_epoch = start_micro_step // num_batches_per_epoch
     curr_micro_step = curr_epoch * num_batches_per_epoch
     epoch_ceil = math.ceil(total_micro_steps / num_batches_per_epoch)

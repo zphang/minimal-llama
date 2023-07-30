@@ -826,11 +826,10 @@ class NoInitExtendedEmbedding(nn.Embedding):
     def reset_parameters(self) -> None:
         pass
 
-    def reset_extended_embeddings(self):
-        if self.extended_weight.device == torch.device("meta"):
-            self.extended_weight = nn.Parameter(
-                torch.empty_like(self.extended_weight.data, device=self.weight.device))
-        nn.init.normal_(self.extended_weight)
+    def reset_extended_embeddings(self, ):
+        indices = torch.randint(self.num_embeddings, (self.additional_tokens,))
+        extended_embeddings = self.weight[indices]
+        self.extended_weight = nn.Parameter(extended_embeddings)
 
 
 def create_model(model_name, hf_path, use_4bit=False, device=None, config=None):

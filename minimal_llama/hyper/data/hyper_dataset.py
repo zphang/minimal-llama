@@ -15,7 +15,7 @@ RIGHT = "right"
 VOCAB_SIZE = 32_000
 
 HYPER_INPUT_INDICATOR = [10567, 29901, 13]
-HYPER_OUTPUT_INDICATOR = [10604, 29901, 13]
+HYPER_OUTPUT_INDICATOR = [13, 10604, 29901, 13]
 
 
 def pad(input_ids: list, max_length: int, side: str,
@@ -49,12 +49,41 @@ def truncate(input_ids: list, max_length: int, side: str):
 
 def format_hyper_inputs(example):
     return (
-        [BOS_TOKEN_ID]
-        + HYPER_INPUT_INDICATOR
+        HYPER_INPUT_INDICATOR
         + example["inputs"]
         + HYPER_OUTPUT_INDICATOR
         + example["targets"]
     )
+
+
+def format_input_ids(example, max_downstream_length=None):
+    input_ids = (
+        HYPER_INPUT_INDICATOR
+        + example["inputs"]
+        + HYPER_OUTPUT_INDICATOR
+        + example["targets"]
+        + [EOS_TOKEN_ID]
+    )
+    if max_downstream_length is not None:
+        input_ids = truncate(input_ids, side=LEFT, max_length=max_downstream_length - 1)
+        input_ids = pad(input_ids, side=RIGHT, max_length=max_downstream_length - 1)
+    return [BOS_TOKEN_ID] + input_ids
+
+
+def format_labels(example, max_downstream_length=None):
+    labels = (
+        [NON_LABEL_TOKEN_ID] * (
+            len(HYPER_INPUT_INDICATOR) + len(example["inputs"])
+        )
+        + [NON_LABEL_TOKEN_ID] * len(HYPER_OUTPUT_INDICATOR)
+        + example["targets"]
+        + [EOS_TOKEN_ID]
+    )
+    if max_downstream_length is not None:
+        labels = truncate(labels, side=LEFT, max_length=max_downstream_length - 1)
+        labels = pad(labels, side=RIGHT, max_length=max_downstream_length - 1,
+                     pad_token_id=NON_LABEL_TOKEN_ID)
+    return [NON_LABEL_TOKEN_ID] + labels
 
 
 class FewshotHyperTrainIterator:
@@ -114,40 +143,22 @@ class FewshotHyperTrainIterator:
             # noinspection PyTypeChecker
             hyper_input_ids = truncate(
                 format_hyper_inputs(hyper_examples[0]),
-                max_length=self.max_hyper_length - self.num_gist_tokens,
+                max_length=self.max_hyper_length - self.num_gist_tokens - 1,
                 side=LEFT,
             ) + self.gist_tokens
         else:
             hyper_input_ids = []
             for ex in candidate_hyper_input_ids:
-                if len(hyper_input_ids) + len(ex) > self.max_hyper_length - self.num_gist_tokens:
+                if len(hyper_input_ids) + len(ex) > self.max_hyper_length - self.num_gist_tokens - 1:
                     break
                 hyper_input_ids += ex
             hyper_input_ids += self.gist_tokens
-            hyper_input_ids = pad(hyper_input_ids, side=RIGHT, max_length=self.max_hyper_length)
+            hyper_input_ids = pad(hyper_input_ids, side=RIGHT, max_length=self.max_hyper_length - 1)
+        hyper_input_ids = [BOS_TOKEN_ID] + hyper_input_ids
         assert len(hyper_input_ids) == self.max_hyper_length
 
-        input_ids = (
-            [BOS_TOKEN_ID]
-            + actual_example["inputs"] + actual_example["targets"]
-            + [EOS_TOKEN_ID]
-        )
-        labels = (
-             [NON_LABEL_TOKEN_ID] * (1 + len(actual_example["inputs"]))
-             + actual_example["targets"] + [EOS_TOKEN_ID]
-        )
-        # input_ids = truncate(input_ids, side=RIGHT, max_length=self.max_downstream_length)
-        # input_ids = pad(input_ids, side=RIGHT, max_length=self.max_downstream_length)
-        # labels = truncate(labels, side=RIGHT, max_length=self.max_downstream_length)
-        # labels = pad(labels, side=RIGHT, max_length=self.max_downstream_length,
-        #              pad_token_id=NON_LABEL_TOKEN_ID)
-        input_ids = truncate(input_ids, side=LEFT, max_length=self.max_downstream_length-1)
-        input_ids = pad(input_ids, side=RIGHT, max_length=self.max_downstream_length-1)
-        labels = truncate(labels, side=LEFT, max_length=self.max_downstream_length-1)
-        labels = pad(labels, side=RIGHT, max_length=self.max_downstream_length-1,
-                     pad_token_id=NON_LABEL_TOKEN_ID)
-        input_ids = [BOS_TOKEN_ID] + input_ids
-        labels = [NON_LABEL_TOKEN_ID] + labels
+        input_ids = format_input_ids(actual_example, max_downstream_length=self.max_downstream_length)
+        labels = format_labels(actual_example, max_downstream_length=self.max_downstream_length)
         assert len(input_ids) == self.max_downstream_length
         assert len(labels) == self.max_downstream_length
 
