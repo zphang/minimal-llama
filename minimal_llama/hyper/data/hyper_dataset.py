@@ -14,8 +14,9 @@ LEFT = "left"
 RIGHT = "right"
 VOCAB_SIZE = 32_000
 
-HYPER_INPUT_INDICATOR = [10567, 29901, 13]
-HYPER_OUTPUT_INDICATOR = [13, 10604, 29901, 13]
+# hard-coded for now
+HYPER_INPUT_INDICATOR = [32255]
+HYPER_OUTPUT_INDICATOR = [32254]
 
 
 def pad(input_ids: list, max_length: int, side: str,
@@ -53,14 +54,15 @@ def format_hyper_inputs(example):
         + example["inputs"]
         + HYPER_OUTPUT_INDICATOR
         + example["targets"]
+        # example["inputs"]
+        # + example["targets"]
+        # + [13, 13, 13]
     )
 
 
 def format_input_ids(example, max_downstream_length=None):
     input_ids = (
-        HYPER_INPUT_INDICATOR
-        + example["inputs"]
-        + HYPER_OUTPUT_INDICATOR
+        example["inputs"]
         + example["targets"]
         + [EOS_TOKEN_ID]
     )
@@ -72,10 +74,7 @@ def format_input_ids(example, max_downstream_length=None):
 
 def format_labels(example, max_downstream_length=None):
     labels = (
-        [NON_LABEL_TOKEN_ID] * (
-            len(HYPER_INPUT_INDICATOR) + len(example["inputs"])
-        )
-        + [NON_LABEL_TOKEN_ID] * len(HYPER_OUTPUT_INDICATOR)
+        [NON_LABEL_TOKEN_ID] * len(example["inputs"])
         + example["targets"]
         + [EOS_TOKEN_ID]
     )
@@ -237,7 +236,7 @@ def construct_metadata(ds_list, base_path):
     for i, row in new_ds:
         new_key = row["task_name"]  # TODO: figure out the key
         if curr_key and new_key != curr_key:
-            assert not curr_key in metadata
+            assert curr_key not in metadata
             metadata[curr_key] = {
                 "task_source": row["task_source"],
                 "task_name": row["task_name"],

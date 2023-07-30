@@ -11,17 +11,8 @@ from accelerate import init_empty_weights
 
 from typing import Optional
 import minimal_llama.utils.io_utils as io_utils
+import minimal_llama.utils.torch_utils as torch_utils
 from transformers.utils.bitsandbytes import set_module_quantized_tensor_to_device
-
-if os.environ.get("CHECK_NAN"):
-    def check_nan(x):
-        if torch.isnan(x).any():
-            import pdb
-            pdb.set_trace()
-else:
-    # noinspection PyUnusedLocal
-    def check_nan(x):
-        pass
 
 
 @dataclasses.dataclass
@@ -75,10 +66,10 @@ LLAMA_CONFIG_DICT = {
     "debug": DEBUG_CONFIG,
 }
 
-MODE_HYPER = "hyper"
-MODE_DOWNSTREAM_TRAIN = "downstream_train"
-MODE_DOWNSTREAM_ENCODE = "downstream_decode_encode"
-MODE_DOWNSTREAM_DECODE = "downstream_decode_decode"
+MODE_TRAIN = "train"
+MODE_INFERENCE_HYPER = "inference_hyper"
+MODE_INFERENCE_DOWNSTREAM_ENCODE = "inference_downstream_decode_encode"
+MODE_INFERENCE_DOWNSTREAM_DECODE = "inference_downstream_decode_decode"
 
 
 class LLaMAModel(nn.Module):
@@ -92,58 +83,31 @@ class LLaMAModel(nn.Module):
     def forward(self,
                 hyper_input_ids,
                 input_ids):
+        return self.train_forward_pass(
+            hyper_input_ids=hyper_input_ids,
+            input_ids=input_ids,
+        )
+
+    def train_forward_pass(
+        self,
+        input_ids,
+        attention_mask,
+    ):
         """Forward pass (with full decode sequence, intended for training or loss-scoring)
-        :param hyper_input_ids: [batch_size, seq_len]
         :param input_ids: [batch_size, seq_len]
             - Always right-padded. Masks are generated based on padding tokens
+        :param attention_mask: [batch_size, num_heads=1, seq_len, seq_len]
         :return: logits [batch_size, seq_len]
         """
-        hyper_model_out = self.hyper_forward_pass(
-            hyper_input_ids=hyper_input_ids,
-        )
-        logits = self.downstream_forward_pass(
+        rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
+        cos, sin = self.get_cos_sin(rope_embed_ids)
+        model_out = self.model.train_forward_pass(
             input_ids=input_ids,
-            gist_cache=hyper_model_out["gist_cache"],
-            t_offset=hyper_model_out["t_offset"],
-        )
-        return logits
-
-    def hyper_forward_pass(self, hyper_input_ids):
-        rope_embed_ids = create_rope_embed_ids(input_ids=hyper_input_ids)
-        cos, sin = self.get_cos_sin(rope_embed_ids)
-        hyper_model_out = self.model(
-            hyper_input_ids,
             cos=cos, sin=sin,
-            # use_kv_cache=False,
-            mode=MODE_HYPER,
-        )
-        t_offset = 1 + hyper_input_ids.argmax(-1)
-        hyper_model_out["t_offset"] = t_offset
-        return hyper_model_out
-
-    def downstream_forward_pass(self, input_ids, gist_cache, t_offset):
-        # 2) Downstream Forward pass
-        t_offset = t_offset[:, None]
-        prefix_length = gist_cache[0]["key"].shape[2]
-        # TODO: We don't actually want to clamp, we want to expend to ensure it can fit both hyper
-        #       and regular IDs, and then throw an error if it still doesn't fit
-        rope_embed_ids = (create_rope_embed_ids(input_ids=input_ids) + prefix_length + t_offset).clamp(
-            max=self.config.max_seq_length - 1,
-        )
-        cos, sin = self.get_cos_sin(rope_embed_ids)
-        attention_mask = create_prefix_train_attention_mask(input_ids, prefix_length)
-        # [batch_size, seq_len, hidden_dim]
-        model_out = self.model(
-            input_ids,
-            cos=cos, sin=sin,
-            # use_kv_cache=True,
-            kv_cache=gist_cache,
             attention_mask=attention_mask,
-            mode=MODE_DOWNSTREAM_TRAIN,
         )
-        # [batch_size, seq_len, vocab_size]
         logits = self.lm_head(model_out["hidden_states"])
-        return logits
+        return {"logits": logits}
 
     def init_kv_cache(self, batch_size):
         # noinspection GrazieInspection
@@ -322,91 +286,69 @@ class LLaMAInnerModel(nn.Module):
         self,
         input_ids,
         cos, sin,
-        # use_kv_cache=False,
         kv_cache=None,
-        num_valid_tokens=None,
         attention_mask=None,
         mode=None,
     ):
+        if mode == MODE_TRAIN:
+            return self.train_forward_pass(
+                input_ids=input_ids,
+                cos=cos, sin=sin,
+                attention_mask=attention_mask,
+            )
+        elif mode == MODE_INFERENCE_HYPER:
+            raise NotImplementedError
+        else:
+            raise NotImplementedError
+
+    def train_forward_pass(
+        self,
+        input_ids,
+        cos, sin,
+        attention_mask=None,
+    ):
         """
         :param input_ids: [batch_size, seq_len]
-        :param kv_cache: See init_kv_cache.
-            We use the presence of kv_cache to determine if we're generating
         :param cos:
         :param sin:
-        # :param use_kv_cache: If True, we are going to maintain a kv_cache
-        #     if kv_cache is None (i.e. the first encoding step in decoding), the kv_cache is just the
-        #     based on the kv states.
-        :param kv_cache: {"key"/"value": [batch_size, num_heads, cache_seq_len, head_dim]}
-            Only used for decoding
-        :param num_valid_tokens: [batch_size]
-            Only used for decoding
         :param mode:
         :param attention_mask: [batch_size, num_heads, q_len, kv_len]
         """
-        hidden_states = self.embed_tokens(input_ids, use_extended=mode == MODE_HYPER)
+        hidden_states = self.embed_tokens(input_ids, use_extended=True)
         hidden_states = hidden_states.to(self.config.dtype)
+        hyper_hidden_states = hidden_states
+        is_gist = (input_ids >= self.config.vocab_size).bfloat()
 
-        if mode == MODE_HYPER:
-            is_gist_token = (input_ids >= self.config.vocab_size) & (input_ids <= self.config.vocab_size + 128)
-        else:
-            is_gist_token = None
-
-        new_kv_cache = []
-        gist_cache = []
         for layer_i, layer in enumerate(self.layers):
-            if kv_cache:
-                # dict(
-                #   key = [batch_size, num_heads, kv_seq_len=decode_step+1, head_dim]
-                #   value = [batch_size, num_heads, kv_seq_len=decode_step+1, head_dim]
-                # )
-                layer_kv_cache = kv_cache[layer_i]
-            else:
-                layer_kv_cache = None
-
             if self.config.gradient_checkpointing:
                 # noinspection PyUnresolvedReferences
                 layer_out = torch.utils.checkpoint.checkpoint(
-                    layer,
+                    layer.train_forward_pass,
+                    hyper_hidden_states,
                     hidden_states,
                     cos, sin,
-                    # use_kv_cache,
-                    layer_kv_cache,
-                    num_valid_tokens,
                     attention_mask,
-                    mode,
+                    is_gist,
                     use_reentrant=False,
                 )
             else:
-                layer_out = layer(
+                layer_out = layer.train_forward_pass(
+                    hyper_hidden_states=hyper_hidden_states,
                     hidden_states=hidden_states,
                     cos=cos, sin=sin,
-                    # use_kv_cache=use_kv_cache,
-                    kv_cache=layer_kv_cache,
-                    num_valid_tokens=num_valid_tokens,
                     attention_mask=attention_mask,
-                    mode=mode,
+                    is_gist=is_gist,
                 )
 
             hidden_states = layer_out["hidden_states"]
-            if mode == MODE_HYPER:
-                gist_cache.append({
-                    "key": extract_gist_kv(layer_out["kv_cache"]["key"], is_gist_token),
-                    "value": extract_gist_kv(layer_out["kv_cache"]["value"], is_gist_token),
-                })
-            if mode in (MODE_DOWNSTREAM_ENCODE, MODE_DOWNSTREAM_DECODE):
-                new_kv_cache.append(layer_out["kv_cache"])
-
-        if mode == MODE_HYPER:
-            return {"gist_cache": gist_cache}
+            hyper_hidden_states = layer_out["hyper_hidden_states"]
 
         hidden_states = self.norm(hidden_states)
+        # hyper_hidden_states = self.norm(hyper_hidden_states)
         output = {
-            "hidden_states": hidden_states
+            "hidden_states": hidden_states,
+            # "hyper_hidden_states": hyper_hidden_states,
         }
-        if mode in (MODE_DOWNSTREAM_ENCODE, MODE_DOWNSTREAM_DECODE):
-            output["kv_cache"] = new_kv_cache
-
         return output
 
 
@@ -421,17 +363,37 @@ class LLaMALayer(nn.Module):
 
     def forward(
         self,
+        hyper_hidden_states,
         hidden_states,
         cos, sin,
-        # use_kv_cache=False,
         kv_cache=None,
-        num_valid_tokens=None,
         attention_mask=None,
         mode=None,
+        is_gist=None,
         offload_to_cpu=False,  # Needed for activation checkpointing? idk
+    ):
+        if mode == MODE_TRAIN:
+            return self.train_forward_pass(
+                hyper_hidden_states=hyper_hidden_states,
+                hidden_states=hidden_states,
+                cos=cos, sin=sin,
+                attention_mask=attention_mask,
+                is_gist=is_gist,
+            )
+        else:
+            raise NotImplementedError
+
+    def train_forward_pass(
+        self,
+        hyper_hidden_states,
+        hidden_states,
+        cos, sin,
+        attention_mask,
+        is_gist,
     ):
         # 1) Self-attention
         # [batch_size, seq_len, hidden_dim]
+        normed_hyper_hidden_states = self.input_layernorm(hidden_states).to(self.config.dtype)
         normed_hidden_states = self.input_layernorm(hidden_states).to(self.config.dtype)
         # dict(
         #   attn_output = [batch_size, seq_len, hidden_dim]
@@ -440,35 +402,33 @@ class LLaMALayer(nn.Module):
         #     value = [batch_size, num_heads, kv_seq_len, head_dim]
         #   )
         # )
-        check_nan(normed_hidden_states)
-        raw_self_attn_output = self.self_attn(
+        torch_utils.check_nan(normed_hidden_states)
+        attn_output = self.self_attn.train_forward_pass(
+            hyper_hidden_states=normed_hyper_hidden_states,
             hidden_states=normed_hidden_states,
             cos=cos, sin=sin,
-            # use_kv_cache=use_kv_cache,
-            kv_cache=kv_cache,
-            num_valid_tokens=num_valid_tokens,
             attention_mask=attention_mask,
-            mode=mode,
+            is_gist=is_gist,
         )
         # [batch_size, seq_len, hidden_dim]
-        hidden_states = hidden_states + raw_self_attn_output["attn_output"]
-        check_nan(hidden_states)
-        # 2) FFN
-        # [batch_size, seq_len, hidden_dim]
+        hidden_states = hidden_states + attn_output["attn_output"]
+        torch_utils.check_nan(hidden_states)
+        hyper_hidden_states = hyper_hidden_states + attn_output["hyper_attn_output"]
+        torch_utils.check_nan(hyper_hidden_states)
         hidden_states = hidden_states + self.mlp(
             self.post_attention_layernorm(hidden_states),
-            use_pefts=mode == MODE_HYPER,
+            use_pefts=False,
         )
-        check_nan(hidden_states)
-        if mode in (MODE_HYPER, MODE_DOWNSTREAM_ENCODE, MODE_DOWNSTREAM_DECODE):
-            return {
-                "hidden_states": hidden_states,
-                "kv_cache": raw_self_attn_output["kv_cache"],
-            }
-        else:
-            return {
-                "hidden_states": hidden_states
-            }
+        torch_utils.check_nan(hidden_states)
+        hyper_hidden_states = hyper_hidden_states + self.mlp(
+            self.post_attention_layernorm(hidden_states),
+            use_pefts=True,
+        )
+        torch_utils.check_nan(hyper_hidden_states)
+        return {
+            "hidden_states": hidden_states,
+            "hyper_hidden_states": hyper_hidden_states,
+        }
 
 
 class MLP(nn.Module):
@@ -524,99 +484,144 @@ class Attention(nn.Module):
 
         self.q_proj = create_linear(config.dim, config.dim, dtype=config.dtype, use_4bit=config.use_4bit,
                                     rank=config.lora_rank)
-        self.k_proj = create_linear(config.dim, config.dim, dtype=config.dtype, use_4bit=config.use_4bit,
-                                    rank=config.lora_rank)
-        self.v_proj = create_linear(config.dim, config.dim, dtype=config.dtype, use_4bit=config.use_4bit,
-                                    rank=config.lora_rank)
+        self.k_proj = create_linear(config.dim, config.dim, dtype=config.dtype, use_4bit=True,
+                                    use_lora=False)
+        self.v_proj = create_linear(config.dim, config.dim, dtype=config.dtype, use_4bit=True,
+                                    use_lora=False)
         self.o_proj = create_linear(config.dim, config.dim, dtype=config.dtype, use_4bit=config.use_4bit,
                                     rank=config.lora_rank)
+
+        self.hyper_k_proj = create_linear(config.dim, config.dim, dtype=config.dtype, use_4bit=False,
+                                          use_lora=False)
+        self.hyper_v_proj = create_linear(config.dim, config.dim, dtype=config.dtype, use_4bit=False,
+                                          use_lora=False)
+
         self.rotary_emb = RotaryEmbedding(dim=self.head_dim, max_position_embeddings=config.max_seq_length)
 
-    def forward(self, hidden_states, cos, sin,
-                # use_kv_cache=False,
-                kv_cache=None,
-                num_valid_tokens=None,
+    def forward(self,
+                hyper_hidden_states,
+                hidden_states,
+                is_gist,
+                cos, sin,
                 attention_mask=None,
-                mode=None):
+                mode=MODE_TRAIN):
+        if mode == MODE_TRAIN:
+            return self.train_forward_pass(
+                hyper_hidden_states=hyper_hidden_states,
+                hidden_states=hidden_states,
+                is_gist=is_gist,
+                cos=cos, sin=sin,
+                attention_mask=attention_mask,
+            )
+        elif mode == MODE_INFERENCE_HYPER:
+            return self.inference_hyper(
+                hyper_hidden_states=hyper_hidden_states,
+                is_gist=is_gist,
+                cos=cos, sin=sin,
+            )
+        else:
+            raise NotImplementedError
+
+    def train_forward_pass(self,
+                           hyper_hidden_states,
+                           hidden_states,
+                           is_gist,
+                           cos, sin,
+                           attention_mask=None):
         """
+        :param hyper_hidden_states: [batch_size, seq_len, hidden_dim]
         :param hidden_states: [batch_size, seq_len, hidden_dim]
+        :param is_gist: [batch_size, num_heads, kv_len]
         :param cos:
         :param sin:
-        # :param use_kv_cache: If True, we are going to maintain a kv_cache
-        #     if kv_cache is None (i.e. the first encoding step in decoding), the kv_cache is just the
-        #     based on the kv states.
-        :param kv_cache: {"key"/"value": [batch_size, num_heads, cache_seq_len, head_dim]}
-            Only used for decoding
-        :param num_valid_tokens: [batch_size]
-            Only used for decoding
         :param attention_mask: [batch_size, num_heads, q_len, kv_len]
-        :param mode
         :return:
         """
         batch_size, q_seq_len, hidden_dim = hidden_states.size()
-        use_lora = mode == MODE_HYPER
+        is_gist = is_gist[:, None]
+        not_gist = (1 - is_gist)
 
         # (batch_size, num_heads, q_seq_len, head_dim)
-        query_states = self.q_proj(hidden_states, use_lora=use_lora).view(
+        hyper_query_states = self.q_proj(hyper_hidden_states, use_lora=True).view(
             batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        key_states = self.k_proj(hidden_states, use_lora=use_lora).view(
+        hyper_key_states = self.hyper_k_proj(hyper_hidden_states).view(
             batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        value_states = self.v_proj(hidden_states, use_lora=use_lora).view(
+        hyper_value_states = self.hyper_v_proj(hyper_hidden_states).view(
+            batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        query_states = self.q_proj(hidden_states, use_lora=False).view(
+            batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(
+            batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(
             batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos=cos, sin=sin)
-        if mode in (MODE_DOWNSTREAM_TRAIN, MODE_DOWNSTREAM_ENCODE, MODE_DOWNSTREAM_DECODE):
-            key_states, value_states = self.append_to_kv_cache(
-                kv_cache=kv_cache,
-                new_key_state=key_states,
-                new_value_state=value_states,
-            )
-        if q_seq_len == key_states.shape[2]:
-            # We shouldn't encounter this case because of prefixes
+        hyper_query_states, hyper_key_states = apply_rotary_pos_emb(
+            hyper_query_states, hyper_key_states, cos=cos, sin=sin)
+        key_states = key_states * not_gist + hyper_key_states * is_gist
+        value_states = value_states * not_gist + hyper_value_states * is_gist
 
-            if attention_mask is None:
-                # noinspection PyUnresolvedReferences
-                with torch.backends.cuda.sdp_kernel(
-                    enable_math=False, enable_flash=True, enable_mem_efficient=False,
-                ):
-                    attn_output = torch.nn.functional.scaled_dot_product_attention(
-                        query=query_states,
-                        key=key_states,
-                        value=value_states,
-                        is_causal=True,
-                    )
-            else:
-                # noinspection PyUnresolvedReferences
-                with torch.backends.cuda.sdp_kernel(
-                    enable_math=True, enable_flash=True, enable_mem_efficient=True,
-                ):
-                    attn_output = torch.nn.functional.scaled_dot_product_attention(
-                        query=query_states,
-                        key=key_states,
-                        value=value_states,
-                        attn_mask=attention_mask,
-                    )
-        else:
-            # noinspection PyUnresolvedReferences
-            with torch.backends.cuda.sdp_kernel(
-                enable_math=True, enable_flash=True, enable_mem_efficient=True,
-            ):
-                attn_output = torch.nn.functional.scaled_dot_product_attention(
-                    query=query_states,
-                    key=key_states,
-                    value=value_states,
-                    attn_mask=attention_mask,
-                )
-        # (batch_size, q_seq_len, hidden_dim)
+        # noinspection PyUnresolvedReferences
+        with torch.backends.cuda.sdp_kernel(
+            enable_math=True, enable_flash=False, enable_mem_efficient=True,
+        ):
+            hyper_attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query=hyper_query_states,
+                key=hyper_key_states,
+                value=hyper_value_states,
+                attn_mask=attention_mask,
+            )
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query=query_states,
+                key=key_states,
+                value=value_states,
+                attn_mask=attention_mask,
+            )
+
         attn_output = attn_output.transpose(1, 2).contiguous().view(
             batch_size, q_seq_len, hidden_dim,
         )
-        attn_output = self.o_proj(attn_output, use_lora=use_lora)
-        check_nan(attn_output)
-        if mode in (MODE_HYPER, MODE_DOWNSTREAM_ENCODE, MODE_DOWNSTREAM_DECODE):
-            new_kv_cache = {"key": key_states, "value": value_states}
-            return {"attn_output": attn_output, "kv_cache": new_kv_cache}
-        else:
-            return {"attn_output": attn_output}
+        attn_output = self.o_proj(attn_output, use_lora=False)
+        torch_utils.check_nan(attn_output)
+
+        hyper_attn_output = hyper_attn_output.transpose(1, 2).contiguous().view(
+            batch_size, q_seq_len, hidden_dim,
+        )
+        hyper_attn_output = self.o_proj(hyper_attn_output, use_lora=True)
+        torch_utils.check_nan(hyper_attn_output)
+        return {"attn_output": attn_output, "hyper_attn_output": hyper_attn_output}
+
+    def inference_hyper(self, hyper_hidden_states, cos, sin, is_gist):
+        batch_size, q_seq_len, hidden_dim = hyper_hidden_states.size()
+        is_gist_token = is_gist.bool()
+
+        # (batch_size, num_heads, q_seq_len, head_dim)
+        hyper_query_states = self.q_proj(hyper_hidden_states, use_lora=True).view(
+            batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        hyper_key_states = self.hyper_k_proj(hyper_hidden_states).view(
+            batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        hyper_value_states = self.hyper_v_proj(hyper_hidden_states).view(
+            batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        unrotated_hyper_key_states = hyper_key_states
+        hyper_query_states, hyper_key_states = apply_rotary_pos_emb(
+            hyper_query_states, hyper_key_states, cos=cos, sin=sin)
+        # noinspection PyUnresolvedReferences
+        with torch.backends.cuda.sdp_kernel(
+            enable_math=True, enable_flash=True, enable_mem_efficient=True,
+        ):
+            hyper_attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query=hyper_query_states,
+                key=hyper_key_states,
+                value=hyper_value_states,
+            )
+        hyper_attn_output = hyper_attn_output.transpose(1, 2).contiguous().view(
+            batch_size, q_seq_len, hidden_dim,
+        )
+        hyper_attn_output = self.o_proj(hyper_attn_output, use_lora=True)
+        return {
+            "hyper_attn_output": hyper_attn_output,
+            "gist_k": extract_gist_kv(unrotated_hyper_key_states, is_gist_token=is_gist_token),
+            "gist_v": extract_gist_kv(hyper_key_states, is_gist_token=is_gist_token),
+        }
 
     @classmethod
     def append_to_kv_cache(cls, kv_cache, new_key_state, new_value_state):
@@ -826,13 +831,9 @@ class NoInitExtendedEmbedding(nn.Embedding):
     def reset_parameters(self) -> None:
         pass
 
-    def reset_extended_embeddings(self):
+    def reset_extended_embeddings(self, ):
         indices = torch.randint(self.num_embeddings, (self.additional_tokens,))
-        indices[0] = 1
-        indices[self.additional_tokens-1] = 1
-        indices[self.additional_tokens-2] = 2
         extended_embeddings = self.weight[indices]
-        print("Using: ", indices)
         self.extended_weight = nn.Parameter(extended_embeddings)
 
 
@@ -886,15 +887,15 @@ def initialize_pefts(model):
     model.model.embed_tokens.reset_extended_embeddings()
     for layer in model.model.layers:
         layer.self_attn.q_proj.reset_lora_parameters()
-        layer.self_attn.k_proj.reset_lora_parameters()
-        layer.self_attn.v_proj.reset_lora_parameters()
+        layer.self_attn.hyper_k_proj.weight = nn.Parameter(layer.self_attn.k_proj.weight.detach().clone())
+        layer.self_attn.hyper_v_proj.weight = nn.Parameter(layer.self_attn.v_proj.weight.detach().clone())
         layer.self_attn.o_proj.reset_lora_parameters()
         layer.mlp.gate_proj.reset_lora_parameters()
         layer.mlp.up_proj.reset_lora_parameters()
         layer.mlp.down_proj.reset_lora_parameters()
     # model.lm_head.reset_lora_parameters()
     for k, v in model.named_parameters():
-        if "lora" in k or "extended" in k:
+        if "lora" in k or "extended" in k or "hyper" in k:
             v.requires_grad_(True)
         else:
             v.requires_grad_(False)

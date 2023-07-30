@@ -1,3 +1,5 @@
+import os
+import torch
 from functools import partial
 import torch.optim.lr_scheduler as lr_scheduler
 
@@ -39,3 +41,14 @@ def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
         num_training_steps=num_training_steps,
     )
     return lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch)
+
+
+if os.environ.get("CHECK_NAN"):
+    def check_nan(x):
+        if torch.isnan(x).any():
+            import pdb
+            pdb.set_trace()
+else:
+    # noinspection PyUnusedLocal
+    def check_nan(x):
+        pass
