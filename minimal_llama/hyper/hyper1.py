@@ -831,7 +831,7 @@ class NoInitExtendedEmbedding(nn.Embedding):
         indices[0] = 1
         indices[self.additional_tokens-1] = 1
         indices[self.additional_tokens-2] = 2
-        extended_embeddings = self.weight[indices]
+        extended_embeddings = self.weight[indices].data
         print("Using: ", indices)
         self.extended_weight = nn.Parameter(extended_embeddings)
 

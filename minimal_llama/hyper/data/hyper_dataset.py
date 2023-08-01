@@ -15,8 +15,10 @@ RIGHT = "right"
 VOCAB_SIZE = 32_000
 
 # hard-coded for now
-HYPER_INPUT_INDICATOR = [32255]
-HYPER_OUTPUT_INDICATOR = [32254]
+# HYPER_INPUT_INDICATOR = [32255]
+# HYPER_OUTPUT_INDICATOR = [32254]
+HYPER_INPUT_INDICATOR = [13, 10567, 29901, 13]
+HYPER_OUTPUT_INDICATOR = [13, 10604, 29901, 13]
 
 
 def pad(input_ids: list, max_length: int, side: str,
@@ -62,7 +64,9 @@ def format_hyper_inputs(example):
 
 def format_input_ids(example, max_downstream_length=None):
     input_ids = (
-        example["inputs"]
+        HYPER_INPUT_INDICATOR
+        + example["inputs"]
+        + HYPER_OUTPUT_INDICATOR
         + example["targets"]
         + [EOS_TOKEN_ID]
     )
@@ -74,7 +78,9 @@ def format_input_ids(example, max_downstream_length=None):
 
 def format_labels(example, max_downstream_length=None):
     labels = (
-        [NON_LABEL_TOKEN_ID] * len(example["inputs"])
+        [NON_LABEL_TOKEN_ID] * len(HYPER_INPUT_INDICATOR)
+        + [NON_LABEL_TOKEN_ID] * len(example["inputs"])
+        + [NON_LABEL_TOKEN_ID] * len(HYPER_OUTPUT_INDICATOR)
         + example["targets"]
         + [EOS_TOKEN_ID]
     )
