@@ -221,6 +221,8 @@ def create_gist_attention_mask(gist_token_type):
 
 
 def create_multigist_attention_mask(input_ids, num_gist_tokens):
+    if isinstance(input_ids, list):
+        input_ids = np.array(input_ids)
     first_gist_token_id = 32_000
     input_len = len(input_ids)
     mask = torch.ones([input_len, input_len]).tril().bool()

@@ -80,13 +80,14 @@ class LLaMAModel(nn.Module):
         self.lm_head = create_linear(config.dim, config.vocab_size, dtype=config.dtype,
                                      use_4bit=config.use_4bit, use_lora=False, device=config.device)
 
-    def forward(self,
-                hyper_input_ids,
-                input_ids):
-        return self.train_forward_pass(
-            hyper_input_ids=hyper_input_ids,
-            input_ids=input_ids,
-        )
+    def forward(self, input_ids, attention_mask, mode=MODE_TRAIN):
+        if mode == MODE_TRAIN:
+            return self.train_forward_pass(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+        else:
+            raise KeyError(mode)
 
     def train_forward_pass(
         self,
@@ -311,13 +312,12 @@ class LLaMAInnerModel(nn.Module):
         :param input_ids: [batch_size, seq_len]
         :param cos:
         :param sin:
-        :param mode:
         :param attention_mask: [batch_size, num_heads, q_len, kv_len]
         """
         hidden_states = self.embed_tokens(input_ids, use_extended=True)
         hidden_states = hidden_states.to(self.config.dtype)
         hyper_hidden_states = hidden_states
-        is_gist = (input_ids >= self.config.vocab_size).bfloat()
+        is_gist = (input_ids >= self.config.vocab_size).bfloat16()
 
         for layer_i, layer in enumerate(self.layers):
             if self.config.gradient_checkpointing:
@@ -557,8 +557,10 @@ class Attention(nn.Module):
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos=cos, sin=sin)
         hyper_query_states, hyper_key_states = apply_rotary_pos_emb(
             hyper_query_states, hyper_key_states, cos=cos, sin=sin)
-        key_states = key_states * not_gist + hyper_key_states * is_gist
-        value_states = value_states * not_gist + hyper_value_states * is_gist
+        key_states = key_states * not_gist[..., None] + hyper_key_states * is_gist[..., None]
+        value_states = value_states * not_gist[..., None] + hyper_value_states * is_gist[..., None]
+        key_states = key_states.to(self.config.dtype)
+        value_states = value_states.to(self.config.dtype)
 
         # noinspection PyUnresolvedReferences
         with torch.backends.cuda.sdp_kernel(
@@ -858,10 +860,18 @@ def create_model(model_name, hf_path, use_4bit=False, device=None, config=None):
                 if "lm_head" in k or "layernorm" in k or ".norm" in k:
                     v = v.to(config.dtype)
                 set_module_quantized_tensor_to_device(model, tensor_name=k, device=device, value=v)
+
+                # Handle hyper layers
+                if "k_proj.weight" in k or "v_proj.weight" in k:
+                    hyper_key = k.replace("k_proj", "hyper_k_proj").replace("v_proj", "hyper_v_proj")
+                    model.load_state_dict({hyper_key: v}, strict=False)
+                    state_keys.remove(hyper_key)
+
                 state_keys.remove(k)
         for k in list(state_keys):
             if "lora" in k or "extended" in k:
                 state_keys.remove(k)
+
         assert not state_keys
     else:
         # noinspection PyUnresolvedReferences
@@ -887,8 +897,8 @@ def initialize_pefts(model):
     model.model.embed_tokens.reset_extended_embeddings()
     for layer in model.model.layers:
         layer.self_attn.q_proj.reset_lora_parameters()
-        layer.self_attn.hyper_k_proj.weight = nn.Parameter(layer.self_attn.k_proj.weight.detach().clone())
-        layer.self_attn.hyper_v_proj.weight = nn.Parameter(layer.self_attn.v_proj.weight.detach().clone())
+        # layer.self_attn.hyper_k_proj.weight = nn.Parameter(layer.self_attn.k_proj.weight.detach().clone())
+        # layer.self_attn.hyper_v_proj.weight = nn.Parameter(layer.self_attn.v_proj.weight.detach().clone())
         layer.self_attn.o_proj.reset_lora_parameters()
         layer.mlp.gate_proj.reset_lora_parameters()
         layer.mlp.up_proj.reset_lora_parameters()
