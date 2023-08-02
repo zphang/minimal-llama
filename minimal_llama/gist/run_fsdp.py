@@ -155,10 +155,15 @@ def run():
             if local_rank == 0:
                 print(batch_metadata["curr_step"], "Mem:", torch.cuda.max_memory_allocated(device), loss.item())
 
-    fsdp_utils.save_model_and_optimizer_sharded(
-        model, rank, save_using_num_threads=6,
-        save_dir=args.save_dir,
-        optim=optimizer,
+    # fsdp_utils.save_model_and_optimizer_sharded(
+    #     model, rank, save_using_num_threads=6,
+    #     save_dir=args.save_dir,
+    #     optim=optimizer,
+    # )
+    fsdp_utils.save_model_checkpoint(
+        model=model,
+        rank=rank,
+        save_path=os.path.join(args.save_dir, f"model.p"),
     )
 
     if local_rank == 0:

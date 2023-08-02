@@ -120,7 +120,6 @@ def save_model_and_optimizer_sharded(model, rank, save_using_num_threads: int, s
             state_dict=state_dict,
             storage_writer=distributed_writer,
             planner=DefaultSavePlanner(),
-
         )
     dist.barrier()
     t1 = time.perf_counter()
@@ -129,6 +128,31 @@ def save_model_and_optimizer_sharded(model, rank, save_using_num_threads: int, s
         print(
             f"Checkpoint Time = {t1 - t0:.4f}\n using {save_using_num_threads=} total threads"
         )
+
+
+def load_model_and_optimizer_sharded(model, rank, load_dir, optim=None):
+    """save model and optimizer via sharded_state_dict to save_dir"""
+    if rank == 0:
+        print(f"Loading model from {load_dir}")
+
+    distributed_writer = dist_cp.FileSystemReader(load_dir)
+    dist.barrier()
+    with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
+
+        state_dict = {"model": model.state_dict()}
+        if optim is not None:
+            state_dict["optim"] = FSDP.optim_state_dict(model, optim)
+
+        if rank == 0:
+            print("Loading.")
+        dist_cp.load_state_dict(
+            state_dict=state_dict,
+            storage_reader=distributed_writer,
+            planner=DefaultLoadPlanner(),
+        )
+        if rank == 0:
+            print("Loaded.")
+    dist.barrier()
 
 
 def save_optimizer_checkpoint(model, optimizer, rank, optimizer_save_path):
@@ -149,3 +173,19 @@ def load_optimizer_checkpoint(model, optimizer, rank, optimizer_load_path):
     # called from all ranks, though only rank0 has a valid param for full_osd
     sharded_osd = FSDP.scatter_full_optim_state_dict(full_osd, model)
     optimizer.load_state_dict(sharded_osd)
+
+
+def save_model_checkpoint(model, rank, save_path, fullstate_save_policy=None):
+    if not fullstate_save_policy:
+        fullstate_save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    dist.barrier()
+    with FSDP.state_dict_type(
+        model, StateDictType.FULL_STATE_DICT, fullstate_save_policy
+    ):
+        cpu_state = model.state_dict()
+    if rank == 0:
+        print("Saving.")
+        torch.save(cpu_state, save_path)
+        print("Saved.")
+    dist.barrier()
+    print("rank", rank, "done")
