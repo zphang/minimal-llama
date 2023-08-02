@@ -31,6 +31,7 @@ class LLaMAConfig:
     num_gist_tokens: int = 256
     lora_rank: int = 8
     device: Optional[torch.device] = None
+    use_full_kv: bool = False
 
     @property
     def head_dim(self):
@@ -317,6 +318,7 @@ class LLaMAInnerModel(nn.Module):
         hidden_states = self.embed_tokens(input_ids, use_extended=True)
         hidden_states = hidden_states.to(self.config.dtype)
         hyper_hidden_states = hidden_states
+        # is_gist: [batch_size, seq_len]
         is_gist = (input_ids >= self.config.vocab_size).bfloat16()
 
         for layer_i, layer in enumerate(self.layers):
@@ -393,7 +395,7 @@ class LLaMALayer(nn.Module):
     ):
         # 1) Self-attention
         # [batch_size, seq_len, hidden_dim]
-        normed_hyper_hidden_states = self.input_layernorm(hidden_states).to(self.config.dtype)
+        normed_hyper_hidden_states = self.input_layernorm(hyper_hidden_states).to(self.config.dtype)
         normed_hidden_states = self.input_layernorm(hidden_states).to(self.config.dtype)
         # dict(
         #   attn_output = [batch_size, seq_len, hidden_dim]
@@ -411,23 +413,23 @@ class LLaMALayer(nn.Module):
             is_gist=is_gist,
         )
         # [batch_size, seq_len, hidden_dim]
-        hidden_states = hidden_states + attn_output["attn_output"]
-        torch_utils.check_nan(hidden_states)
         hyper_hidden_states = hyper_hidden_states + attn_output["hyper_attn_output"]
+        hidden_states = hidden_states + attn_output["attn_output"]
         torch_utils.check_nan(hyper_hidden_states)
+        torch_utils.check_nan(hidden_states)
+        hyper_hidden_states = hyper_hidden_states + self.mlp(
+            self.post_attention_layernorm(hyper_hidden_states),
+            use_pefts=True,
+        )
         hidden_states = hidden_states + self.mlp(
             self.post_attention_layernorm(hidden_states),
             use_pefts=False,
         )
-        torch_utils.check_nan(hidden_states)
-        hyper_hidden_states = hyper_hidden_states + self.mlp(
-            self.post_attention_layernorm(hidden_states),
-            use_pefts=True,
-        )
         torch_utils.check_nan(hyper_hidden_states)
+        torch_utils.check_nan(hidden_states)
         return {
-            "hidden_states": hidden_states,
             "hyper_hidden_states": hyper_hidden_states,
+            "hidden_states": hidden_states,
         }
 
 
@@ -483,18 +485,24 @@ class Attention(nn.Module):
         self.head_dim = config.dim // config.n_heads
 
         self.q_proj = create_linear(config.dim, config.dim, dtype=config.dtype, use_4bit=config.use_4bit,
-                                    rank=config.lora_rank)
-        self.k_proj = create_linear(config.dim, config.dim, dtype=config.dtype, use_4bit=True,
-                                    use_lora=False)
-        self.v_proj = create_linear(config.dim, config.dim, dtype=config.dtype, use_4bit=True,
-                                    use_lora=False)
+                                    use_lora=True, rank=config.lora_rank)
         self.o_proj = create_linear(config.dim, config.dim, dtype=config.dtype, use_4bit=config.use_4bit,
-                                    rank=config.lora_rank)
+                                    use_lora=True, rank=config.lora_rank)
 
-        self.hyper_k_proj = create_linear(config.dim, config.dim, dtype=config.dtype, use_4bit=False,
-                                          use_lora=False)
-        self.hyper_v_proj = create_linear(config.dim, config.dim, dtype=config.dtype, use_4bit=False,
-                                          use_lora=False)
+        if config.use_full_kv:
+            self.hyper_k_proj = create_linear(config.dim, config.dim, dtype=config.dtype, use_4bit=False,
+                                              use_lora=False)
+            self.hyper_v_proj = create_linear(config.dim, config.dim, dtype=config.dtype, use_4bit=False,
+                                              use_lora=False)
+            self.k_proj = create_linear(config.dim, config.dim, dtype=config.dtype, use_4bit=True,
+                                        use_lora=False)
+            self.v_proj = create_linear(config.dim, config.dim, dtype=config.dtype, use_4bit=True,
+                                        use_lora=False)
+        else:
+            self.k_proj = create_linear(config.dim, config.dim, dtype=config.dtype, use_4bit=True,
+                                        use_lora=True, rank=config.lora_rank)
+            self.v_proj = create_linear(config.dim, config.dim, dtype=config.dtype, use_4bit=True,
+                                        use_lora=True, rank=config.lora_rank)
 
         self.rotary_emb = RotaryEmbedding(dim=self.head_dim, max_position_embeddings=config.max_seq_length)
 
@@ -538,29 +546,49 @@ class Attention(nn.Module):
         :return:
         """
         batch_size, q_seq_len, hidden_dim = hidden_states.size()
+        # is_gist: [batch_size, 1, seq_len]
         is_gist = is_gist[:, None]
         not_gist = (1 - is_gist)
 
         # (batch_size, num_heads, q_seq_len, head_dim)
-        hyper_query_states = self.q_proj(hyper_hidden_states, use_lora=True).view(
+        hyper_query_states = self.q_proj(hyper_hidden_states, use_lora=True)
+        query_states = self.q_proj(hidden_states, use_lora=False)
+
+        if self.config.use_full_kv:
+            hyper_key_states = self.hyper_k_proj(hyper_hidden_states)
+            hyper_value_states = self.hyper_v_proj(hyper_hidden_states)
+            key_states = self.k_proj(hidden_states)
+            value_states = self.v_proj(hidden_states)
+        else:
+            hyper_key_states = self.k_proj(hyper_hidden_states, use_lora=True)
+            hyper_value_states = self.v_proj(hyper_hidden_states, use_lora=True)
+            key_states = self.k_proj(hidden_states, use_lora=False)
+            value_states = self.v_proj(hidden_states, use_lora=False)
+
+        hyper_query_states = hyper_query_states.view(
             batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        hyper_key_states = self.hyper_k_proj(hyper_hidden_states).view(
+        hyper_key_states = hyper_key_states.view(
             batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        hyper_value_states = self.hyper_v_proj(hyper_hidden_states).view(
+        hyper_value_states = hyper_value_states.view(
             batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        query_states = self.q_proj(hidden_states, use_lora=False).view(
+        query_states = query_states.view(
             batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(
+        key_states = key_states.view(
             batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(
+        value_states = value_states.view(
             batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos=cos, sin=sin)
+
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos=cos, sin=sin)
         hyper_query_states, hyper_key_states = apply_rotary_pos_emb(
             hyper_query_states, hyper_key_states, cos=cos, sin=sin)
+
         key_states = key_states * not_gist[..., None] + hyper_key_states * is_gist[..., None]
         value_states = value_states * not_gist[..., None] + hyper_value_states * is_gist[..., None]
         key_states = key_states.to(self.config.dtype)
         value_states = value_states.to(self.config.dtype)
+        hyper_key_states = hyper_key_states.to(self.config.dtype)
+        hyper_value_states = hyper_value_states.to(self.config.dtype)
 
         # noinspection PyUnresolvedReferences
         with torch.backends.cuda.sdp_kernel(
@@ -597,12 +625,22 @@ class Attention(nn.Module):
         is_gist_token = is_gist.bool()
 
         # (batch_size, num_heads, q_seq_len, head_dim)
-        hyper_query_states = self.q_proj(hyper_hidden_states, use_lora=True).view(
+        hyper_query_states = self.q_proj(hyper_hidden_states, use_lora=True)
+
+        if self.config.use_full_kv:
+            hyper_key_states = self.hyper_k_proj(hyper_hidden_states)
+            hyper_value_states = self.hyper_v_proj(hyper_hidden_states)
+        else:
+            hyper_key_states = self.k_proj(hyper_hidden_states, use_lora=True)
+            hyper_value_states = self.v_proj(hyper_hidden_states, use_lora=True)
+
+        hyper_query_states = hyper_query_states.view(
             batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        hyper_key_states = self.hyper_k_proj(hyper_hidden_states).view(
+        hyper_key_states = hyper_key_states.view(
             batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        hyper_value_states = self.hyper_v_proj(hyper_hidden_states).view(
+        hyper_value_states = hyper_value_states.view(
             batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+
         unrotated_hyper_key_states = hyper_key_states
         hyper_query_states, hyper_key_states = apply_rotary_pos_emb(
             hyper_query_states, hyper_key_states, cos=cos, sin=sin)
@@ -814,7 +852,8 @@ class NoInitExtendedEmbedding(nn.Embedding):
         self.weight.requires_grad_(False)
         self.extended_weight = nn.Parameter(torch.empty([
             self.additional_tokens, embedding_dim
-        ], device=device), requires_grad=True)
+        ], device=device, dtype=dtype), requires_grad=True)
+        self.dtype = dtype
 
     def forward(self, input_ids: torch.Tensor, use_extended: bool = False) -> torch.Tensor:
         if not use_extended:
@@ -835,11 +874,15 @@ class NoInitExtendedEmbedding(nn.Embedding):
 
     def reset_extended_embeddings(self, ):
         indices = torch.randint(self.num_embeddings, (self.additional_tokens,))
-        extended_embeddings = self.weight[indices]
+        indices[0] = 1
+        indices[self.additional_tokens-1] = 1
+        indices[self.additional_tokens-2] = 2
+        extended_embeddings = self.weight[indices].detach().clone().to(self.dtype)
+        print("Using: ", indices)
         self.extended_weight = nn.Parameter(extended_embeddings)
 
 
-def create_model(model_name, hf_path, use_4bit=False, device=None, config=None):
+def create_model(model_name, hf_path, use_4bit=False, device=None, config: Optional[LLaMAConfig] = None):
     if config is None:
         config = LLAMA_CONFIG_DICT[model_name]
     weight_map = io_utils.read_json(os.path.join(hf_path, "pytorch_model.bin.index.json"))["weight_map"]
@@ -852,6 +895,14 @@ def create_model(model_name, hf_path, use_4bit=False, device=None, config=None):
         config = dataclasses.replace(config, use_4bit=True)
         with init_empty_weights():
             model = LLaMAModel(config=config)
+        if config.use_full_kv:
+            for layer_i in range(config.n_layers):
+                model.model.layers[layer_i].self_attn.hyper_k_proj.weight = nn.Parameter(
+                    torch.empty([config.dim, config.dim], dtype=config.dtype),
+                )
+                model.model.layers[layer_i].self_attn.hyper_v_proj.weight = nn.Parameter(
+                    torch.empty([config.dim, config.dim], dtype=config.dtype),
+                )
         state_keys = set(model.state_dict())
         filename_list = sorted(list(set(weight_map.values())))
         for filename in tqdm.tqdm(filename_list):
@@ -862,10 +913,11 @@ def create_model(model_name, hf_path, use_4bit=False, device=None, config=None):
                 set_module_quantized_tensor_to_device(model, tensor_name=k, device=device, value=v)
 
                 # Handle hyper layers
-                if "k_proj.weight" in k or "v_proj.weight" in k:
-                    hyper_key = k.replace("k_proj", "hyper_k_proj").replace("v_proj", "hyper_v_proj")
-                    model.load_state_dict({hyper_key: v}, strict=False)
-                    state_keys.remove(hyper_key)
+                if config.use_full_kv:
+                    if "k_proj.weight" in k or "v_proj.weight" in k:
+                        hyper_key = k.replace("k_proj", "hyper_k_proj").replace("v_proj", "hyper_v_proj")
+                        model.load_state_dict({hyper_key: v}, strict=False)
+                        state_keys.remove(hyper_key)
 
                 state_keys.remove(k)
         for k in list(state_keys):
@@ -897,8 +949,13 @@ def initialize_pefts(model):
     model.model.embed_tokens.reset_extended_embeddings()
     for layer in model.model.layers:
         layer.self_attn.q_proj.reset_lora_parameters()
-        # layer.self_attn.hyper_k_proj.weight = nn.Parameter(layer.self_attn.k_proj.weight.detach().clone())
-        # layer.self_attn.hyper_v_proj.weight = nn.Parameter(layer.self_attn.v_proj.weight.detach().clone())
+        if model.config.use_full_kv:
+            layer.self_attn.hyper_k_proj.weight = nn.Parameter(layer.self_attn.k_proj.weight.detach().clone())
+            layer.self_attn.hyper_v_proj.weight = nn.Parameter(layer.self_attn.v_proj.weight.detach().clone())
+        else:
+            layer.self_attn.k_proj.reset_lora_parameters()
+            layer.self_attn.v_proj.reset_lora_parameters()
+
         layer.self_attn.o_proj.reset_lora_parameters()
         layer.mlp.gate_proj.reset_lora_parameters()
         layer.mlp.up_proj.reset_lora_parameters()

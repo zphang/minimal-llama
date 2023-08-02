@@ -9,7 +9,8 @@ import wandb
 import accelerate
 import datasets
 import datasets.distributed
-
+import bitsandbytes
+from torch.distributed.optim import ZeroRedundancyOptimizer
 import minimal_llama.hyper.hyper2 as hyper2
 import minimal_llama.hyper.data.hyper_dataset2 as hyper_dataset2
 import minimal_llama.utils.torch_utils as torch_utils
@@ -20,6 +21,7 @@ def run():
     parser.add_argument("--hf_path", type=str)
     parser.add_argument("--dataset_path", type=str)
     parser.add_argument("--dataset_type", type=str, default="pre")
+    parser.add_argument("--max_input_length", type=int, default=1024)
     parser.add_argument("--save_dir", type=str)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--lora_rank", type=int, default=8)
@@ -72,8 +74,19 @@ def run():
         use_4bit=True,
         device=device,
     )
-    # optimizer = bitsandbytes.optim.AdamW(model.parameters(), lr=args.lr, is_paged=True, optim_bits=32)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.99))
+    optimizer = bitsandbytes.optim.AdamW(model.parameters(), lr=args.lr, is_paged=True, optim_bits=32)
+    # optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.99))
+    # trainable_params = [p for p in model.parameters() if p.requires_grad]
+    # for k, v in model.named_parameters():
+    #     if v.requires_grad:
+    #         print0(k, v.dtype)
+    #         if v.dtype != torch.bfloat16:
+    #             raise RuntimeError(f"WARNING: {k} is not bf16")
+    # accelerator.wait_for_everyone()
+    # optimizer = ZeroRedundancyOptimizer(
+    #     trainable_params, lr=args.lr,
+    #     optimizer_class=torch.optim.AdamW,
+    # )
     save_model = model
 
     if args.lr_scheduler:
@@ -125,6 +138,7 @@ def run():
     elif args.dataset_type == "hyper":
         ds = hyper_dataset2.FewshotHyperTrainDataset(
             args.dataset_path, seed_offset=accelerator.process_index * 1000,
+            max_input_length=args.max_input_length,
         )
         train_iterator = get_hyper_train_iterator(
             ds,
@@ -146,12 +160,12 @@ def run():
         # print(f"Rank: {accelerator.process_index}", batch["input_ids"][0, 0:8])
         with accelerator.accumulate(model):
             logits = model(
-                hyper_input_ids=batch["hyper_input_ids"].to(device),
-                input_ids=batch["input_ids"][:, :-1].to(device),
-            )
+                input_ids=batch["input_ids"].to(device),
+                attention_mask=batch["attention_mask"].to(device),
+            )["logits"]
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
-                batch["labels"][:, 1:].reshape(-1).to(device),
+                batch["labels"].reshape(-1).to(device),
             )
             # print(f"Rank: {accelerator.process_index}, Loss: {loss}, Step: {batch_metadata['curr_step']}")
             if torch.isnan(loss):
@@ -196,13 +210,19 @@ def run():
 
 
 def data_collator(features: list) -> dict:
-    keys = features[0].keys()
     batch = {
-        k: torch.stack([
-            torch.LongTensor(f[k])
+        "input_ids": torch.stack([
+            torch.LongTensor(f["input_ids"])
             for f in features
-        ])
-        for k in keys
+        ]),
+        "labels": torch.stack([
+            torch.LongTensor(f["labels"])
+            for f in features
+        ]),
+        "attention_mask": torch.stack([
+            torch.BoolTensor(f["attention_mask"])
+            for f in features
+        ]),
     }
     return batch
 

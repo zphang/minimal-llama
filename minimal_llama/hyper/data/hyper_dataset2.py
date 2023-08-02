@@ -154,6 +154,9 @@ class FewshotHyperTrainIterator:
         elif len(input_ids) > self.max_input_length:
             input_ids = truncate(input_ids, max_length=self.max_input_length, side=RIGHT)
             labels = truncate(labels, max_length=self.max_input_length, side=RIGHT)
+
+        input_ids = input_ids[:-1]
+        labels = labels[1:]
         attention_mask = create_multigist_attention_mask(input_ids, self.num_gist_tokens)
 
         return {
