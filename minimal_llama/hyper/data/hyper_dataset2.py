@@ -16,7 +16,8 @@ RIGHT = "right"
 VOCAB_SIZE = 32_000
 
 DEFAULT_START_TOKEN = 32_255
-DEFAULT_SEP_TOKEN = 32_254
+# DEFAULT_SEP_TOKEN = 32_254
+DEFAULT_SEP_TOKEN = 2
 
 
 def pad(input_ids: list, max_length: int, side: str,
@@ -61,7 +62,8 @@ def format_labels(example, start_tokens, sep_tokens):
     return (
         [NON_LABEL_TOKEN_ID] * len(start_tokens)
         + [NON_LABEL_TOKEN_ID] * len(example["inputs"])
-        + [NON_LABEL_TOKEN_ID] * len(sep_tokens)
+        # + [NON_LABEL_TOKEN_ID] * len(sep_tokens)
+        + sep_tokens
         + example["targets"]
     )
 

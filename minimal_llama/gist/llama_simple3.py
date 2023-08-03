@@ -72,6 +72,8 @@ class LLaMAModel(nn.Module):
         self.config = config
         self.model = LLaMAInnerModel(config)
         self.lm_head = NoInitLinear(config.dim, config.vocab_size, bias=False, dtype=config.dtype)
+        # self.lm_head = create_linear(config.dim, config.vocab_size, dtype=config.dtype,
+        #                              use_4bit=config.use_4bit, bias=False)
 
     def forward(self,
                 input_ids,
@@ -201,7 +203,7 @@ class LLaMAModel(nn.Module):
                 max_seq_len=total_seq_len,
                 initial_max_len=original_input_ids.shape[1]
             ).to(input_ids.device)
-            rope_embed_ids += num_valid_tokens[:, None]
+            rope_embed_ids += num_valid_tokens[:, None] - 1
             cos, sin = self.get_cos_sin(rope_embed_ids)
             model_out = self.model(
                 input_ids=input_ids,

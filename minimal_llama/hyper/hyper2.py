@@ -81,8 +81,9 @@ class LLaMAModel(nn.Module):
         super().__init__()
         self.config = config
         self.model = LLaMAInnerModel(config)
-        self.lm_head = create_linear(config.dim, config.vocab_size, dtype=config.dtype,
-                                     use_4bit=config.use_4bit, use_lora=False, device=config.device)
+        self.lm_head = NoInitLinear(config.dim, config.vocab_size, bias=False, dtype=config.dtype)
+        # self.lm_head = create_linear(config.dim, config.vocab_size, dtype=config.dtype,
+        #                              use_4bit=config.use_4bit, use_lora=False, device=config.device)
 
     def forward(self, input_ids, attention_mask, mode=MODE_TRAIN):
         if mode == MODE_TRAIN:
@@ -217,7 +218,7 @@ class LLaMAModel(nn.Module):
                 max_seq_len=total_seq_len + prefix_length,
                 initial_max_len=original_input_ids.shape[1] + prefix_length,
             ).to(input_ids.device)
-            rope_embed_ids += num_valid_tokens[:, None] + prefix_length
+            rope_embed_ids += num_valid_tokens[:, None] + prefix_length - 1
             cos, sin = self.get_cos_sin(rope_embed_ids)
             model_out = self.model(
                 input_ids=input_ids,
@@ -320,7 +321,11 @@ class LLaMAInnerModel(nn.Module):
         hidden_states = hidden_states.to(self.config.dtype)
         hyper_hidden_states = hidden_states
         # is_gist: [batch_size, seq_len]
-        is_gist = (input_ids >= self.config.vocab_size).bfloat16()
+        # is_gist = (input_ids >= self.config.vocab_size).bfloat16()
+        is_gist = (
+            (input_ids >= self.config.vocab_size)
+            & (input_ids < self.config.vocab_size + self.config.actual_num_gist_tokens)
+        ).bfloat16()
 
         for layer_i, layer in enumerate(self.layers):
             if self.config.gradient_checkpointing:
@@ -688,6 +693,7 @@ class Attention(nn.Module):
 
         key_states = key_states * not_gist[..., None] + hyper_key_states * is_gist[..., None]
         value_states = value_states * not_gist[..., None] + hyper_value_states * is_gist[..., None]
+
         key_states = key_states.to(self.config.dtype)
         value_states = value_states.to(self.config.dtype)
         hyper_key_states = hyper_key_states.to(self.config.dtype)
@@ -772,7 +778,7 @@ class Attention(nn.Module):
             "hyper_attn_output": hyper_attn_output,
             "gist_cache": {
                 "key": select_gist_tokens(unrotated_hyper_key_states, gist_tokens_selector=gist_tokens_selector),
-                "value": select_gist_tokens(hyper_key_states, gist_tokens_selector=gist_tokens_selector),
+                "value": select_gist_tokens(hyper_value_states, gist_tokens_selector=gist_tokens_selector),
             }
         }
 
