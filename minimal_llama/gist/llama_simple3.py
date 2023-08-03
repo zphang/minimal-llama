@@ -431,7 +431,8 @@ class Attention(nn.Module):
         self.o_proj = create_linear(config.dim, config.dim, bias=False, dtype=config.dtype, use_4bit=config.use_4bit)
         self.rotary_emb = RotaryEmbedding(dim=self.head_dim, max_position_embeddings=config.max_seq_length)
 
-    def forward(self, hidden_states, cos, sin,
+    def forward(self,
+                hidden_states, cos, sin,
                 use_kv_cache=False,
                 kv_cache=None,
                 num_valid_tokens=None,

@@ -14,13 +14,15 @@ import minimal_llama.utils.io_utils as io_utils
 import minimal_llama.utils.torch_utils as torch_utils
 from transformers.utils.bitsandbytes import set_module_quantized_tensor_to_device
 
+VOCAB_SIZE = 32_000
+
 
 @dataclasses.dataclass
 class LLaMAConfig:
     dim: int
     n_layers: int
     n_heads: int
-    vocab_size: int = 32000
+    vocab_size: int = VOCAB_SIZE
     max_seq_length: int = 2048
     dtype: torch.Type = torch.float16
     pad_token_id: int = 0
@@ -32,6 +34,7 @@ class LLaMAConfig:
     lora_rank: int = 8
     device: Optional[torch.device] = None
     use_full_kv: bool = False
+    actual_num_gist_tokens: int = 16
 
     @property
     def head_dim(self):
@@ -111,32 +114,24 @@ class LLaMAModel(nn.Module):
         logits = self.lm_head(model_out["hidden_states"])
         return {"logits": logits}
 
-    def init_kv_cache(self, batch_size):
-        # noinspection GrazieInspection
-        """Initialize an empty KV cache for decoding.
-
-        A KV cache consists of a list of dicts (one per layer):
-            dict(
-              key = [batch_size, num_heads, kv_seq_len=0, head_dim]
-              value = [batch_size, num_heads, kv_seq_len=0, head_dim]
-            )
-
-        :param batch_size
-        :return: 0-length kv_cache
-        """
-        kv_cache = []
-        num_heads = self.config.n_heads
-        head_dim = self.config.head_dim
-        for layer in self.model.layers:
-            device = layer.input_layernorm.weight.device
-            kv_cache.append({
-                "key": torch.zeros([batch_size, num_heads, 0, head_dim]).to(device=device, dtype=self.config.dtype),
-                "value": torch.zeros([batch_size, num_heads, 0, head_dim]).to(device=device, dtype=self.config.dtype),
-            })
-        return kv_cache
+    def inference_hyper(self, input_ids, gist_cache=None):
+        rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
+        cos, sin = self.get_cos_sin(rope_embed_ids)
+        gist_cache = self.model.inference_hyper(
+            input_ids=input_ids,
+            cos=cos, sin=sin,
+            gist_cache=gist_cache,
+        )
+        gist_rope_embed_ids = torch.arange(
+            self.config.actual_num_gist_tokens
+        )[None].expand(input_ids.shape[0], -1).to(input_ids.device).long()
+        new_cos, new_sin = self.get_cos_sin(gist_rope_embed_ids)
+        for gist in gist_cache:
+            gist["key"] = apply_single_rotary_pos_emb(gist["key"], new_cos, new_sin)
+        return gist_cache
 
     def downstream_generate(self,
-                            input_ids, gist_cache, t_offset,
+                            input_ids, gist_cache,
                             generation_length: int = 20,
                             return_output_only=True, stop_on_eos=True):
         """Generate tokens with efficient caching of KV.
@@ -147,7 +142,6 @@ class LLaMAModel(nn.Module):
         :param input_ids: [batch_size, input_seq_len]
             - Always right-padded. Masks are generated based on padding tokens
         :param gist_cache:
-        :param t_offset: [batch_size]
         :param generation_length: int
         :param return_output_only: True = return continuation only. False = return whole sequence
         :param stop_on_eos
@@ -159,7 +153,6 @@ class LLaMAModel(nn.Module):
         num_valid_tokens = (input_ids != self.config.pad_token_id).long().sum(dim=1)
         orig_num_valid_tokens = num_valid_tokens.clone()
         seen_eos = torch.zeros([batch_size], dtype=torch.bool).to(device=input_ids.device)
-        t_offset = t_offset[:, None]
         prefix_length = gist_cache[0]["key"].shape[2]
 
         # 1) Setup
@@ -181,7 +174,7 @@ class LLaMAModel(nn.Module):
         #     value = [batch_size, num_heads, kv_seq_len=decode_step+1, head_dim]
         #   )]
         # )
-        rope_embed_ids = (create_rope_embed_ids(input_ids=input_ids) + prefix_length + t_offset).clamp(
+        rope_embed_ids = (create_rope_embed_ids(input_ids=input_ids) + prefix_length).clamp(
             max=self.config.max_seq_length - 1,
         )
         cos, sin = self.get_cos_sin(rope_embed_ids)
@@ -189,10 +182,9 @@ class LLaMAModel(nn.Module):
         model_out = self.model(
             input_ids=input_ids,
             cos=cos, sin=sin,
-            mode=MODE_DOWNSTREAM_ENCODE,
+            mode=MODE_INFERENCE_DOWNSTREAM_ENCODE,
             attention_mask=attention_mask,
             kv_cache=gist_cache,
-            num_valid_tokens=num_valid_tokens,
         )
         logits = self.lm_head(model_out["hidden_states"])
         kv_cache = model_out["kv_cache"]
@@ -225,14 +217,13 @@ class LLaMAModel(nn.Module):
                 max_seq_len=total_seq_len + prefix_length,
                 initial_max_len=original_input_ids.shape[1] + prefix_length,
             ).to(input_ids.device)
-            rope_embed_ids += num_valid_tokens[:, None] + prefix_length + t_offset
+            rope_embed_ids += num_valid_tokens[:, None] + prefix_length
             cos, sin = self.get_cos_sin(rope_embed_ids)
             model_out = self.model(
                 input_ids=input_ids,
                 cos=cos, sin=sin,
-                mode=MODE_DOWNSTREAM_DECODE,
+                mode=MODE_INFERENCE_DOWNSTREAM_DECODE,
                 kv_cache=kv_cache,
-                num_valid_tokens=num_valid_tokens,
                 attention_mask=decoding_attention_mask,
             )
             # [batch_size, dec_seq_len=1, vocab_size]
@@ -299,7 +290,17 @@ class LLaMAInnerModel(nn.Module):
                 attention_mask=attention_mask,
             )
         elif mode == MODE_INFERENCE_HYPER:
-            raise NotImplementedError
+            return self.inference_hyper(
+                input_ids=input_ids,
+                cos=cos, sin=sin,
+            )
+        elif mode in (MODE_INFERENCE_DOWNSTREAM_ENCODE, MODE_INFERENCE_DOWNSTREAM_DECODE):
+            return self.inference_generate(
+                input_ids=input_ids,
+                cos=cos, sin=sin,
+                kv_cache=kv_cache,
+                attention_mask=attention_mask,
+            )
         else:
             raise NotImplementedError
 
@@ -307,7 +308,7 @@ class LLaMAInnerModel(nn.Module):
         self,
         input_ids,
         cos, sin,
-        attention_mask=None,
+        attention_mask,
     ):
         """
         :param input_ids: [batch_size, seq_len]
@@ -353,6 +354,51 @@ class LLaMAInnerModel(nn.Module):
         }
         return output
 
+    def inference_hyper(self, input_ids, cos, sin, gist_cache=None):
+        hyper_hidden_states = self.embed_tokens(input_ids, use_extended=True)
+        hyper_hidden_states = hyper_hidden_states.to(self.config.dtype)
+        gist_tokens_selector = get_gist_tokens_selector(
+            input_ids=input_ids,
+            num_gist_tokens=self.config.actual_num_gist_tokens,
+        )
+        new_gist_cache = []
+        for layer_i, layer in enumerate(self.layers):
+            if gist_cache is not None:
+                layer_gist_cache = gist_cache[layer_i]
+            else:
+                layer_gist_cache = None
+            layer_out = layer.inference_hyper(
+                hyper_hidden_states=hyper_hidden_states,
+                cos=cos, sin=sin,
+                gist_tokens_selector=gist_tokens_selector,
+                gist_cache=layer_gist_cache,
+            )
+            hyper_hidden_states = layer_out["hyper_hidden_states"]
+            new_gist_cache.append(layer_out["gist_cache"])
+        return new_gist_cache
+
+    def inference_generate(self, input_ids, cos, sin, kv_cache, attention_mask):
+        hidden_states = self.embed_tokens(input_ids, use_extended=True)
+        hidden_states = hidden_states.to(self.config.dtype)
+
+        new_kv_cache = []
+        for layer_i, layer in enumerate(self.layers):
+            layer_kv_cache = kv_cache[layer_i]
+            layer_out = layer.inference_generate(
+                hidden_states=hidden_states,
+                cos=cos, sin=sin,
+                kv_cache=layer_kv_cache,
+                attention_mask=attention_mask,
+            )
+            hidden_states = layer_out["hidden_states"]
+            new_kv_cache.append(layer_out["kv_cache"])
+        hidden_states = self.norm(hidden_states)
+        output = {
+            "hidden_states": hidden_states,
+            "kv_cache": new_kv_cache,
+        }
+        return output
+
 
 class LLaMALayer(nn.Module):
     def __init__(self, config: LLaMAConfig):
@@ -372,6 +418,7 @@ class LLaMALayer(nn.Module):
         attention_mask=None,
         mode=None,
         is_gist=None,
+        gist_tokens_selector=None,
         offload_to_cpu=False,  # Needed for activation checkpointing? idk
     ):
         if mode == MODE_TRAIN:
@@ -381,6 +428,19 @@ class LLaMALayer(nn.Module):
                 cos=cos, sin=sin,
                 attention_mask=attention_mask,
                 is_gist=is_gist,
+            )
+        elif mode == MODE_INFERENCE_HYPER:
+            return self.inference_hyper(
+                hyper_hidden_states=hyper_hidden_states,
+                cos=cos, sin=sin,
+                gist_tokens_selector=gist_tokens_selector,
+            )
+        elif mode in (MODE_INFERENCE_DOWNSTREAM_ENCODE, MODE_INFERENCE_DOWNSTREAM_DECODE):
+            return self.inference_generate(
+                hidden_states=hidden_states,
+                cos=cos, sin=sin,
+                kv_cache=kv_cache,
+                attention_mask=attention_mask,
             )
         else:
             raise NotImplementedError
@@ -430,6 +490,48 @@ class LLaMALayer(nn.Module):
         return {
             "hyper_hidden_states": hyper_hidden_states,
             "hidden_states": hidden_states,
+        }
+
+    def inference_hyper(
+        self,
+        hyper_hidden_states,
+        cos, sin,
+        gist_tokens_selector,
+        gist_cache=None,
+    ):
+        normed_hyper_hidden_states = self.input_layernorm(hyper_hidden_states).to(self.config.dtype)
+        attn_output = self.self_attn.inference_hyper(
+            hyper_hidden_states=normed_hyper_hidden_states,
+            cos=cos, sin=sin,
+            gist_tokens_selector=gist_tokens_selector,
+            gist_cache=gist_cache,
+        )
+        hyper_hidden_states = hyper_hidden_states + attn_output["hyper_attn_output"]
+        hyper_hidden_states = hyper_hidden_states + self.mlp(
+            self.post_attention_layernorm(hyper_hidden_states),
+            use_pefts=True,
+        )
+        return {
+            "hyper_hidden_states": hyper_hidden_states,
+            "gist_cache": attn_output["gist_cache"],
+        }
+
+    def inference_generate(self, hidden_states, cos, sin, kv_cache, attention_mask):
+        normed_hidden_states = self.input_layernorm(hidden_states).to(self.config.dtype)
+        attn_output = self.self_attn.inference_generate(
+            hidden_states=normed_hidden_states,
+            cos=cos, sin=sin,
+            kv_cache=kv_cache,
+            attention_mask=attention_mask,
+        )
+        hidden_states = hidden_states + attn_output["attn_output"]
+        hidden_states = hidden_states + self.mlp(
+            self.post_attention_layernorm(hidden_states),
+            use_pefts=False,
+        )
+        return {
+            "hidden_states": hidden_states,
+            "kv_cache": attn_output["kv_cache"],
         }
 
 
@@ -509,9 +611,10 @@ class Attention(nn.Module):
     def forward(self,
                 hyper_hidden_states,
                 hidden_states,
-                is_gist,
                 cos, sin,
                 attention_mask=None,
+                is_gist=None,
+                gist_tokens_selector=None,
                 mode=MODE_TRAIN):
         if mode == MODE_TRAIN:
             return self.train_forward_pass(
@@ -524,8 +627,8 @@ class Attention(nn.Module):
         elif mode == MODE_INFERENCE_HYPER:
             return self.inference_hyper(
                 hyper_hidden_states=hyper_hidden_states,
-                is_gist=is_gist,
                 cos=cos, sin=sin,
+                gist_tokens_selector=gist_tokens_selector,
             )
         else:
             raise NotImplementedError
@@ -620,9 +723,9 @@ class Attention(nn.Module):
         torch_utils.check_nan(hyper_attn_output)
         return {"attn_output": attn_output, "hyper_attn_output": hyper_attn_output}
 
-    def inference_hyper(self, hyper_hidden_states, cos, sin, is_gist):
+    def inference_hyper(self, hyper_hidden_states, cos, sin, gist_tokens_selector,
+                        gist_cache=None):
         batch_size, q_seq_len, hidden_dim = hyper_hidden_states.size()
-        is_gist_token = is_gist.bool()
 
         # (batch_size, num_heads, q_seq_len, head_dim)
         hyper_query_states = self.q_proj(hyper_hidden_states, use_lora=True)
@@ -644,6 +747,13 @@ class Attention(nn.Module):
         unrotated_hyper_key_states = hyper_key_states
         hyper_query_states, hyper_key_states = apply_rotary_pos_emb(
             hyper_query_states, hyper_key_states, cos=cos, sin=sin)
+
+        # Dirty version
+        if gist_cache is not None:
+            hyper_key_states[:, :, :self.config.actual_num_gist_tokens, :] = gist_cache["key"]
+            hyper_value_states[:, :, :self.config.actual_num_gist_tokens, :] = gist_cache["value"]
+        # End dirty version
+
         # noinspection PyUnresolvedReferences
         with torch.backends.cuda.sdp_kernel(
             enable_math=True, enable_flash=True, enable_mem_efficient=True,
@@ -652,6 +762,7 @@ class Attention(nn.Module):
                 query=hyper_query_states,
                 key=hyper_key_states,
                 value=hyper_value_states,
+                is_causal=True,
             )
         hyper_attn_output = hyper_attn_output.transpose(1, 2).contiguous().view(
             batch_size, q_seq_len, hidden_dim,
@@ -659,9 +770,62 @@ class Attention(nn.Module):
         hyper_attn_output = self.o_proj(hyper_attn_output, use_lora=True)
         return {
             "hyper_attn_output": hyper_attn_output,
-            "gist_k": extract_gist_kv(unrotated_hyper_key_states, is_gist_token=is_gist_token),
-            "gist_v": extract_gist_kv(hyper_key_states, is_gist_token=is_gist_token),
+            "gist_cache": {
+                "key": select_gist_tokens(unrotated_hyper_key_states, gist_tokens_selector=gist_tokens_selector),
+                "value": select_gist_tokens(hyper_key_states, gist_tokens_selector=gist_tokens_selector),
+            }
         }
+
+    def inference_generate(self,
+                           hidden_states, cos, sin,
+                           kv_cache=None,
+                           attention_mask=None):
+        """
+        :param hidden_states: [batch_size, seq_len, hidden_dim]
+        :param cos:
+        :param sin:
+        :param kv_cache: {"key"/"value": [batch_size, num_heads, cache_seq_len, head_dim]}
+            Only used for decoding
+        :param attention_mask: [batch_size, num_heads, q_len, kv_len]
+        :return:
+        """
+        batch_size, q_seq_len, hidden_dim = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states, use_lora=False)
+
+        if self.config.use_full_kv:
+            key_states = self.k_proj(hidden_states)
+            value_states = self.v_proj(hidden_states)
+        else:
+            key_states = self.k_proj(hidden_states, use_lora=False)
+            value_states = self.v_proj(hidden_states, use_lora=False)
+
+        query_states = query_states.view(
+            batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(
+            batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(
+            batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos=cos, sin=sin)
+
+        key_states, value_states = self.append_to_kv_cache(
+            kv_cache=kv_cache,
+            new_key_state=key_states,
+            new_value_state=value_states,
+        )
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query=query_states,
+            key=key_states,
+            value=value_states,
+            attn_mask=attention_mask,
+        )
+        # (batch_size, q_seq_len, hidden_dim)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(
+            batch_size, q_seq_len, hidden_dim,
+        )
+        attn_output = self.o_proj(attn_output, use_lora=False)
+        new_kv_cache = {"key": key_states, "value": value_states}
+        return {"attn_output": attn_output, "kv_cache": new_kv_cache}
 
     @classmethod
     def append_to_kv_cache(cls, kv_cache, new_key_state, new_value_state):
@@ -722,9 +886,14 @@ def rotate_half(x):
 
 
 def apply_rotary_pos_emb(q, k, cos, sin):
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
+    return (
+        apply_single_rotary_pos_emb(q, cos, sin),
+        apply_single_rotary_pos_emb(k, cos, sin),
+    )
+
+
+def apply_single_rotary_pos_emb(q_or_k, cos, sin):
+    return (q_or_k * cos) + (rotate_half(q_or_k) * sin)
 
 
 class NoInitLinear(nn.Linear):
@@ -1008,10 +1177,29 @@ def create_prefix_train_attention_mask(input_ids, prefix_length):
     return full_mask[None, None, :, :].to(input_ids.device)
 
 
-def extract_gist_kv(kv, is_gist_token):
-    num_gist_tokens = is_gist_token.long()[0].sum()
-    bs, num_heads, seq_len, head_dim = kv.shape
-    kv = kv.transpose(1, 2).reshape(bs * seq_len, num_heads, head_dim)
-    gist_kv = kv[is_gist_token.flatten()]
-    gist_kv = gist_kv.reshape(bs, num_gist_tokens, num_heads, head_dim).transpose(1, 2)
-    return gist_kv
+def get_gist_tokens_selector(input_ids, num_gist_tokens):
+    last_gist_token = VOCAB_SIZE + num_gist_tokens
+    length = input_ids.shape[1]
+    last_gist_token_position = length - 1 - (input_ids.flip(1) == last_gist_token).long().argmax(-1)
+    assert not (last_gist_token_position == 0).any()
+    # final_gist_tokens_selector = torch.zeros_like(input_ids).bool()
+    # for i, elem in enumerate(last_gist_token_position):
+    #     final_gist_tokens_selector[i, elem - num_gist_tokens + 1:elem + 1] = True
+    # assert (input_ids[final_gist_tokens_selector] >= 32_000).all()
+    # if expand:
+    #     return final_gist_tokens_selector[:, None, None, :]
+    # return final_gist_tokens_selector
+    final_gist_tokens_selector = []
+    for i, elem in enumerate(last_gist_token_position):
+        elem = elem.item()
+        final_gist_tokens_selector.append(slice(elem - num_gist_tokens + 1, elem + 1))
+    return final_gist_tokens_selector
+
+
+def select_gist_tokens(kv_cache, gist_tokens_selector):
+    batch_size = kv_cache.shape[0]
+    selected_cache = []
+    for i in range(batch_size):
+        selected_cache.append(kv_cache[i, :, gist_tokens_selector[i], :])
+    selected_cache = torch.stack(selected_cache, dim=0)
+    return selected_cache
