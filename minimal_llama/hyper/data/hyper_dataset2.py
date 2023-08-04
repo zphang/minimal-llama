@@ -16,8 +16,7 @@ RIGHT = "right"
 VOCAB_SIZE = 32_000
 
 DEFAULT_START_TOKEN = 32_255
-# DEFAULT_SEP_TOKEN = 32_254
-DEFAULT_SEP_TOKEN = 2
+DEFAULT_SEP_TOKEN = 32_254
 
 
 def pad(input_ids: list, max_length: int, side: str,
@@ -55,6 +54,7 @@ def format_input_ids(example, start_tokens, sep_tokens):
         + example["inputs"]
         + sep_tokens
         + example["targets"]
+        + [EOS_TOKEN_ID]
     )
 
 
@@ -62,9 +62,10 @@ def format_labels(example, start_tokens, sep_tokens):
     return (
         [NON_LABEL_TOKEN_ID] * len(start_tokens)
         + [NON_LABEL_TOKEN_ID] * len(example["inputs"])
-        # + [NON_LABEL_TOKEN_ID] * len(sep_tokens)
-        + sep_tokens
+        + [NON_LABEL_TOKEN_ID] * len(sep_tokens)
+        # + sep_tokens
         + example["targets"]
+        + [EOS_TOKEN_ID]
     )
 
 
@@ -78,7 +79,7 @@ class FewshotHyperTrainIterator:
                  max_consecutive_examples: int = 8,
                  min_consecutive_examples: int = 1,
                  ones_proportion: float = 0.5,
-                 ):
+                 mode: str = "v1"):
         self.base_path = base_path
         self.num_gist_tokens = num_gist_tokens
         self.rng = np.random.default_rng(rng_seed)
@@ -89,8 +90,14 @@ class FewshotHyperTrainIterator:
         self.ones_proportion = ones_proportion
 
         self.gist_tokens = list(range(VOCAB_SIZE, VOCAB_SIZE + self.num_gist_tokens))
-        self.start_tokens = [DEFAULT_START_TOKEN]
-        self.sep_tokens = [DEFAULT_SEP_TOKEN]
+        if mode == "v1":
+            self.start_tokens = [DEFAULT_START_TOKEN]
+            self.sep_tokens = [DEFAULT_SEP_TOKEN]
+        elif mode == "v2":
+            self.start_tokens = [BOS_TOKEN_ID]
+            self.sep_tokens = []
+        else:
+            raise KeyError(mode)
         self.metadata = io_utils.read_json(os.path.join(base_path, "ds_metadata.json"))
         self.ds = datasets.load_from_disk(base_path, keep_in_memory=True)
         self.task_list = list(self.metadata.keys())
@@ -177,7 +184,8 @@ class FewshotHyperTrainDataset(IterableDataset):
                  max_consecutive_examples: int = 8,
                  min_consecutive_examples: int = 1,
                  ones_proportion: float = 0.5,
-                 seed_offset: int = 0):
+                 seed_offset: int = 0,
+                 mode: str = "v1"):
         self.base_path = base_path
         self.num_gist_tokens = num_gist_tokens
         self.max_num_examples = max_num_examples
@@ -186,6 +194,7 @@ class FewshotHyperTrainDataset(IterableDataset):
         self.min_consecutive_examples = min_consecutive_examples
         self.ones_proportion = ones_proportion
         self.seed_offset = seed_offset
+        self.mode = mode
 
     def __getitem__(self, index):
         raise NotImplementedError
@@ -204,6 +213,7 @@ class FewshotHyperTrainDataset(IterableDataset):
             max_consecutive_examples=self.max_consecutive_examples,
             min_consecutive_examples=self.min_consecutive_examples,
             ones_proportion=self.ones_proportion,
+            mode=self.mode,
         )
 
 

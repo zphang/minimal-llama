@@ -113,7 +113,7 @@ class LLaMAModel(nn.Module):
             attention_mask=attention_mask,
         )
         logits = self.lm_head(model_out["hidden_states"])
-        return {"logits": logits}
+        return {"logits": logits, "gist_cache": model_out["gist_cache"]}
 
     def inference_hyper(self, input_ids, gist_cache=None):
         rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
@@ -327,6 +327,7 @@ class LLaMAInnerModel(nn.Module):
             & (input_ids < self.config.vocab_size + self.config.actual_num_gist_tokens)
         ).bfloat16()
 
+        new_gist_cache = []
         for layer_i, layer in enumerate(self.layers):
             if self.config.gradient_checkpointing:
                 # noinspection PyUnresolvedReferences
@@ -350,12 +351,14 @@ class LLaMAInnerModel(nn.Module):
 
             hidden_states = layer_out["hidden_states"]
             hyper_hidden_states = layer_out["hyper_hidden_states"]
+            new_gist_cache.append(layer_out["gist_cache"])
 
         hidden_states = self.norm(hidden_states)
         # hyper_hidden_states = self.norm(hyper_hidden_states)
         output = {
             "hidden_states": hidden_states,
             # "hyper_hidden_states": hyper_hidden_states,
+            "gist_cache": new_gist_cache
         }
         return output
 
@@ -495,6 +498,7 @@ class LLaMALayer(nn.Module):
         return {
             "hyper_hidden_states": hyper_hidden_states,
             "hidden_states": hidden_states,
+            "gist_cache": attn_output["gist_cache"],
         }
 
     def inference_hyper(
@@ -686,6 +690,7 @@ class Attention(nn.Module):
         value_states = value_states.view(
             batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
 
+        unrotated_hyper_key_states = hyper_key_states
         query_states, key_states = apply_rotary_pos_emb(
             query_states, key_states, cos=cos, sin=sin)
         hyper_query_states, hyper_key_states = apply_rotary_pos_emb(
@@ -715,7 +720,6 @@ class Attention(nn.Module):
                 value=value_states,
                 attn_mask=attention_mask,
             )
-
         attn_output = attn_output.transpose(1, 2).contiguous().view(
             batch_size, q_seq_len, hidden_dim,
         )
@@ -727,7 +731,14 @@ class Attention(nn.Module):
         )
         hyper_attn_output = self.o_proj(hyper_attn_output, use_lora=True)
         torch_utils.check_nan(hyper_attn_output)
-        return {"attn_output": attn_output, "hyper_attn_output": hyper_attn_output}
+        return {
+            "attn_output": attn_output,
+            "hyper_attn_output": hyper_attn_output,
+            "gist_cache": {
+                "key": unrotated_hyper_key_states,
+                "value": hyper_value_states,
+            }
+        }
 
     def inference_hyper(self, hyper_hidden_states, cos, sin, gist_tokens_selector,
                         gist_cache=None):
@@ -1184,7 +1195,7 @@ def create_prefix_train_attention_mask(input_ids, prefix_length):
 
 
 def get_gist_tokens_selector(input_ids, num_gist_tokens):
-    last_gist_token = VOCAB_SIZE + num_gist_tokens
+    last_gist_token = VOCAB_SIZE + num_gist_tokens - 1
     length = input_ids.shape[1]
     last_gist_token_position = length - 1 - (input_ids.flip(1) == last_gist_token).long().argmax(-1)
     assert not (last_gist_token_position == 0).any()

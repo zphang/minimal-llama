@@ -33,6 +33,7 @@ def run():
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--model_size", type=str, default="7b")
     parser.add_argument("--lr_scheduler", action="store_true")
+    parser.add_argument("--data_mode", type=str, default="v1")
     parser.add_argument("--no_wandb", action="store_true", default=False)
     args = parser.parse_args()
     torch.manual_seed(1)
@@ -139,14 +140,14 @@ def run():
         ds = hyper_dataset2.FewshotHyperTrainDataset(
             args.dataset_path, seed_offset=accelerator.process_index * 1000,
             max_input_length=args.max_input_length,
+            mode=args.data_mode,
         )
         train_iterator = get_hyper_train_iterator(
             ds,
-            rank=accelerator.process_index, world_size=accelerator.num_processes,
+            rank=accelerator.process_index,
             batch_size=args.batch_size, num_workers=args.num_workers,
             total_steps=args.total_steps,
             start_step=train_state["completed_steps"],
-            seed=train_state["completed_steps"],  # use steps as stand-in for seed
             grad_accum_steps=args.grad_accum_steps,
         )
     else:
@@ -284,11 +285,10 @@ def get_train_iterator(dataset,
 
 
 def get_hyper_train_iterator(dataset,
-                             rank: int, world_size: int,
+                             rank: int,
                              batch_size: int, num_workers: int,
                              total_steps: int,
-                             start_step: int = 0, grad_accum_steps: int = 1,
-                             seed: int = 0):
+                             start_step: int = 0, grad_accum_steps: int = 1):
     total_micro_steps = total_steps * grad_accum_steps
     start_micro_step = start_step * grad_accum_steps
     curr_micro_step = start_micro_step
