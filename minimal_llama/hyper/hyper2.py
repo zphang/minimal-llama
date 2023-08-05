@@ -1090,7 +1090,6 @@ def create_model(model_name, hf_path, use_4bit=False, device=None, config: Optio
                     torch.empty([config.dim, config.dim], dtype=config.dtype),
                 )
         state_keys = set(model.state_dict())
-        filename_list = sorted(list(set(weight_map.values())))
         for filename in tqdm.tqdm(filename_list):
             loaded = torch.load(os.path.join(hf_path, filename), map_location="cpu")
             for k, v in loaded.items():

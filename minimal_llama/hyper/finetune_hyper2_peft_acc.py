@@ -75,8 +75,8 @@ def run():
         use_4bit=True,
         device=device,
     )
-    optimizer = bitsandbytes.optim.AdamW(model.parameters(), lr=args.lr, is_paged=True, optim_bits=32)
-    # optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.99))
+    # optimizer = bitsandbytes.optim.AdamW(model.parameters(), lr=args.lr, is_paged=True, optim_bits=32)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.99))
     # trainable_params = [p for p in model.parameters() if p.requires_grad]
     # for k, v in model.named_parameters():
     #     if v.requires_grad:

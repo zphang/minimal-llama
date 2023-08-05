@@ -128,6 +128,9 @@ def run():
         total_steps=args.total_steps, start_step=0, grad_accum_steps=args.grad_accum_steps,
     )
 
+    if local_rank == 0:
+        os.makedirs(args.save_dir, exist_ok=True)
+
     optimizer.zero_grad()
     loss = None
     for batch_metadata, batch in train_iterator:
