@@ -113,7 +113,7 @@ class LLaMAModel(nn.Module):
             attention_mask=attention_mask,
         )
         logits = self.lm_head(model_out["hidden_states"])
-        return {"logits": logits, "gist_cache": model_out["gist_cache"]}
+        return {"logits": logits}
 
     def inference_hyper(self, input_ids, gist_cache=None):
         rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
@@ -327,7 +327,6 @@ class LLaMAInnerModel(nn.Module):
             & (input_ids < self.config.vocab_size + self.config.actual_num_gist_tokens)
         ).bfloat16()
 
-        new_gist_cache = []
         for layer_i, layer in enumerate(self.layers):
             if self.config.gradient_checkpointing:
                 # noinspection PyUnresolvedReferences
@@ -351,14 +350,10 @@ class LLaMAInnerModel(nn.Module):
 
             hidden_states = layer_out["hidden_states"]
             hyper_hidden_states = layer_out["hyper_hidden_states"]
-            new_gist_cache.append(layer_out["gist_cache"])
 
         hidden_states = self.norm(hidden_states)
-        # hyper_hidden_states = self.norm(hyper_hidden_states)
         output = {
             "hidden_states": hidden_states,
-            # "hyper_hidden_states": hyper_hidden_states,
-            "gist_cache": new_gist_cache
         }
         return output
 
@@ -498,7 +493,6 @@ class LLaMALayer(nn.Module):
         return {
             "hyper_hidden_states": hyper_hidden_states,
             "hidden_states": hidden_states,
-            "gist_cache": attn_output["gist_cache"],
         }
 
     def inference_hyper(
@@ -1058,17 +1052,25 @@ class NoInitExtendedEmbedding(nn.Embedding):
     def reset_parameters(self) -> None:
         pass
 
-    def reset_extended_embeddings(self, ):
-        indices = torch.randint(self.num_embeddings, (self.additional_tokens,))
-        indices[0] = 1
-        indices[self.additional_tokens-1] = 1
-        indices[self.additional_tokens-2] = 2
-        extended_embeddings = self.weight[indices].detach().clone().to(self.dtype)
-        print("Using: ", indices)
+    def reset_extended_embeddings(self, only_reset_extra_tokens):
+        if only_reset_extra_tokens:
+            extended_embeddings = self.extended_weight.data
+            extended_embeddings[-1] = self.weight[1]
+            extended_embeddings[-2] = self.weight[2]
+            extended_embeddings = extended_embeddings.detach().clone().to(self.dtype)
+            print("Only replacing index -1,-2 in extended embeddings")
+        else:
+            indices = torch.randint(self.num_embeddings, (self.additional_tokens,))
+            indices[0] = 1
+            indices[self.additional_tokens-1] = 1
+            indices[self.additional_tokens-2] = 2
+            extended_embeddings = self.weight[indices].detach().clone().to(self.dtype)
+            print("Initialize Embedding using: ", indices)
         self.extended_weight = nn.Parameter(extended_embeddings)
 
 
-def create_model(model_name, hf_path, use_4bit=False, device=None, config: Optional[LLaMAConfig] = None):
+def create_model(model_name, hf_path, use_4bit=False, device=None, config: Optional[LLaMAConfig] = None,
+                 only_reset_extra_tokens: bool = False):
     if config is None:
         config = LLAMA_CONFIG_DICT[model_name]
     weight_map = io_utils.read_json(os.path.join(hf_path, "pytorch_model.bin.index.json"))["weight_map"]
@@ -1125,13 +1127,13 @@ def create_model(model_name, hf_path, use_4bit=False, device=None, config: Optio
             for k in loaded:
                 state_keys.remove(k)
 
-    initialize_pefts(model)
+    initialize_pefts(model, only_reset_extra_tokens=only_reset_extra_tokens)
 
     return model
 
 
-def initialize_pefts(model):
-    model.model.embed_tokens.reset_extended_embeddings()
+def initialize_pefts(model, only_reset_extra_tokens: bool = False):
+    model.model.embed_tokens.reset_extended_embeddings(only_reset_extra_tokens)
     for layer in model.model.layers:
         layer.self_attn.q_proj.reset_lora_parameters()
         if model.config.use_full_kv:

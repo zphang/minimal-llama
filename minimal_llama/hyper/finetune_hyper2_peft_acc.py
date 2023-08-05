@@ -25,6 +25,8 @@ def run():
     parser.add_argument("--save_dir", type=str)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--lora_rank", type=int, default=8)
+    parser.add_argument("--num_gist_tokens", type=int, default=8)
+    parser.add_argument("--only_reset_extra_tokens", action="store_true", default=False)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--grad_accum_steps", type=int, default=1)
     parser.add_argument("--total_steps", type=int, default=3000)
@@ -68,15 +70,17 @@ def run():
     config.dtype = torch.bfloat16
     config.gradient_checkpointing = True
     config.lora_rank = args.lora_rank
+    config.actual_num_gist_tokens = args.num_gist_tokens
     model = hyper2.create_model(
         "7b",
         config=config,
         hf_path=args.hf_path,
         use_4bit=True,
         device=device,
+        only_reset_extra_tokens=args.only_reset_extra_tokens,
     )
-    # optimizer = bitsandbytes.optim.AdamW(model.parameters(), lr=args.lr, is_paged=True, optim_bits=32)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.99))
+    optimizer = bitsandbytes.optim.AdamW(model.parameters(), lr=args.lr, is_paged=True, optim_bits=32)
+    # optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.99))
     # trainable_params = [p for p in model.parameters() if p.requires_grad]
     # for k, v in model.named_parameters():
     #     if v.requires_grad:
