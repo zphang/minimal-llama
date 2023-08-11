@@ -108,23 +108,49 @@ class FewshotHyperTrainIterator:
         self.max_downstream_length = max_downstream_length
 
         self.gist_tokens = list(range(VOCAB_SIZE, VOCAB_SIZE + self.num_gist_tokens))
-        self.metadata = io_utils.read_json(os.path.join(base_path, "ds_metadata.json"))
-        self.ds = datasets.load_from_disk(base_path, keep_in_memory=True)
-        self.task_list = list(self.metadata.keys())
-        self.task_indices = {
-            task: np.arange(
-                self.metadata[task]["from"],
-                self.metadata[task]["to_ex"]
-            )
-            for task in self.task_list
-        }
-        self.examples_per_task_srs = pd.Series({
-            task: len(self.task_indices[task])
-            for task in self.task_list
-        })
-        self.task_weights = self.examples_per_task_srs / self.examples_per_task_srs.sum()
-        self.task_weights = self.task_weights / self.task_weights.sum()
-        self.task_start_index_dict = self.examples_per_task_srs.cumsum().shift().fillna(0).to_dict()
+        if os.path.isfile(os.path.join(base_path)):
+            # Multi Data
+            self.nested_metadata, self.ds = load_multi_dataset(multi_metadata_path=base_path)
+            self.task_list = []
+            self.task_indices = {}
+            self.task_weights = {}
+            for ds_name, metadata in self.nested_metadata.items():
+                task_weights_within_ds = {}
+                for task, task_metadata in metadata.items():
+                    full_task_name = f"{ds_name}:{task}"
+                    self.task_list.append(full_task_name)
+                    self.task_indices[full_task_name] = np.arange(
+                        task_metadata["from"],
+                        task_metadata["to_ex"]
+                    )
+                    clipped_example_count = min(len(self.task_indices[full_task_name]), 30_000)
+                    task_weights_within_ds[full_task_name] = clipped_example_count
+                task_weights_within_ds = pd.Series(task_weights_within_ds)
+                task_weights_within_ds = (
+                    task_weights_within_ds / task_weights_within_ds.sum() / len(self.nested_metadata)
+                )
+                for k, v in task_weights_within_ds.items():
+                    self.task_weights[k] = v
+            self.task_weights = pd.Series(self.task_weights)
+            self.task_weights = self.task_weights / self.task_weights.sum()
+
+        else:
+            # Single Data
+            self.metadata, self.ds = load_single_dataset(base_path=base_path)
+            self.task_list = list(self.metadata.keys())
+            self.task_indices = {
+                task: np.arange(
+                    self.metadata[task]["from"],
+                    self.metadata[task]["to_ex"]
+                )
+                for task in self.task_list
+            }
+            self.examples_per_task_srs = pd.Series({
+                task: min(len(self.task_indices[task]), 30_000)
+                for task in self.task_list
+            })
+            self.task_weights = self.examples_per_task_srs / self.examples_per_task_srs.sum()
+            self.task_weights = self.task_weights / self.task_weights.sum()
 
     def __iter__(self):
         return self
@@ -264,3 +290,26 @@ def construct_metadata(ds_list, base_path):
         }
     new_ds.save_to_disk(base_path)
     io_utils.write_json(metadata, "ds_metadata.json")
+
+
+def load_single_dataset(base_path):
+    metadata = io_utils.read_json(os.path.join(base_path, "ds_metadata.json"))
+    ds = datasets.load_from_disk(base_path, keep_in_memory=True)
+    return metadata, ds
+
+
+def load_multi_dataset(multi_metadata_path):
+    multi_metadata = io_utils.read_json(multi_metadata_path)
+    ds_list = []
+    curr = 0
+    nested_metadata = {}
+    for ds_name, path in multi_metadata.items():
+        metadata, ds = load_single_dataset(path)
+        ds_list.append(ds)
+        for k, v in metadata.items():
+            v["from"] += curr
+            v["to_ex"] += curr
+        nested_metadata[ds_name] = metadata
+        curr += len(ds)
+    combined_ds = datasets.concatenate_datasets(ds_list)
+    return nested_metadata, combined_ds

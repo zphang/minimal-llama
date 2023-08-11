@@ -100,6 +100,7 @@ def run():
         optimizer.load_state_dict(loaded["optimizer"])
         if scheduler is not None:
             scheduler.load_state_dict(loaded["scheduler"])
+        print0("Resumed from", os.path.join(args.save_dir, "train_state.json"), "as step", completed_steps)
     else:
         train_state = {"completed_steps": 0}
         os.makedirs(args.save_dir, exist_ok=True)
