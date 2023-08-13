@@ -45,7 +45,8 @@ def run():
     parser.add_argument("--expand_embedding", type=int, default=256)
     parser.add_argument("--num_gist_tokens", type=int, default=8)
     parser.add_argument("--no_wandb", action="store_true", default=False)
-    # parser.add_argument("--save_path", type=str)
+    parser.add_argument("--add_hf_shift", action="store_true")
+    parser.add_argument("--save_freq", type=int, default=None)
     args = parser.parse_args()
 
     local_rank = int(os.environ['LOCAL_RANK'])
@@ -120,7 +121,7 @@ def run():
     )
 
     ds = datasets.load_from_disk(args.dataset_path)
-    ds = GistDatasetWrapper(ds, num_gist_tokens=args.num_gist_tokens)
+    ds = GistDatasetWrapper(ds, num_gist_tokens=args.num_gist_tokens, add_hf_shift=args.add_hf_shift)
     train_iterator = get_train_iterator(
         ds,
         rank=rank, world_size=world_size,
@@ -158,6 +159,13 @@ def run():
             if local_rank == 0:
                 print(batch_metadata["curr_step"], "Mem:", torch.cuda.max_memory_allocated(device), loss.item())
 
+        if args.save_freq is not None and batch_metadata["completed_steps"] % args.save_freq == 0:
+            fsdp_utils.save_model_checkpoint(
+                model=model,
+                rank=rank,
+                save_path=os.path.join(args.save_dir, f"model_{batch_metadata['completed_steps']}.p"),
+            )
+
     # fsdp_utils.save_model_and_optimizer_sharded(
     #     model, rank, save_using_num_threads=6,
     #     save_dir=args.save_dir,
@@ -166,7 +174,7 @@ def run():
     fsdp_utils.save_model_checkpoint(
         model=model,
         rank=rank,
-        save_path=os.path.join(args.save_dir, f"model.p"),
+        save_path=os.path.join(args.save_dir, f"model_{args.total_steps}.p"),
     )
 
     if local_rank == 0:
@@ -176,20 +184,25 @@ def run():
 
 class GistDatasetWrapper(torch.utils.data.Dataset):
 
-    def __init__(self, ds, num_gist_tokens: int = 16):
+    def __init__(self, ds, num_gist_tokens: int = 16, add_hf_shift: bool = False):
         self.ds = ds
         self.num_gist_tokens = num_gist_tokens
+        self.add_hf_shift = add_hf_shift
 
     def __len__(self):
         return len(self.ds)
 
     def __getitem__(self, index):
         ex = self.ds[index]
-        input_ids = ex["input_ids"][:-1]
-        labels = [
-            x if 0 < x < 32_000 else -100
-            for x in ex["input_ids"][1:]
-        ]
+        if self.add_hf_shift:
+            input_ids = ex["input_ids"][:-1]
+            labels = [
+                x if 0 < x < 32_000 else -100
+                for x in ex["input_ids"][1:]
+            ]
+        else:
+            input_ids = ex["input_ids"]
+            labels = ex["labels"]
         return {
             "input_ids": input_ids,
             "attention_mask": create_multigist_attention_mask(
