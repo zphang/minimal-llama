@@ -19,6 +19,7 @@ def run():
     parser = argparse.ArgumentParser()
     parser.add_argument("--hf_path", type=str)
     parser.add_argument("--dataset_path", type=str)
+    parser.add_argument("--input_mode", type=str)  # apply_offset, no_apply_offset
     parser.add_argument("--save_dir", type=str)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--peft_type", type=str, default="prefix")
@@ -35,36 +36,59 @@ def run():
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--model_size", type=str, default="7b")
     parser.add_argument("--lr_scheduler", action="store_true")
+    parser.add_argument("--no_wandb", action="store_true", default=False)
     args = parser.parse_args()
-    assert args.prefix_maker_mode in ["plain", "mlp", "hidden_states"]
+    assert args.prefix_maker_mode in ["plain", "mlp", "hidden_states", "gist"]
 
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     rank = int(os.environ.get('RANK', 0))
     world_size = int(os.environ.get('WORLD_SIZE', 1))
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
+    use_wandb = not args.no_wandb and rank == 0
 
     if rank == 0:
-        wandb.init(
-            name=args.run_name,
-            project="hyper2",
-            config={
-                "total_steps": args.total_steps,
-                "lr": args.lr,
-                "full_batch_size": args.batch_size * args.grad_accum_steps,
-                "peft_type": args.peft_type,
-                "num_prefix_tokens": args.num_prefix_tokens,
-                "prefix_mode": args.prefix_mode,
-                "prefix_maker_mode": args.prefix_maker_mode,
-                "prefix_include_gates": args.prefix_include_gates,
-                "lora_rank": args.lora_rank,
-            },
-        )
+        if use_wandb:
+            wandb.init(
+                name=args.run_name,
+                project="hyper2",
+                config={
+                    "total_steps": args.total_steps,
+                    "lr": args.lr,
+                    "full_batch_size": args.batch_size * args.grad_accum_steps,
+                    "peft_type": args.peft_type,
+                    "num_prefix_tokens": args.num_prefix_tokens,
+                    "prefix_mode": args.prefix_mode,
+                    "prefix_maker_mode": args.prefix_maker_mode,
+                    "prefix_include_gates": args.prefix_include_gates,
+                    "lora_rank": args.lora_rank,
+                },
+            )
 
     if args.peft_type == "prefix":
         config = prefix_llama.LLAMA_CONFIG_DICT[args.model_size]
         config.dtype = torch.bfloat16
         config.gradient_checkpointing = True
+        model = prefix_llama.create_model(
+            args.model_size,
+            config=config,
+            hf_path=args.hf_path,
+            device=device,
+            use_4bit=True,
+            prefix_config=prefix_llama.PrefixConfig(prefix_mode=args.prefix_mode),
+        )
+        prefix_maker = prefix_makers.create_prefix_maker(
+            num_tokens=args.num_prefix_tokens,
+            config=config,
+            prefix_type=args.prefix_maker_mode,
+            include_gates=args.prefix_include_gates,
+        ).to(device)
+        optimizer = bitsandbytes.optim.AdamW(prefix_maker.parameters(), lr=args.lr, is_paged=True, optim_bits=32)
+    elif args.peft_type == "gist":
+        config = prefix_llama.LLAMA_CONFIG_DICT[args.model_size]
+        config.dtype = torch.bfloat16
+        config.gradient_checkpointing = True
+        config.vocab_size = 32255
         model = prefix_llama.create_model(
             args.model_size,
             config=config,
@@ -111,7 +135,7 @@ def run():
         load_path = os.path.join(args.save_dir, f"checkpoint_{completed_steps:05d}.pt")
         print("Resuming from", load_path)
         loaded = torch.load(load_path)
-        if args.peft_type == "prefix":
+        if args.peft_type in ("prefix", "gist"):
             prefix_maker.load_state_dict(loaded["model"])
         elif args.peft_type == "lora":
             model.load_state_dict(loaded["model"], strict=False)
@@ -126,6 +150,9 @@ def run():
         os.makedirs(args.save_dir, exist_ok=True)
         loss_list = []
 
+    if args.peft_type == "gist":
+        prefix_maker.setup_layer0_kv(model)
+
     ds = datasets.load_from_disk(args.dataset_path)
     train_iterator = get_train_iterator(
         ds,
@@ -139,25 +166,34 @@ def run():
     loss = None
     optimizer.zero_grad()
     for batch_metadata, batch in train_iterator:
-        if args.peft_type == "prefix":
-            prefixes = prefix_maker(batch_size=batch["input_ids"].shape[0])
+        if args.input_mode == "apply_offset":
+            input_ids = batch["input_ids"][:, :-1].to(device)
+            labels = batch["labels"][:, 1:].reshape(-1).to(device)
+        elif args.input_mode == "no_apply_offset":
+            input_ids = batch["input_ids"].to(device)
+            labels = batch["labels"].to(device)
+        else:
+            raise KeyError(args.input_mode)
+        if args.peft_type in ("prefix", "gist"):
+            prefixes = prefix_maker(batch_size=input_ids.shape[0])
             output = model(
-                input_ids=batch["input_ids"][:, :-1].to(device),
+                input_ids=input_ids,
                 prefixes=prefixes,
             )
         elif args.peft_type == "lora":
             output = model(
-                input_ids=batch["input_ids"][:, :-1].to(device),
+                input_ids=input_ids,
                 use_pefts=True,
             )
         else:
             raise KeyError(args.peft_type)
         loss = F.cross_entropy(
             output.view(-1, output.size(-1)),
-            batch["labels"][:, 1:].reshape(-1).to(device),
+            labels.reshape(-1),
         )
         if rank == 0:
-            wandb.log({"loss": loss.item(), "step": batch_metadata["curr_step"]})
+            if use_wandb:
+                wandb.log({"loss": loss.item(), "step": batch_metadata["curr_step"]})
         loss.backward()
         if batch_metadata["grad_accum_index"] == args.grad_accum_steps - 1:
             optimizer.step()
@@ -169,7 +205,7 @@ def run():
                 loss_list.append(loss.item())
         completed_steps = batch_metadata["curr_step"] + 1
         if completed_steps % args.save_freq == 0:
-            if args.peft_type == "prefix":
+            if args.peft_type in ("prefix", "gist"):
                 model_state_dict = prefix_maker.state_dict()
             elif args.peft_type == "lora":
                 model_state_dict = torch_utils.get_requires_grad(model)
@@ -185,7 +221,7 @@ def run():
             io_utils.write_json(loss_list, os.path.join(args.save_dir, f"loss_{completed_steps:05d}.json"))
             io_utils.write_json({"completed_steps": completed_steps}, os.path.join(args.save_dir, f"train_state.json"))
 
-    if args.peft_type == "prefix":
+    if args.peft_type  in ("prefix", "gist"):
         model_state_dict = prefix_maker.state_dict()
     elif args.peft_type == "lora":
         model_state_dict = torch_utils.get_requires_grad(model)
@@ -219,7 +255,7 @@ def get_train_iterator(dataset,
                        batch_size: int, num_workers: int,
                        total_steps: int,
                        start_step: int = 0, grad_accum_steps: int = 1,
-                       seed: int  = 0):
+                       seed: int = 0):
     total_micro_steps = total_steps * grad_accum_steps
     start_micro_step = start_step * grad_accum_steps
     sampler = DistributedSampler(

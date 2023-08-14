@@ -803,3 +803,7 @@ def create_prefix_train_attention_mask(input_ids, prefix_length):
     prefix_mask = torch.ones([seq_len, prefix_length], dtype=torch.bool)
     full_mask = torch.cat([prefix_mask, input_mask], dim=1)
     return full_mask[None, None, :, :].to(input_ids.device)
+
+
+def apply_single_rotary_pos_emb(q_or_k, cos, sin):
+    return (q_or_k * cos) + (rotate_half(q_or_k) * sin)
