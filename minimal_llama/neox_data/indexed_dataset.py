@@ -194,7 +194,7 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
         if not skip_warmup:
             print_rank_0("    warming up data mmap file...")
             _warmup_mmap_file(data_file_path(self._path))
-        print_rank_0("    creating numpy buffer of mmap...")
+        print_rank_0(f"    creating numpy buffer of mmap... {self._path}")
         self._bin_buffer_mmap = np.memmap(
             data_file_path(self._path), mode="r", order="C"
         )

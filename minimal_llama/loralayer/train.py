@@ -36,11 +36,13 @@ def run():
     torch.manual_seed(args.seed)
 
     # Initialize Accelerate
+    ddp_kwargs = accelerate.DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = accelerate.Accelerator(
         mixed_precision="bf16",
         # mixed_precision="no",
         dispatch_batches=False,
         gradient_accumulation_steps=args.grad_accum_steps,
+        kwargs_handlers=[ddp_kwargs],
     )
     device = accelerator.device
     print0 = accelerator.on_local_main_process(print)
@@ -77,6 +79,9 @@ def run():
         args.model_size,
         config=config,
     )
+    # state_dict = model.state_dict()
+    # assert state_dict["model.layers.0.self_attn.q_proj.weight"].data_ptr() == \
+    #     state_dict["model.layers.10.self_attn.q_proj.weight"].data_ptr()
     lora_llama.initialize_model(model=model, device=device)
     # optimizer = bitsandbytes.optim.AdamW(model.parameters(), lr=args.lr, is_paged=True, optim_bits=32)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.95))
@@ -88,7 +93,7 @@ def run():
         num_training_steps=args.total_steps * accelerator.num_processes,
     )
 
-    print(f"Rank: {accelerator.process_index}", model.lm_head.weight.mean())
+    print(f"Rank: {accelerator.process_index}", "lm weight mean", model.lm_head.weight.mean())
 
     # Loading
     if os.path.exists(os.path.join(args.save_dir, "train_state.json")):
@@ -105,6 +110,9 @@ def run():
         os.makedirs(args.save_dir, exist_ok=True)
 
     model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
+    # state_dict = accelerator.unwrap_model(model).state_dict()
+    # assert state_dict["model.layers.0.self_attn.q_proj.weight"].data_ptr() == \
+    #     state_dict["model.layers.10.self_attn.q_proj.weight"].data_ptr()
 
     ds = data_utils.build_the_dataset(
         data_prefix=args.data_prefix,
@@ -131,12 +139,14 @@ def run():
     for batch_metadata, batch in train_iterator:
         # print(f"Rank: {accelerator.process_index}", batch["input_ids"][0, 0:8])
         with accelerator.accumulate(model):
+            if accelerator.process_index in (0, 1):
+                print(f"Rank: {accelerator.process_index}", batch["input_ids"].shape, batch["input_ids"][0, 0:8])
             output = model(
                 input_ids=batch["input_ids"][:, :-1].to(device),
             )
             loss = F.cross_entropy(
                 output.view(-1, output.size(-1)),
-                batch["labels"][:, 1:].reshape(-1).to(device),
+                batch["input_ids"][:, 1:].reshape(-1).to(device),
             )
             # print(f"Rank: {accelerator.process_index}, Loss: {loss}, Step: {batch_metadata['curr_step']}")
             if torch.isnan(loss):
@@ -197,7 +207,7 @@ def get_train_iterator(dataset,
     start_micro_step = start_step * grad_accum_steps
     batch_sampler = data_utils.DistributedBatchSampler(
         sampler=torch.utils.data.SequentialSampler(dataset),
-        batch_size=batch_size,
+        batch_size=batch_size * world_size,
         drop_last=True,
         rank=rank,
         world_size=world_size,
@@ -228,7 +238,7 @@ def save_checkpoint(accelerator, save_model, optimizer, scheduler, save_dir, com
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         unwrapped_model = accelerator.unwrap_model(save_model)
-        model_state_dict = torch_utils.get_requires_grad(unwrapped_model)
+        model_state_dict = get_unique_state_dict(unwrapped_model.state_dict())
         torch.save({
             "model": model_state_dict,
             "optimizer": optimizer.state_dict(),
@@ -238,6 +248,17 @@ def save_checkpoint(accelerator, save_model, optimizer, scheduler, save_dir, com
             "completed_steps": completed_steps,
         }, os.path.join(save_dir, f"train_state.json"))
     accelerator.wait_for_everyone()
+
+
+def get_unique_state_dict(state_dict):
+    seen_data_ptr = set()
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if v.data_ptr() in seen_data_ptr:
+            continue
+        new_state_dict[k] = v
+        seen_data_ptr.add(v.data_ptr())
+    return new_state_dict
 
 
 if __name__ == "__main__":

@@ -66,6 +66,7 @@ LLAMA_160M_CONFIG = LLaMAConfig(
     dim=768,
     n_layers=12,
     n_heads=12,
+    vocab_size=50512,
 )
 LLAMA_7B_CONFIG = LLaMAConfig(
     dim=4096,
@@ -299,6 +300,7 @@ class LLaMAInnerModel(nn.Module):
             Only used for decoding
         :param attention_mask: [batch_size, num_heads, q_len, kv_len]
         """
+        assert input_ids.max() < self.config.vocab_size, input_ids.max()
         hidden_states = self.embed_tokens(input_ids)
         hidden_states = hidden_states.to(self.config.dtype)
 
