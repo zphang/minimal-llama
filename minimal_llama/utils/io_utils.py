@@ -125,3 +125,21 @@ def fsspec_glob(pattern):
     else:
         return glob.glob(pattern)
 
+
+def fsspec_move(src_path, dst_path):
+    import fsspec
+    if dst_path.startswith("s3"):
+        dst_fs = fsspec.filesystem('s3')
+    else:
+        dst_fs = fsspec.filesystem('file')
+    if src_path.startswith("s3"):
+        src_fs = fsspec.filesystem('s3')
+    else:
+        src_fs = fsspec.filesystem('file')
+    dst_fs.move(
+        src_fs=src_fs,
+        src_path=src_path,
+        dst_fs=dst_fs,
+        dst_path=dst_path,
+    )
+

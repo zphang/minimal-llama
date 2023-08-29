@@ -722,34 +722,34 @@ def initialize_model(model: LLaMAModel, device):
     layer_mapping = config.layer_mapping
     for layer_i, layer in enumerate(model.model.layers):
         # Linear params
-        layer_mapped_i = layer_mapping[layer_i]
-        if layer_i == layer_mapped_i:
+        # layer_mapped_i = layer_mapping[layer_i]
+        # if layer_i == layer_mapped_i:
             # create layer
-            layer.self_attn.q_proj.reset_linear_parameters(
-                init_method="small", dtype=config.dtype, device=device)
-            layer.self_attn.k_proj.reset_linear_parameters(
-                init_method="small", dtype=config.dtype, device=device)
-            layer.self_attn.v_proj.reset_linear_parameters(
-                init_method="small", dtype=config.dtype, device=device)
-            layer.self_attn.o_proj.reset_linear_parameters(
-                init_method="wang", dtype=config.dtype, device=device, n_layers=config.n_layers)
+        layer.self_attn.q_proj.reset_linear_parameters(
+            init_method="small", dtype=config.dtype, device=device)
+        layer.self_attn.k_proj.reset_linear_parameters(
+            init_method="small", dtype=config.dtype, device=device)
+        layer.self_attn.v_proj.reset_linear_parameters(
+            init_method="small", dtype=config.dtype, device=device)
+        layer.self_attn.o_proj.reset_linear_parameters(
+            init_method="wang", dtype=config.dtype, device=device, n_layers=config.n_layers)
 
-            layer.mlp.gate_proj.reset_linear_parameters(
-                init_method="small", dtype=config.dtype, device=device)
-            layer.mlp.up_proj.reset_linear_parameters(
-                init_method="small", dtype=config.dtype, device=device)
-            layer.mlp.down_proj.reset_linear_parameters(
-                init_method="wang", dtype=config.dtype, device=device, n_layers=config.n_layers)
-        else:
-            mapped_layer = model.model.layers[layer_mapped_i]
-            layer.self_attn.q_proj.set_linear_parameters(mapped_layer.self_attn.q_proj.weight)
-            layer.self_attn.k_proj.set_linear_parameters(mapped_layer.self_attn.k_proj.weight)
-            layer.self_attn.v_proj.set_linear_parameters(mapped_layer.self_attn.v_proj.weight)
-            layer.self_attn.o_proj.set_linear_parameters(mapped_layer.self_attn.o_proj.weight)
-
-            layer.mlp.gate_proj.set_linear_parameters(mapped_layer.mlp.gate_proj.weight)
-            layer.mlp.up_proj.set_linear_parameters(mapped_layer.mlp.up_proj.weight)
-            layer.mlp.down_proj.set_linear_parameters(mapped_layer.mlp.down_proj.weight)
+        layer.mlp.gate_proj.reset_linear_parameters(
+            init_method="small", dtype=config.dtype, device=device)
+        layer.mlp.up_proj.reset_linear_parameters(
+            init_method="small", dtype=config.dtype, device=device)
+        layer.mlp.down_proj.reset_linear_parameters(
+            init_method="wang", dtype=config.dtype, device=device, n_layers=config.n_layers)
+        # else:
+        #     mapped_layer = model.model.layers[layer_mapped_i]
+        #     layer.self_attn.q_proj.set_linear_parameters(mapped_layer.self_attn.q_proj.weight)
+        #     layer.self_attn.k_proj.set_linear_parameters(mapped_layer.self_attn.k_proj.weight)
+        #     layer.self_attn.v_proj.set_linear_parameters(mapped_layer.self_attn.v_proj.weight)
+        #     layer.self_attn.o_proj.set_linear_parameters(mapped_layer.self_attn.o_proj.weight)
+        #
+        #     layer.mlp.gate_proj.set_linear_parameters(mapped_layer.mlp.gate_proj.weight)
+        #     layer.mlp.up_proj.set_linear_parameters(mapped_layer.mlp.up_proj.weight)
+        #     layer.mlp.down_proj.set_linear_parameters(mapped_layer.mlp.down_proj.weight)
 
         # LoRA params
         layer.input_layernorm.reset_actual_parameters(dtype=config.dtype, device=device)
