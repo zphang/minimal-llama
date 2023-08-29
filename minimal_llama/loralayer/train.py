@@ -75,7 +75,7 @@ def run():
 
     config = lora_llama.LLAMA_CONFIG_DICT[args.model_size]
     config.dtype = torch.bfloat16
-    config.gradient_checkpointing = True
+    # config.gradient_checkpointing = True
     # config.raw_lora_layers = args.raw_lora_layers
     # config.lora_rank = args.lora_rank
     # config.raw_layer_mapping = args.layer_mapping
@@ -96,6 +96,8 @@ def run():
     # assert state_dict["model.layers.0.self_attn.q_proj.weight"].data_ptr() == \
     #     state_dict["model.layers.10.self_attn.q_proj.weight"].data_ptr()
     lora_llama.initialize_model(model=model, device=device)
+    # model.load_state_dict(torch.load("/fsx/zphang/working/2308/24_lora_layer/runs1/global_step0/test.p"))
+    # print("Yes I'm loading a state dict")
     # optimizer = bitsandbytes.optim.AdamW(model.parameters(), lr=args.lr, is_paged=True, optim_bits=32)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.95))
 

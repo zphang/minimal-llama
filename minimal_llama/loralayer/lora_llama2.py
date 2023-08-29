@@ -24,6 +24,7 @@ class LLaMAConfig:
     bos_token_id: int = 1
     eos_token_id: int = 2
     gradient_checkpointing: bool = False
+    rmsnorm_eps: float = 1e-6
 
     lora_rank: int = 16
     raw_lora_layers: str = "attn,ffn"
@@ -62,11 +63,19 @@ class LLaMAConfig:
             return self.raw_layer_mapping
 
 
+LLAMA_70M_CONFIG = LLaMAConfig(
+    dim=512,
+    n_layers=6,
+    n_heads=8,
+    vocab_size=50304,
+    rmsnorm_eps=1e-8,
+)
 LLAMA_160M_CONFIG = LLaMAConfig(
     dim=768,
     n_layers=12,
     n_heads=12,
     vocab_size=50512,
+    rmsnorm_eps=1e-8,
 )
 LLAMA_7B_CONFIG = LLaMAConfig(
     dim=4096,
@@ -80,6 +89,7 @@ DEBUG_CONFIG = LLaMAConfig(
 )
 
 LLAMA_CONFIG_DICT = {
+    "70m": LLAMA_70M_CONFIG,
     "160m": LLAMA_160M_CONFIG,
     "7b": LLAMA_7B_CONFIG,
     "debug": DEBUG_CONFIG,
@@ -271,7 +281,7 @@ class LLaMAInnerModel(nn.Module):
         self.config = config
         self.embed_tokens = NoInitEmbedding(config.vocab_size, config.dim, dtype=config.dtype)
         self.layer = LLaMAMultiLayer(config=config)
-        self.norm = RMSNorm(dim=config.dim, dtype=config.dtype)
+        self.norm = RMSNorm(dim=config.dim, dtype=config.dtype, eps=config.rmsnorm_eps)
 
     def forward(
         self,
@@ -323,7 +333,7 @@ class LLaMAInnerModel(nn.Module):
                     layer_kv_cache,
                     num_valid_tokens,
                     attention_mask,
-                    # use_reentrant=False,
+                    use_reentrant=False,
                 )
             else:
                 layer_out = self.layer(
@@ -354,12 +364,12 @@ class LLaMAMultiLayer(nn.Module):
         self.config = config
 
         self.input_layernorm = nn.ModuleList([
-            RMSNorm(dim=config.dim, dtype=config.dtype)
+            RMSNorm(dim=config.dim, dtype=config.dtype, eps=config.rmsnorm_eps)
             for _ in range(config.n_layers)
         ])
         self.self_attn = Attention(config=config)
         self.post_attention_layernorm = nn.ModuleList([
-            RMSNorm(dim=config.dim, dtype=config.dtype)
+            RMSNorm(dim=config.dim, dtype=config.dtype, eps=config.rmsnorm_eps)
             for _ in range(config.n_layers)
         ])
         self.mlp = MLP(config=config)
