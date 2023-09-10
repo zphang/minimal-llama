@@ -1,0 +1,37 @@
+{
+  "attn_q": {
+    "use_lora": false,
+    "use_linear": true,
+    "linear_mapping": "all"
+  },
+  "attn_k": {
+    "use_lora": false,
+    "use_linear": true,
+    "linear_mapping": "all"
+  },
+  "attn_v": {
+    "use_lora": false,
+    "use_linear": true,
+    "linear_mapping": "all"
+  },
+  "attn_o": {
+    "use_lora": false,
+    "use_linear": true,
+    "linear_mapping": "all"
+  },
+  "mlp_gate": {
+    "use_lora": false,
+    "use_linear": true,
+    "linear_mapping": "all"
+  },
+  "mlp_up": {
+    "use_lora": false,
+    "use_linear": true,
+    "linear_mapping": "all"
+  },
+  "mlp_down": {
+    "use_lora": false,
+    "use_linear": true,
+    "linear_mapping": "all"
+  }
+}

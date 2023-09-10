@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from torch.utils.data.distributed import DistributedSampler
 import minimal_llama.utils.io_utils as io_utils
 import wandb
+import wandb.util
 import accelerate
 
 import minimal_llama.loralayer.lora_llama2 as lora_llama
@@ -15,14 +16,12 @@ import minimal_llama.neox_data.data_utils as data_utils
 def run():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_size", type=str)
+    parser.add_argument("--raw_full_layer_config", type=str)
     parser.add_argument("--data_prefix", type=str)
     parser.add_argument("--index_base_path", type=str)
     parser.add_argument("--save_dir", type=str)
     parser.add_argument("--torch_save_dir", type=str, default=None)
     parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--raw_lora_layers", type=str, default="attn,ffn")
-    parser.add_argument("--lora_rank", type=int, default=8)
-    parser.add_argument("--layer_mapping", type=str, default="single")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--grad_accum_steps", type=int, default=1)
     parser.add_argument("--warmup_steps", type=int, default=1000)
@@ -58,21 +57,6 @@ def run():
     # torch.cuda.set_device(local_rank)
     # device = torch.device("cuda", local_rank)
 
-    if use_wandb:
-        wandb.init(
-            name=args.run_name,
-            project="loralayer",
-            config={
-                "total_steps": args.total_steps,
-                "lr": args.lr,
-                "full_batch_size": args.batch_size * args.grad_accum_steps,
-                "model_size": args.model_size,
-                "raw_lora_layers": args.raw_lora_layers,
-                "lora_rank": args.lora_rank,
-                "layer_mapping": args.layer_mapping,
-            },
-        )
-
     config = lora_llama.LLAMA_CONFIG_DICT[args.model_size]
     config.dtype = torch.bfloat16
     # config.gradient_checkpointing = True
@@ -84,9 +68,7 @@ def run():
     #     config=config,
     # )
 
-    config.raw_lora_layers = args.raw_lora_layers
-    config.lora_rank = args.lora_rank
-    config.raw_layer_mapping = args.layer_mapping
+    config.raw_full_layer_config = args.raw_full_layer_config
     model = lora_llama.create_model(
         args.model_size,
         config=config,
@@ -110,6 +92,7 @@ def run():
     # print0(f"Rank: {accelerator.process_index}",
     #       "lm weight mean", model.lm_head.weight.mean(), model.lm_head.weight.dtype)
 
+    # noinspection PyTypeChecker
     model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
     # state_dict = accelerator.unwrap_model(model).state_dict()
     # assert state_dict["model.layers.0.self_attn.q_proj.weight"].data_ptr() == \
@@ -121,13 +104,34 @@ def run():
     # Loading
     if os.path.exists(os.path.join(args.save_dir, "train_state.json")):
         train_state = io_utils.read_json(os.path.join(args.save_dir, "train_state.json"))
+        wandb_id = train_state.get("wandb_id", "dummy")
         completed_steps = train_state["completed_steps"]
         load_path = os.path.join(args.save_dir, f"full_checkpoint")
         print0("Resuming from", completed_steps, )
         accelerator.load_state(load_path)
+        fresh_start = False
     else:
-        train_state = {"completed_steps": 0}
+        wandb_id = wandb.util.generate_id()
+        train_state = {"completed_steps": 0, "wandb_id": wandb_id}
         os.makedirs(args.save_dir, exist_ok=True)
+        fresh_start = True
+
+    if use_wandb:
+        wandb.init(
+            # id=wandb_id,  # Wait and test
+            name=args.run_name,
+            project="loralayer",
+            config={
+                "total_steps": args.total_steps,
+                "lr": args.lr,
+                "full_batch_size": args.batch_size * args.grad_accum_steps,
+                "model_size": args.model_size,
+                # "raw_lora_layers": args.raw_lora_layers,
+                # "lora_rank": args.lora_rank,
+                # "layer_mapping": args.layer_mapping,
+            },
+            # resume="must" if not fresh_start else None,  # Wait and test
+        )
 
     ds = data_utils.build_the_dataset(
         data_prefix=args.data_prefix,
@@ -182,8 +186,13 @@ def run():
             )
             if use_wandb:
                 # global_loss = accelerator.reduce(loss, "mean")
-                wandb.log({
-                    "loss": loss.item(), "step": batch_metadata["curr_step"], "lr": optimizer.param_groups[0]["lr"]})
+                wandb.log(
+                    step=batch_metadata["curr_step"],
+                    data={
+                        "loss": loss.item(),
+                        "step": batch_metadata["curr_step"],
+                        "lr": optimizer.param_groups[0]["lr"],
+                    })
         completed_steps = batch_metadata["curr_step"] + 1
         if completed_steps % args.save_freq == 0:
             save_model(
@@ -197,12 +206,14 @@ def run():
                 accelerator=accelerator,
                 save_dir=args.save_dir,
                 completed_steps=completed_steps,
+                wandb_id=wandb_id,
             )
 
     save_checkpoint(
         accelerator=accelerator,
         save_dir=args.save_dir,
         completed_steps=args.total_steps,
+        wandb_id=wandb_id,
     )
     save_model(
         accelerator=accelerator,
@@ -290,12 +301,13 @@ def save_model(accelerator, model, torch_save_dir, completed_steps):
     accelerator.wait_for_everyone()
 
 
-def save_checkpoint(accelerator, save_dir, completed_steps):
+def save_checkpoint(accelerator, save_dir, completed_steps, wandb_id):
     accelerator.save_state(os.path.join(save_dir, "full_checkpoint"))
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         io_utils.write_json({
             "completed_steps": completed_steps,
+            "wandb_id": wandb_id,
         }, os.path.join(save_dir, f"train_state.json"))
     accelerator.wait_for_everyone()
 

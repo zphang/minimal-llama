@@ -11,6 +11,11 @@ from typing import Dict, Optional, Union
 import minimal_llama.utils.io_utils as io_utils
 import minimal_llama.utils.torch_utils as torch_utils
 
+LINEAR_LAYERS = [
+    "attn_q", "attn_k", "attn_v", "attn_o",
+    "mlp_up", "mlp_down", "mlp_gate",
+]
+
 
 @dataclasses.dataclass
 class LLaMAConfig:
@@ -26,18 +31,20 @@ class LLaMAConfig:
     gradient_checkpointing: bool = False
     rmsnorm_eps: float = 1e-6
 
-    lora_rank: int = 16
-    raw_lora_layers: str = "attn,ffn"
-    raw_layer_mapping: Union[dict, str] = "single"
     use_llama_intermediate_size: bool = True
+    raw_full_layer_config: Optional[Union[dict, str]] = None
+
+    # Deprecated
+    lora_rank: int = 16
+    raw_lora_layers: str = ",".join(LINEAR_LAYERS)
+    raw_layer_mapping: Union[dict, str] = "single"
+
+    def copy(self):
+        return dataclasses.replace(self)
 
     @property
     def head_dim(self):
         return self.dim // self.n_heads
-
-    @property
-    def lora_layers(self):
-        return self.raw_lora_layers.split(",")
 
     @property
     def hidden_size(self):
@@ -45,6 +52,10 @@ class LLaMAConfig:
 
     def to_dict(self):
         return dataclasses.asdict(self)
+
+    @property
+    def lora_layers(self):
+        return self.raw_lora_layers.split(",")
 
     @property
     def layer_mapping(self):
@@ -62,7 +73,72 @@ class LLaMAConfig:
             assert isinstance(self.raw_layer_mapping, dict)
             return self.raw_layer_mapping
 
+    @property
+    def full_layer_config(self):
+        if self.raw_full_layer_config is not None:
+            if isinstance(self.raw_full_layer_config, str):
+                raw_full_layer_config = io_utils.read_json(self.raw_full_layer_config)
+            else:
+                raw_full_layer_config = self.raw_full_layer_config
+            return {
+                k: LayerConfig.parse_single_layer_config(v, n_layers=self.n_layers)
+                for k, v in raw_full_layer_config.items()
+            }
+        else:
+            # DEPRECATED
+            full_layer_config = {}
+            for layer_type, layer_list in [
+                ("attn", ["attn_q", "attn_k", "attn_v", "attn_o"]),
+                ("ffn", ["mlp_up", "mlp_down", "mlp_gate"]),
+            ]:
+                for layer_name in layer_list:
+                    full_layer_config[layer_name] = LayerConfig(
+                        lora_rank=self.lora_rank,
+                        use_lora=layer_type in self.raw_lora_layers,
+                        use_linear=True,
+                        linear_mapping=LayerConfig.get_linear_mapping(self.raw_layer_mapping, n_layers=self.n_layers),
+                    )
+            return full_layer_config
 
+
+@dataclasses.dataclass
+class LayerConfig:
+    use_lora: bool
+    use_linear: bool
+    linear_mapping: Dict[int, int]
+    lora_rank: int = 16
+
+    @classmethod
+    def parse_single_layer_config(cls, single_config: dict, n_layers: int):
+        return cls(
+            use_lora=single_config["use_lora"],
+            use_linear=single_config["use_linear"],
+            linear_mapping=cls.get_linear_mapping(single_config["linear_mapping"], n_layers=n_layers),
+            lora_rank=single_config.get("lora_rank", 16)
+        )
+
+    @classmethod
+    def get_linear_mapping(cls, raw_linear_mapping, n_layers):
+        if raw_linear_mapping == "single":
+            return {
+                i: 0
+                for i in range(n_layers)
+            }
+        elif raw_linear_mapping == "all":
+            return {
+                i: i
+                for i in range(n_layers)
+            }
+        else:
+            assert isinstance(raw_linear_mapping, dict)
+            return raw_linear_mapping
+
+
+DEBUG_CONFIG = LLaMAConfig(
+    dim=64,
+    n_layers=3,
+    n_heads=4,
+)
 LLAMA_70M_CONFIG = LLaMAConfig(
     dim=512,
     n_layers=6,
@@ -77,21 +153,45 @@ LLAMA_160M_CONFIG = LLaMAConfig(
     vocab_size=50512,
     rmsnorm_eps=1e-8,
 )
+LLAMA_350M_CONFIG = LLaMAConfig(
+    dim=1024,
+    n_layers=24,
+    n_heads=16,
+    vocab_size=50512,
+    rmsnorm_eps=1e-8,
+)
 LLAMA_7B_CONFIG = LLaMAConfig(
     dim=4096,
     n_layers=32,
     n_heads=32,
 )
-DEBUG_CONFIG = LLaMAConfig(
-    dim=64,
-    n_layers=3,
-    n_heads=4,
+LLAMA_13B_CONFIG = LLaMAConfig(
+    dim=5120,
+    n_layers=40,
+    n_heads=40,
+    vocab_size=50512,
 )
+LLAMA_30B_CONFIG = LLaMAConfig(
+    dim=6656,
+    n_layers=60,
+    n_heads=52,
+    vocab_size=50512,
+)
+LLAMA_70B_CONFIG = LLaMAConfig(
+    dim=8192,
+    n_layers=80,
+    n_heads=64,
+    vocab_size=50512,
+)
+
 
 LLAMA_CONFIG_DICT = {
     "70m": LLAMA_70M_CONFIG,
     "160m": LLAMA_160M_CONFIG,
+    "350m": LLAMA_350M_CONFIG,
     "7b": LLAMA_7B_CONFIG,
+    "13b": LLAMA_13B_CONFIG,
+    "30b": LLAMA_30B_CONFIG,
     "debug": DEBUG_CONFIG,
 }
 
@@ -430,34 +530,35 @@ class MultiLinear(nn.Module):
     def __init__(self,
                  in_features: int,
                  out_features: int,
-                 linear_mapping: Dict[int, int],
+                 layer_config: LayerConfig,
                  init_method: str = "small",
-                 use_linear: bool = True,
-                 use_lora: bool = False,
-                 lora_rank: int = 16,
                  device=None,
                  dtype: torch.dtype = torch.bfloat16):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.use_linear = use_linear
-        self.use_lora = use_lora
+        self.layer_config = layer_config
         self.init_method = init_method
+        self.use_lora = layer_config.use_lora
+        self.use_linear = layer_config.use_linear
 
-        assert use_linear or use_lora
+        assert layer_config.use_linear or layer_config.use_lora
         if self.use_linear:
             self.linear = nn.ModuleDict({
                 str(linear_layer_i): NoInitLinear(
                     in_features, out_features, bias=False, dtype=dtype, device=device,
                 )
-                for linear_layer_i in sorted(set(linear_mapping.values()))
+                for linear_layer_i in sorted(set(layer_config.linear_mapping.values()))
             })
         if self.use_lora:
             self.lora = nn.ModuleDict({
-                str(layer_i): NoInitLora(in_features, out_features, rank=lora_rank, dtype=dtype, device=device)
-                for layer_i in linear_mapping.keys()
+                str(layer_i): NoInitLora(
+                    in_features, out_features,
+                    rank=layer_config.lora_rank, dtype=dtype, device=device
+                )
+                for layer_i in layer_config.linear_mapping.keys()
             })
-        self.linear_mapping = linear_mapping
+        self.linear_mapping = layer_config.linear_mapping
 
     def forward(self, x, layer_i: int):
         linear_layer_i = str(self.linear_mapping[layer_i])
@@ -486,27 +587,19 @@ class MLP(nn.Module):
             hidden_dim = int(2 * hidden_dim / 3)
             hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
-        mlp_use_lora = "ffn" in config.lora_layers
-
         self.gate_proj = MultiLinear(
             dim, hidden_dim,
-            use_linear=True,
-            use_lora=mlp_use_lora,
-            linear_mapping=self.config.layer_mapping,
+            layer_config=config.full_layer_config["mlp_gate"],
             init_method="small",
         )
         self.up_proj = MultiLinear(
             dim, hidden_dim,
-            use_linear=True,
-            use_lora=mlp_use_lora,
-            linear_mapping=self.config.layer_mapping,
+            layer_config=config.full_layer_config["mlp_up"],
             init_method="small",
         )
         self.down_proj = MultiLinear(
             hidden_dim, dim,
-            use_linear=True,
-            use_lora=mlp_use_lora,
-            linear_mapping=self.config.layer_mapping,
+            layer_config=config.full_layer_config["mlp_down"],
             init_method="wang",
         )
 
@@ -544,33 +637,24 @@ class Attention(nn.Module):
         self.n_heads = config.n_heads
         self.head_dim = config.dim // config.n_heads
 
-        attn_use_lora = "attn" in config.lora_layers
         self.q_proj = MultiLinear(
             config.dim, config.dim,
-            use_linear=True,
-            use_lora=attn_use_lora,
-            linear_mapping=self.config.layer_mapping,
+            layer_config=config.full_layer_config["attn_q"],
             init_method="small",
         )
         self.k_proj = MultiLinear(
             config.dim, config.dim,
-            use_linear=True,
-            use_lora=attn_use_lora,
-            linear_mapping=self.config.layer_mapping,
+            layer_config=config.full_layer_config["attn_k"],
             init_method="small",
         )
         self.v_proj = MultiLinear(
             config.dim, config.dim,
-            use_linear=True,
-            use_lora=attn_use_lora,
-            linear_mapping=self.config.layer_mapping,
+            layer_config=config.full_layer_config["attn_v"],
             init_method="small",
         )
         self.o_proj = MultiLinear(
             config.dim, config.dim,
-            use_linear=True,
-            use_lora=attn_use_lora,
-            linear_mapping=self.config.layer_mapping,
+            layer_config=config.full_layer_config["attn_o"],
             init_method="wang",
         )
         self.rotary_emb = RotaryEmbedding(dim=self.head_dim, max_position_embeddings=config.max_seq_length)
