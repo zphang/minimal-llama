@@ -21,12 +21,15 @@ def run():
     parser.add_argument("--dataset_path", type=str)
     parser.add_argument("--dataset_type", type=str, default="pre")
     parser.add_argument("--save_dir", type=str)
+    parser.add_argument("--torch_save_dir", type=str)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--lora_rank", type=int, default=8)
+    parser.add_argument("--raw_full_layers", type=str, default="")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--grad_accum_steps", type=int, default=1)
     parser.add_argument("--total_steps", type=int, default=3000)
-    parser.add_argument("--save_freq", type=int, default=500)
+    parser.add_argument("--save_freq", type=int, default=2000)
+    parser.add_argument("--checkpoint_freq", type=int, default=1000)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--model_size", type=str, default="7b")
@@ -65,6 +68,7 @@ def run():
     config.dtype = torch.bfloat16
     config.gradient_checkpointing = True
     config.lora_rank = args.lora_rank
+    config.raw_full_layers = args.raw_full_layers
     model = hyper1.create_model(
         "7b",
         config=config,
@@ -74,7 +78,7 @@ def run():
     )
     # optimizer = bitsandbytes.optim.AdamW(model.parameters(), lr=args.lr, is_paged=True, optim_bits=32)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.99))
-    save_model = model
+    model_to_save = model
 
     if args.lr_scheduler:
         scheduler = torch_utils.get_linear_schedule_with_warmup(
@@ -93,7 +97,7 @@ def run():
     if os.path.exists(os.path.join(args.save_dir, "train_state.json")):
         train_state = io_utils.read_json(os.path.join(args.save_dir, "train_state.json"))
         completed_steps = train_state["completed_steps"]
-        load_path = os.path.join(args.save_dir, f"checkpoint_{completed_steps:05d}.pt")
+        load_path = os.path.join(args.save_dir, "full_checkpoint")
         print0("Resuming from", load_path)
         loaded = torch.load(load_path)
         model.load_state_dict(loaded["model"], strict=False)
@@ -155,7 +159,7 @@ def run():
             )
             # print(f"Rank: {accelerator.process_index}, Loss: {loss}, Step: {batch_metadata['curr_step']}")
             if torch.isnan(loss):
-                unwrapped_model = accelerator.unwrap_model(save_model)
+                unwrapped_model = accelerator.unwrap_model(model_to_save)
                 model_state_dict = torch_utils.get_requires_grad(unwrapped_model)
                 torch.save(model_state_dict, "/fsx/zphang/working/2307/14_hyper/testing/checkpoint.p")
                 torch.save(batch, "/fsx/zphang/working/2307/14_hyper/testing/bad_batch.p")
@@ -169,23 +173,32 @@ def run():
             print0(batch_metadata["curr_step"], "Mem:", torch.cuda.max_memory_allocated(device), loss.item())
             if use_wandb:
                 # global_loss = accelerator.reduce(loss, "mean")
-                wandb.log({
-                    "loss": loss.item(), "step": batch_metadata["curr_step"], "lr": optimizer.param_groups[0]["lr"]
-                })
+                wandb.log(
+                    step=batch_metadata["curr_step"],
+                    data={
+                        "loss": loss.item(), "step": batch_metadata["curr_step"], "lr": optimizer.param_groups[0]["lr"]
+                    },
+                )
         completed_steps = batch_metadata["curr_step"] + 1
-        if completed_steps % args.save_freq == 0:
+        if completed_steps % args.checkpoint_freq == 0:
             save_checkpoint(
                 accelerator=accelerator,
-                save_model=save_model,
+                model_to_save=model_to_save,
                 optimizer=optimizer,
                 scheduler=scheduler,
                 save_dir=args.save_dir,
                 completed_steps=completed_steps,
             )
+            save_model(
+                accelerator=accelerator,
+                model_to_save=model_to_save,
+                torch_save_dir=args.torch_save_dir,
+                completed_steps=completed_steps,
+            )
 
     save_checkpoint(
         accelerator=accelerator,
-        save_model=save_model,
+        model_to_save=model_to_save,
         optimizer=optimizer,
         scheduler=scheduler,
         save_dir=args.save_dir,
@@ -300,19 +313,31 @@ def get_hyper_train_iterator(dataset,
             return
 
 
-def save_checkpoint(accelerator, save_model, optimizer, scheduler, save_dir, completed_steps):
+def save_checkpoint(accelerator, model_to_save, optimizer, scheduler, save_dir, completed_steps):
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        unwrapped_model = accelerator.unwrap_model(save_model)
+        unwrapped_model = accelerator.unwrap_model(model_to_save)
         model_state_dict = torch_utils.get_requires_grad(unwrapped_model)
         torch.save({
             "model": model_state_dict,
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict() if scheduler else None,
-        }, os.path.join(save_dir, f"checkpoint_{completed_steps:05d}.pt"))
+        }, os.path.join(save_dir, "full_checkpoint"))
         io_utils.write_json({
             "completed_steps": completed_steps,
         }, os.path.join(save_dir, f"train_state.json"))
+    accelerator.wait_for_everyone()
+
+
+def save_model(accelerator, model_to_save, torch_save_dir, completed_steps):
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        unwrapped_model = accelerator.unwrap_model(model_to_save)
+        model_state_dict = torch_utils.get_requires_grad(unwrapped_model)
+        io_utils.fsspec_torch_save(
+            model_state_dict,
+            os.path.join(torch_save_dir, f"model_{completed_steps:05d}.pt")
+        )
     accelerator.wait_for_everyone()
 
 

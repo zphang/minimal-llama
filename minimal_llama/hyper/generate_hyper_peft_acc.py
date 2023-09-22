@@ -20,12 +20,14 @@ def run():
     parser.add_argument("--dataset_path", type=str)
     parser.add_argument("--save_dir", type=str)
     parser.add_argument("--lora_rank", type=int, default=8)
+    parser.add_argument("--raw_full_layers", type=str, default="")
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--generation_length", type=int, default=128)
     parser.add_argument("--eval_nat_inst", action="store_true", default=False)
     parser.add_argument("--filename", type=str, default="gen_data")
     parser.add_argument("--model_size", type=str, default="7b")
+    parser.add_argument("--skip_sub_model", action="store_true", default=False)
     args = parser.parse_args()
     torch.manual_seed(1)
 
@@ -46,6 +48,7 @@ def run():
     config.dtype = torch.bfloat16
     config.gradient_checkpointing = True
     config.lora_rank = args.lora_rank
+    config.raw_full_layers = args.raw_full_layers
     model = hyper1.create_model(
         "7b",
         config=config,
@@ -53,7 +56,9 @@ def run():
         use_4bit=True,
         device=device,
     )
-    load_out = model.load_state_dict(loaded["model"], strict=False)
+    if not args.skip_sub_model:
+        loaded = loaded["model"]
+    load_out = model.load_state_dict(loaded, strict=False)
     assert not load_out.unexpected_keys
 
     ds = datasets.load_from_disk(args.dataset_path)

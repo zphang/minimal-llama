@@ -31,6 +31,7 @@ from torch.distributed.checkpoint.default_planner import (
 )
 
 import minimal_llama.newfancy.fsdp_policies as policies
+import minimal_llama.utils.io_utils as io_utils
 
 
 def setup(rank, world_size):
@@ -185,7 +186,7 @@ def save_model_checkpoint(model, rank, save_path, fullstate_save_policy=None):
         cpu_state = model.state_dict()
     if rank == 0:
         print("Saving.")
-        torch.save(cpu_state, save_path)
+        io_utils.fsspec_torch_save(cpu_state, save_path)
         print("Saved.")
     dist.barrier()
     print("rank", rank, "done")

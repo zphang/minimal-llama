@@ -29,7 +29,7 @@ class LLaMAConfig:
     n_heads: int
     vocab_size: int = 32000
     max_seq_length: int = 2048
-    dtype: torch.Type = torch.float16
+    dtype: torch.Type = torch.bfloat16
     pad_token_id: int = 0
     bos_token_id: int = 1
     eos_token_id: int = 2
@@ -403,7 +403,7 @@ class MLP(nn.Module):
 
 
 class RMSNorm(torch.nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6, dtype=torch.float16):
+    def __init__(self, dim: int, eps: float = 1e-6, dtype=torch.bfloat16):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim, dtype=dtype))

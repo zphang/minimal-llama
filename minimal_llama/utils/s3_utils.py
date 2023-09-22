@@ -104,7 +104,7 @@ def _upload(
     )
 
 
-def upload_checkpoint(iteration, neox_args):
+def upload_checkpoint(local_fol_path, remote_fol_path):
     local_checkpoint_path = os.path.join(os.path.abspath(neox_args.save), get_checkpoint_tag(iteration))
     local_checkpoint_list = sorted(filter(
         lambda x: os.path.isfile(x),

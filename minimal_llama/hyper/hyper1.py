@@ -39,6 +39,7 @@ class LLaMAConfig:
     gradient_checkpointing: bool = False
     num_gist_tokens: int = 256
     lora_rank: int = 8
+    raw_full_layers: str = ""
     device: Optional[torch.device] = None
 
     @property
@@ -48,6 +49,15 @@ class LLaMAConfig:
     @property
     def hidden_size(self):
         return self.dim
+
+    def use_full_layer(self, linear_name):
+        return linear_name in self.raw_full_layers
+
+    def get_full_layer_list(self):
+        if self.raw_full_layers:
+            return self.raw_full_layers.split(",")
+        else:
+            return []
 
     def to_dict(self):
         return dataclasses.asdict(self)
@@ -484,11 +494,11 @@ class MLP(nn.Module):
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
         self.gate_proj = create_linear(dim, hidden_dim, dtype=config.dtype, use_4bit=config.use_4bit,
-                                       rank=config.lora_rank)
+                                       rank=config.lora_rank, use_full=config.use_full_layer("gate_proj"))
         self.up_proj = create_linear(dim, hidden_dim, dtype=config.dtype, use_4bit=config.use_4bit,
-                                     rank=config.lora_rank)
+                                     rank=config.lora_rank, use_full=config.use_full_layer("up_proj"))
         self.down_proj = create_linear(hidden_dim, dim, dtype=config.dtype, use_4bit=config.use_4bit,
-                                       rank=config.lora_rank)
+                                       rank=config.lora_rank, use_full=config.use_full_layer("down_proj"))
 
     def forward(self, x, use_pefts=False):
         return self.down_proj(
@@ -523,13 +533,13 @@ class Attention(nn.Module):
         self.head_dim = config.dim // config.n_heads
 
         self.q_proj = create_linear(config.dim, config.dim, dtype=config.dtype, use_4bit=config.use_4bit,
-                                    rank=config.lora_rank)
+                                    rank=config.lora_rank, use_full=config.use_full_layer("q_proj"))
         self.k_proj = create_linear(config.dim, config.dim, dtype=config.dtype, use_4bit=config.use_4bit,
-                                    rank=config.lora_rank)
+                                    rank=config.lora_rank, use_full=config.use_full_layer("k_proj"))
         self.v_proj = create_linear(config.dim, config.dim, dtype=config.dtype, use_4bit=config.use_4bit,
-                                    rank=config.lora_rank)
+                                    rank=config.lora_rank, use_full=config.use_full_layer("v_proj"))
         self.o_proj = create_linear(config.dim, config.dim, dtype=config.dtype, use_4bit=config.use_4bit,
-                                    rank=config.lora_rank)
+                                    rank=config.lora_rank, use_full=config.use_full_layer("o_proj"))
         self.rotary_emb = RotaryEmbedding(dim=self.head_dim, max_position_embeddings=config.max_seq_length)
 
     def forward(self, hidden_states, cos, sin,
@@ -771,12 +781,52 @@ class NoInitLora4bitLinear(NoInit4bitLinear):
         nn.init.kaiming_uniform_(self.lora_a, a=math.sqrt(5))
 
 
+class NoInitFull4bitLinear(NoInit4bitLinear):
+    source_cls = nn.Linear
+
+    def __init__(self,
+                 input_features: int, output_features: int,
+                 compute_dtype=None,
+                 compress_statistics=True,
+                 quant_type="fp4") -> None:
+        super().__init__(
+            input_features=input_features, output_features=output_features,
+            bias=False,
+            compute_dtype=compute_dtype,
+            compress_statistics=compress_statistics,
+            quant_type=quant_type,
+        )
+        self.full = NoInitLinear(input_features, output_features, bias=False, dtype=compute_dtype)
+
+    def forward(self, x: torch.Tensor, use_lora: bool = True) -> torch.Tensor:
+        if use_lora:
+            return self.full(x)
+        else:
+            return super().forward(x)
+
+    def reset_lora_parameters(self):
+        # This is a hack
+        pass
+
+    def reset_parameters(self) -> None:
+        pass
+
+
 def create_linear(in_features: int, out_features: int, dtype: torch.Type,
                   use_4bit: bool = False, double_quant: bool = True,
                   use_lora=True,
-                  rank: int = 8, device: Optional[torch.device] = None) -> nn.Module:
+                  rank: int = 8,
+                  use_full: bool = False,
+                  device: Optional[torch.device] = None) -> nn.Module:
     if use_4bit:
-        if use_lora:
+        if use_full:
+            return NoInitFull4bitLinear(
+                in_features, out_features,
+                compute_dtype=dtype,
+                compress_statistics=double_quant,
+                quant_type="nf4",
+            )
+        elif use_lora:
             return NoInitLora4bitLinear(
                 in_features, out_features,
                 compute_dtype=dtype,
@@ -845,6 +895,7 @@ def create_model(model_name, hf_path, use_4bit=False, device=None, config=None):
         # TODO: Local rank
         device = torch.device("cuda:0")
     config.device = device
+    full_layers = config.get_full_layer_list()
     if use_4bit:
         config = dataclasses.replace(config, use_4bit=True)
         with init_empty_weights():
@@ -857,6 +908,13 @@ def create_model(model_name, hf_path, use_4bit=False, device=None, config=None):
                 if "lm_head" in k or "layernorm" in k or ".norm" in k:
                     v = v.to(config.dtype)
                 set_module_quantized_tensor_to_device(model, tensor_name=k, device=device, value=v)
+
+                for linear in full_layers:
+                    if linear in k:
+                        new_k = k.replace("_proj.", "_proj.full.")
+                        print("Loading full:", new_k)
+                        set_module_quantized_tensor_to_device(model, tensor_name=new_k, device=device, value=v)
+                        state_keys.remove(new_k)
                 state_keys.remove(k)
         for k in list(state_keys):
             if "lora" in k or "extended" in k:
@@ -947,3 +1005,17 @@ def extract_gist_kv(kv, is_gist_token):
     gist_kv = kv[is_gist_token.flatten()]
     gist_kv = gist_kv.reshape(bs, num_gist_tokens, num_heads, head_dim).transpose(1, 2)
     return gist_kv
+
+
+def set_to_device(model, k, v, device):
+    parts = k.split(".")
+    prefix, param_name = parts[:-1], parts[-1]
+    module = model
+    for p in prefix:
+        module = getattr(module, p)
+    dtype = getattr(module, param_name).dtype
+    setattr(module, param_name, nn.Parameter(torch.empty_like(
+        getattr(module, param_name),
+        device=device, dtype=dtype,
+    )))
+
