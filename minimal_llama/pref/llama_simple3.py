@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import bitsandbytes as bnb
 from accelerate import init_empty_weights
+from flash_attn import flash_attn_func
 
 import minimal_llama.utils.io_utils as io_utils
 from transformers.utils.bitsandbytes import set_module_quantized_tensor_to_device
@@ -480,6 +481,12 @@ class Attention(nn.Module):
                         value=value_states,
                         is_causal=True,
                     )
+                # attn_output = flash_attn_func(
+                #     q=query_states,
+                #     k=key_states,
+                #     v=value_states,
+                #     causal=True,
+                # )
             else:
                 # noinspection PyUnresolvedReferences
                 with torch.backends.cuda.sdp_kernel(

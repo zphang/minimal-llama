@@ -22,6 +22,7 @@ import minimal_llama.utils.torch_utils as torch_utils
 from accelerate import init_empty_weights
 import minimal_llama.newfancy.fsdp_utils as fsdp_utils
 import wandb
+import datetime as dt
 
 FSDP_IS_AVAILABLE = enable_2d_with_fsdp()
 
@@ -113,7 +114,7 @@ def run():
         total_steps=args.total_steps, start_step=0, grad_accum_steps=args.grad_accum_steps,
     )
 
-    if local_rank == 0:
+    if local_rank == 0 and not args.save_dir.startswith("s3:"):
         os.makedirs(args.save_dir, exist_ok=True)
 
     optimizer.zero_grad()
@@ -136,7 +137,9 @@ def run():
                     "loss": loss.item(), "step": batch_metadata["curr_step"], "lr": optimizer.param_groups[0]["lr"]
                 })
             torch_utils.print_rank_0(
-                batch_metadata["curr_step"], "Mem:", torch.cuda.max_memory_allocated(device), loss.item())
+                batch_metadata["curr_step"], "Mem:", torch.cuda.max_memory_allocated(device), loss.item(),
+                dt.datetime.now(),
+            )
             if torch.isnan(loss):
                 1/0
 
