@@ -472,21 +472,21 @@ class Attention(nn.Module):
 
             if attention_mask is None:
                 # noinspection PyUnresolvedReferences
-                with torch.backends.cuda.sdp_kernel(
-                    enable_math=False, enable_flash=True, enable_mem_efficient=False,
-                ):
-                    attn_output = torch.nn.functional.scaled_dot_product_attention(
-                        query=query_states,
-                        key=key_states,
-                        value=value_states,
-                        is_causal=True,
-                    )
-                # attn_output = flash_attn_func(
-                #     q=query_states,
-                #     k=key_states,
-                #     v=value_states,
-                #     causal=True,
-                # )
+                # with torch.backends.cuda.sdp_kernel(
+                #     enable_math=False, enable_flash=True, enable_mem_efficient=False,
+                # ):
+                #     attn_output = torch.nn.functional.scaled_dot_product_attention(
+                #         query=query_states,
+                #         key=key_states,
+                #         value=value_states,
+                #         is_causal=True,
+                #     )
+                attn_output = flash_attn_func(
+                    q=query_states.transpose(1, 2),
+                    k=key_states.transpose(1, 2),
+                    v=value_states.transpose(1, 2),
+                    causal=True,
+                ).transpose(1, 2)
             else:
                 # noinspection PyUnresolvedReferences
                 with torch.backends.cuda.sdp_kernel(
