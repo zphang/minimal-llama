@@ -250,3 +250,45 @@ class NatInstHyperTrainIterator:
             "input_ids": actual_input_ids,
             "labels": actual_labels,
         }
+
+
+class NatInstHyperTrainDataset(IterableDataset):
+
+    def __init__(self, base_path,
+                 max_num_hyper_examples: int = 32,
+                 num_downstream_examples: int = 1,
+                 max_hyper_length: int = 1024,
+                 max_downstream_length: int = 384,
+                 add_definition: bool = True,
+                 hyper_example_mode: str = "sample",
+                 hyper_example_copy_factor: float = 1.0,
+                 seed_offset: int = 0):
+        self.base_path = base_path
+        self.max_num_hyper_examples = max_num_hyper_examples
+        self.num_downstream_examples = num_downstream_examples
+        self.max_hyper_length = max_hyper_length
+        self.max_downstream_length = max_downstream_length
+        self.add_definition = add_definition
+        self.hyper_example_mode = hyper_example_mode
+        self.hyper_example_copy_factor = hyper_example_copy_factor
+        self.seed_offset = seed_offset
+
+    def __getitem__(self, index):
+        raise NotImplementedError
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        rng_seed = worker_info.seed if worker_info is not None else np.random.randint(1_000_000)
+        rng_seed += self.seed_offset
+        print(f"Using seed {rng_seed}")
+        return NatInstHyperTrainIterator(
+            rng_seed=rng_seed,
+            base_path=self.base_path,
+            max_num_hyper_examples=self.max_num_hyper_examples,
+            num_downstream_examples=self.num_downstream_examples,
+            max_hyper_length=self.max_hyper_length,
+            max_downstream_length=self.max_downstream_length,
+            add_definition=self.add_definition,
+            hyper_example_mode=self.hyper_example_mode,
+            hyper_example_copy_factor=self.hyper_example_copy_factor,
+        )

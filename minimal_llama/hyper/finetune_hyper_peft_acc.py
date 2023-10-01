@@ -12,6 +12,7 @@ import datasets.distributed
 
 import minimal_llama.hyper.hyper1 as hyper1
 import minimal_llama.hyper.data.hyper_dataset as hyper_dataset
+import minimal_llama.hyper.data.hyper_dataset_v2 as hyper_dataset_v2
 import minimal_llama.utils.torch_utils as torch_utils
 
 
@@ -20,6 +21,8 @@ def run():
     parser.add_argument("--hf_path", type=str)
     parser.add_argument("--dataset_path", type=str)
     parser.add_argument("--dataset_type", type=str, default="pre")
+    parser.add_argument("--max_num_hyper_examples", type=int, default=32)
+    parser.add_argument("--num_downstream_examples", type=int, default=1)
     parser.add_argument("--save_dir", type=str)
     parser.add_argument("--torch_save_dir", type=str)
     parser.add_argument("--lr", type=float, default=2e-4)
@@ -139,6 +142,22 @@ def run():
             seed=train_state["completed_steps"],  # use steps as stand-in for seed
             grad_accum_steps=args.grad_accum_steps,
         )
+    elif args.dataset_type == "nat_inst":
+        ds = hyper_dataset_v2.NatInstHyperTrainDataset(
+            args.dataset_path,
+            max_num_hyper_examples=args.max_num_hyper_examples,
+            num_downstream_examples=args.num_downstream_examples,
+            seed_offset=accelerator.process_index * 1000,
+        )
+        train_iterator = get_hyper_train_iterator(
+            ds,
+            rank=accelerator.process_index, world_size=accelerator.num_processes,
+            batch_size=args.batch_size, num_workers=args.num_workers,
+            total_steps=args.total_steps,
+            start_step=train_state["completed_steps"],
+            seed=train_state["completed_steps"],  # use steps as stand-in for seed
+            grad_accum_steps=args.grad_accum_steps,
+        )
     else:
         raise KeyError(args.dataset_type)
     torch.cuda.empty_cache()
@@ -151,18 +170,18 @@ def run():
         with accelerator.accumulate(model):
             logits = model(
                 hyper_input_ids=batch["hyper_input_ids"].to(device),
-                input_ids=batch["input_ids"][:, :-1].to(device),
+                input_ids=batch["input_ids"][..., :-1].to(device),
             )
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
-                batch["labels"][:, 1:].reshape(-1).to(device),
+                batch["labels"][..., 1:].reshape(-1).to(device),
             )
             # print(f"Rank: {accelerator.process_index}, Loss: {loss}, Step: {batch_metadata['curr_step']}")
             if torch.isnan(loss):
-                unwrapped_model = accelerator.unwrap_model(model_to_save)
-                model_state_dict = torch_utils.get_requires_grad(unwrapped_model)
-                torch.save(model_state_dict, "/fsx/zphang/working/2307/14_hyper/testing/checkpoint.p")
-                torch.save(batch, "/fsx/zphang/working/2307/14_hyper/testing/bad_batch.p")
+                # unwrapped_model = accelerator.unwrap_model(model_to_save)
+                # model_state_dict = torch_utils.get_requires_grad(unwrapped_model)
+                # torch.save(model_state_dict, "/fsx/zphang/working/2307/14_hyper/testing/checkpoint.p")
+                # torch.save(batch, "/fsx/zphang/working/2307/14_hyper/testing/bad_batch.p")
                 raise RuntimeError(f"NaN on rank {accelerator.process_index}")
             accelerator.backward(loss)
             optimizer.step()

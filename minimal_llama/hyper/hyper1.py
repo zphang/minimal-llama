@@ -105,17 +105,36 @@ class LLaMAModel(nn.Module):
         """Forward pass (with full decode sequence, intended for training or loss-scoring)
         :param hyper_input_ids: [batch_size, seq_len]
         :param input_ids: [batch_size, seq_len]
+            or [batch_size, a_batch_size, seq_len]
             - Always right-padded. Masks are generated based on padding tokens
         :return: logits [batch_size, seq_len]
         """
         hyper_model_out = self.hyper_forward_pass(
             hyper_input_ids=hyper_input_ids,
         )
+        if len(input_ids.shape) == 3:
+            h_bs, a_bs, seq_len = input_ids.shape
+            input_ids = input_ids.view(h_bs * a_bs, seq_len)
+            new_hyper_model_out = {
+                "t_offset": hyper_model_out["t_offset"].repeat_interleave(a_bs),
+            }
+            new_hyper_model_out["gist_cache"] = [
+                {
+                    "key": layer_gist_cache["key"].repeat_interleave(a_bs, dim=0),
+                    "value": layer_gist_cache["value"].repeat_interleave(a_bs, dim=0),
+                }
+                for layer_gist_cache in hyper_model_out["gist_cache"]
+            ]
+            hyper_model_out = new_hyper_model_out
+
         logits = self.downstream_forward_pass(
             input_ids=input_ids,
             gist_cache=hyper_model_out["gist_cache"],
             t_offset=hyper_model_out["t_offset"],
         )
+        if len(input_ids.shape) == 3:
+            h_bs, a_bs, seq_len = input_ids.shape
+            logits = logits.view(h_bs, a_bs, seq_len, -1)
         return logits
 
     def hyper_forward_pass(self, hyper_input_ids):
