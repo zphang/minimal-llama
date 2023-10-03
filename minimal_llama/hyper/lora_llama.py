@@ -83,7 +83,7 @@ class LLaMAModel(nn.Module):
         self.config = config
         self.model = LLaMAInnerModel(config)
         self.lm_head = create_linear(config.dim, config.vocab_size, dtype=config.dtype,
-                                     use_4bit=True, use_lora=False, device=config.device)
+                                     use_4bit=config.use_4bit, use_lora=False, device=config.device)
 
     def forward(self,
                 input_ids,

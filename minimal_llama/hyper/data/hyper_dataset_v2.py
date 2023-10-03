@@ -2,7 +2,7 @@ import datasets
 import os
 import numpy as np
 import torch
-from torch.utils.data import IterableDataset
+from torch.utils.data import Dataset, IterableDataset
 import minimal_llama.utils.io_utils as io_utils
 import pandas as pd
 
@@ -292,3 +292,120 @@ class NatInstHyperTrainDataset(IterableDataset):
             hyper_example_mode=self.hyper_example_mode,
             hyper_example_copy_factor=self.hyper_example_copy_factor,
         )
+
+
+class NatInstHyperValidationDataset(Dataset):
+
+    def __init__(self,
+                 rng_seed,
+                 base_path,
+                 num_gist_tokens: int = 16,
+                 max_num_hyper_examples: int = 32,
+                 num_downstream_examples: int = 1,
+                 max_hyper_length: int = 1024,
+                 max_downstream_length: int = 384,
+                 add_definition: bool = True):
+        self.base_path = base_path
+        self.num_gist_tokens = num_gist_tokens
+        self.max_num_hyper_examples = max_num_hyper_examples
+        self.num_downstream_examples = num_downstream_examples
+        self.max_hyper_length = max_hyper_length
+        self.max_downstream_length = max_downstream_length
+        self.add_definition = add_definition
+        self.rng = np.random.default_rng(rng_seed)
+
+        self.gist_tokens = list(range(VOCAB_SIZE, VOCAB_SIZE + self.num_gist_tokens))
+
+        self.metadata = torch.load(os.path.join(base_path, "metadata.p"))
+        self.end_postidx_dict = {
+            task_metadata["end_postidx"]: task
+            for task, task_metadata in self.metadata.items()
+        }
+        self.end_postidx_dict = {
+            k: self.end_postidx_dict[k]
+            for k in sorted(self.end_postidx_dict.keys())
+        }
+
+        self.ds = datasets.load_from_disk(os.path.join(base_path, "examples.ds"))
+
+        self.task_list = list(self.metadata.keys())
+        self.train_task_indices = {
+            task: np.arange(
+                self.metadata[task]["start_idx"],
+                self.metadata[task]["end_postidx"]
+            )
+            for task in self.task_list
+        }
+
+    def __len__(self):
+        return len(self.ds)
+
+    def _get_task(self, idx):
+        task = None
+        for end_postidx, task2 in self.end_postidx_dict.items():
+            if idx < end_postidx:
+                task = task2
+                break
+        assert task is not None
+        assert idx < self.metadata[task]["end_postidx"], (idx, self.metadata[task]["end_postidx"])
+        return task
+
+    def __getitem__(self, idx):
+        task = self._get_task(idx)
+        pos_examples = self.metadata[task]["pos_ex"]
+        num_hyper_examples = min(len(pos_examples), self.max_num_hyper_examples)
+        hyper_indices = self.rng.choice(
+            a=len(pos_examples),
+            size=num_hyper_examples,
+            replace=False,
+        )
+        hyper_examples = [pos_examples[idx] for idx in hyper_indices]
+
+        # Copied
+        candidate_hyper_input_ids = [
+            format_hyper_inputs(ex)
+            for ex in hyper_examples
+        ]
+        if len(candidate_hyper_input_ids[0]) > self.max_hyper_length:
+            # Special handling if first hyper-example is already too long
+            # noinspection PyTypeChecker
+            raw_hyper_input_ids = []
+            if self.add_definition:
+                raw_hyper_input_ids += self.metadata[task]["def"] + POST_DEFINITION_INDICATOR
+            raw_hyper_input_ids += format_hyper_inputs(hyper_examples[0])
+            hyper_input_ids = truncate(
+                raw_hyper_input_ids,
+                max_length=self.max_hyper_length - self.num_gist_tokens - 1,
+                side=LEFT,
+            ) + self.gist_tokens
+        else:
+            hyper_input_ids = []
+            if self.add_definition:
+                hyper_input_ids += self.metadata[task]["def"] + POST_DEFINITION_INDICATOR
+            for ex in candidate_hyper_input_ids:
+                if len(hyper_input_ids) + len(ex) > \
+                        self.max_hyper_length - self.num_gist_tokens - 1 - len(EXAMPLE_SEPARATOR):
+                    break
+                hyper_input_ids += ex + EXAMPLE_SEPARATOR
+            hyper_input_ids += self.gist_tokens
+            hyper_input_ids = pad(hyper_input_ids, side=RIGHT, max_length=self.max_hyper_length - 1)
+        hyper_input_ids = [BOS_TOKEN_ID] + hyper_input_ids
+        assert len(hyper_input_ids) == self.max_hyper_length
+        # End Copied
+
+        # Stand-in
+        actual_example = self.ds[idx]
+
+        # Copied
+        input_ids = format_input_ids(actual_example, max_downstream_length=self.max_downstream_length)
+        labels = format_labels(actual_example, max_downstream_length=self.max_downstream_length)
+        assert len(input_ids) == self.max_downstream_length
+        assert len(labels) == self.max_downstream_length
+        # End copied
+
+        return {
+            "hyper_input_ids": hyper_input_ids,
+            "input_ids": input_ids,
+            "labels": labels,
+            "task_name": task,
+        }

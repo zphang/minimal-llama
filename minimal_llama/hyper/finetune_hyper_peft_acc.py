@@ -23,6 +23,8 @@ def run():
     parser.add_argument("--dataset_type", type=str, default="pre")
     parser.add_argument("--max_num_hyper_examples", type=int, default=32)
     parser.add_argument("--num_downstream_examples", type=int, default=1)
+    parser.add_argument("--hyper_example_mode", type=str, default="sample")
+    parser.add_argument("--hyper_example_copy_factor", type=float, default=1.0)
     parser.add_argument("--save_dir", type=str)
     parser.add_argument("--torch_save_dir", type=str)
     parser.add_argument("--lr", type=float, default=2e-4)
@@ -147,6 +149,8 @@ def run():
             args.dataset_path,
             max_num_hyper_examples=args.max_num_hyper_examples,
             num_downstream_examples=args.num_downstream_examples,
+            hyper_example_mode=args.hyper_example_mode,
+            hyper_example_copy_factor=args.hyper_example_copy_factor,
             seed_offset=accelerator.process_index * 1000,
         )
         train_iterator = get_hyper_train_iterator(

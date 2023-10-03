@@ -80,6 +80,7 @@ def run():
             generated = model.generate(
                 input_ids=converted_batch["input_ids"].cuda(),
                 generation_length=args.generation_length,
+                use_pefts=True,
             )
 
         predictions = clean_predictions(generated, tokenizer=tokenizer)

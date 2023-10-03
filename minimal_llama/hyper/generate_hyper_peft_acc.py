@@ -8,6 +8,7 @@ import datasets
 import transformers
 
 import minimal_llama.hyper.hyper1 as hyper1
+import minimal_llama.hyper.data.hyper_dataset_v2 as hyper_dataset_v2
 import accelerate
 from accelerate.utils.operations import gather_object
 
@@ -18,6 +19,8 @@ def run():
     parser.add_argument("--hf_path", type=str)
     parser.add_argument("--load_path", type=str)
     parser.add_argument("--dataset_path", type=str)
+    parser.add_argument("--dataset_type", type=str, default="pre")
+    parser.add_argument("--max_num_hyper_examples", type=int, default=32)
     parser.add_argument("--save_dir", type=str)
     parser.add_argument("--lora_rank", type=int, default=8)
     parser.add_argument("--raw_full_layers", type=str, default="")
@@ -28,6 +31,7 @@ def run():
     parser.add_argument("--filename", type=str, default="gen_data")
     parser.add_argument("--model_size", type=str, default="7b")
     parser.add_argument("--skip_sub_model", action="store_true", default=False)
+    parser.add_argument("--seed", type=int, default=1234)
     args = parser.parse_args()
     torch.manual_seed(1)
 
@@ -61,14 +65,30 @@ def run():
     load_out = model.load_state_dict(loaded, strict=False)
     assert not load_out.unexpected_keys
 
-    ds = datasets.load_from_disk(args.dataset_path)
-    dataloader = torch.utils.data.DataLoader(
-        ds,
-        batch_size=args.batch_size,
-        pin_memory=True,
-        collate_fn=data_collator,
-    )
-    dataloader = accelerator.prepare_data_loader(dataloader)
+    if args.dataset_type == "pre":
+        ds = datasets.load_from_disk(args.dataset_path)
+        dataloader = torch.utils.data.DataLoader(
+            ds,
+            batch_size=args.batch_size,
+            pin_memory=True,
+            collate_fn=data_collator,
+        )
+        dataloader = accelerator.prepare_data_loader(dataloader)
+    elif args.dataset_type == "hyper":
+        ds = hyper_dataset_v2.NatInstHyperValidationDataset(
+            rng_seed=args.seed,
+            base_path=args.dataset_path,
+            max_num_hyper_examples=args.max_num_hyper_examples,
+        )
+        dataloader = torch.utils.data.DataLoader(
+            ds,
+            batch_size=args.batch_size,
+            pin_memory=True,
+            collate_fn=data_collator,
+        )
+        dataloader = accelerator.prepare_data_loader(dataloader)
+    else:
+        raise KeyError(args.dataset_type)
     os.makedirs(args.save_dir, exist_ok=True)
 
     eval_data = {}
