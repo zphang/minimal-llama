@@ -905,7 +905,7 @@ class NoInitExtendedEmbedding(nn.Embedding):
         self.extended_weight = nn.Parameter(extended_embeddings)
 
 
-def create_model(model_name, hf_path, use_4bit=False, device=None, config=None):
+def create_model(model_name, hf_path, use_4bit=False, device=None, config=None, skip_init_embed=False):
     if config is None:
         config = LLAMA_CONFIG_DICT[model_name]
     weight_map = io_utils.read_json(os.path.join(hf_path, "pytorch_model.bin.index.json"))["weight_map"]
@@ -954,13 +954,14 @@ def create_model(model_name, hf_path, use_4bit=False, device=None, config=None):
             for k in loaded:
                 state_keys.remove(k)
 
-    initialize_pefts(model)
+    initialize_pefts(model, skip_init_embed=skip_init_embed)
 
     return model
 
 
-def initialize_pefts(model):
-    model.model.embed_tokens.reset_extended_embeddings()
+def initialize_pefts(model, skip_init_embed=False):
+    if not skip_init_embed:
+        model.model.embed_tokens.reset_extended_embeddings()
     for layer in model.model.layers:
         layer.self_attn.q_proj.reset_lora_parameters()
         layer.self_attn.k_proj.reset_lora_parameters()

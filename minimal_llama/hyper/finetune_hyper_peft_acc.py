@@ -35,11 +35,13 @@ def run():
     parser.add_argument("--total_steps", type=int, default=3000)
     parser.add_argument("--save_freq", type=int, default=2000)
     parser.add_argument("--checkpoint_freq", type=int, default=1000)
+    parser.add_argument("--save0", action="store_true", default=False)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--model_size", type=str, default="7b")
     parser.add_argument("--lr_scheduler", action="store_true")
     parser.add_argument("--no_wandb", action="store_true", default=False)
+    parser.add_argument("--skip_init_embed", action="store_true", default=False)
     args = parser.parse_args()
     torch.manual_seed(1)
 
@@ -80,6 +82,7 @@ def run():
         hf_path=args.hf_path,
         use_4bit=True,
         device=device,
+        skip_init_embed=args.skip_init_embed,
     )
     # optimizer = bitsandbytes.optim.AdamW(model.parameters(), lr=args.lr, is_paged=True, optim_bits=32)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.99))
@@ -166,6 +169,14 @@ def run():
         raise KeyError(args.dataset_type)
     torch.cuda.empty_cache()
     accelerator.wait_for_everyone()
+
+    if args.save0:
+        save_model(
+            accelerator=accelerator,
+            model_to_save=model_to_save,
+            torch_save_dir=args.save_dir,
+            completed_steps=0,
+        )
 
     loss = None
     optimizer.zero_grad()
