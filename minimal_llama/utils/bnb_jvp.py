@@ -1,11 +1,13 @@
 from bitsandbytes.functional import *
 import bitsandbytes.functional as bbf
+import bitsandbytes.autograd._functions as bbaf
 
 
 IS_SWAPPED = False
 
 dequantize_blockwise_old = bbf.dequantize_blockwise
 dequantize_4bit_old = bbf.dequantize_4bit
+MatMul4BitOld = bbaf.MatMul4Bit
 
 
 def apply_changes():
@@ -14,6 +16,8 @@ def apply_changes():
         return
     bbf.dequantize_blockwise = dequantize_blockwise_new
     bbf.dequantize_4bit = dequantize_4bit_new
+    bbaf.MatMul4Bit = MatMul4BitNew
+
     IS_SWAPPED = True
 
 
@@ -23,7 +27,20 @@ def undo_changes():
         return
     bbf.dequantize_blockwise = dequantize_blockwise_old
     bbf.dequantize_4bit = dequantize_4bit_old
+    bbaf.MatMul4Bit = MatMul4BitOld
     IS_SWAPPED = False
+
+
+def unwrap(x):
+    if isinstance(x, torch.Tensor):
+        if torch._C._functorch.is_gradtrackingtensor(x):
+            return torch._C._functorch.get_unwrapped(x)
+        else:
+            return x
+    elif isinstance(x, list):
+        return [unwrap(x1) for x1 in x]
+    else:
+        return x
 
 
 def dequantize_blockwise_new(
@@ -171,7 +188,7 @@ def dequantize_4bit_new(A: Tensor,quant_state: Tuple[Tensor, Tensor] = None, abs
     else: return out
 
 
-class MatMul4Bit(torch.autograd.Function):
+class MatMul4BitNew(torch.autograd.Function):
     # forward is the same, but we added the fallback for pre-turing GPUs
     # backward is mostly the same, but adds one extra clause (see "elif state.CxB is not None")
 
@@ -227,4 +244,3 @@ class MatMul4Bit(torch.autograd.Function):
         if req_gradA: grad_A = torch.matmul(grad_output, F.dequantize_fp4(B, ctx.state).to(grad_output.dtype).t())
 
         return grad_A, grad_B, None, grad_bias, None
-
