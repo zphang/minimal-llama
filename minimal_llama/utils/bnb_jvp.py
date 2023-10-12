@@ -1,3 +1,4 @@
+import torch.nn.functional as F
 from bitsandbytes.functional import *
 import bitsandbytes.functional as bbf
 import bitsandbytes.autograd._functions as bbaf
