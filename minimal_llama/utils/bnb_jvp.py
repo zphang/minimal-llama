@@ -90,7 +90,7 @@ def dequantize_blockwise_new(
     absmax, code, blocksize, nested, dtype, offset, state2 = quant_state
 
     if nested:
-        absmax = dequantize_blockwise(absmax, state2)
+        absmax = dequantize_blockwise_new(absmax, state2)
         absmax += offset
         if absmax.dtype != torch.float32: absmax = absmax.float()
 
@@ -100,6 +100,8 @@ def dequantize_blockwise_new(
     if A.device.type != 'cpu':
         device = pre_call(A.device)
         code = code.to(A.device)
+        code = unwrap(code)
+        out = unwrap(out)
         if blocksize not in [2048, 4096, 1024, 512, 256, 128, 64]:
             raise ValueError(f"The blockwise of {blocksize} is not supported. Supported values: [2048, 4096, 1024, 512, 256, 128, 64]")
         is_on_gpu([A, absmax, out])
@@ -161,8 +163,9 @@ def dequantize_4bit_new(A: Tensor,quant_state: Tuple[Tensor, Tensor] = None, abs
 
     if compressed_stats is not None:
         offset, state2 = compressed_stats
-        absmax = dequantize_blockwise(absmax, state2)
-        absmax += offset
+        absmax = bbf.dequantize_blockwise(absmax, state2)
+        absmax = unwrap(absmax + offset)
+        quant_state[0] = absmax
         if absmax.dtype != torch.float32: absmax = absmax.float()
 
     if out is None:
@@ -173,6 +176,7 @@ def dequantize_4bit_new(A: Tensor,quant_state: Tuple[Tensor, Tensor] = None, abs
 
     device = pre_call(A.device)
     is_on_gpu([A, absmax, out])
+    out = unwrap(out)
     if out.dtype == torch.float32:
         if quant_type == 'fp4':
             lib.cdequantize_blockwise_fp32_fp4(get_ptr(None), get_ptr(A), get_ptr(absmax), get_ptr(out), ct.c_int(blocksize), ct.c_int(n))
@@ -202,35 +206,17 @@ class MatMul4BitNew(torch.autograd.Function):
     # backward is mostly the same, but adds one extra clause (see "elif state.CxB is not None")
 
     @staticmethod
-    def forward(ctx, A, B, out=None, bias=None, state=None):
-        # default of pytorch behavior if inputs are empty
-        ctx.is_empty = False
-        if prod(A.shape) == 0:
-            ctx.is_empty = True
-            ctx.A = A
-            ctx.B = B
-            ctx.bias = bias
-            B_shape = state[1]
-            if A.shape[-1] == B_shape[0]:
-                return torch.empty(A.shape[:-1] + B_shape[1:], dtype=A.dtype, device=A.device)
-            else:
-                return torch.empty(A.shape[:-1] + B_shape[:1], dtype=A.dtype, device=A.device)
-
-
-        # 1. Dequantize
-        # 2. MatmulnN
-        output = torch.nn.functional.linear(A, F.dequantize_4bit(B, state).to(A.dtype).t(), bias)
-
-        # 3. Save state
-        ctx.state = state
-        ctx.dtype_A, ctx.dtype_B, ctx.dtype_bias = A.dtype, B.dtype, None if bias is None else bias.dtype
-
-        if any(ctx.needs_input_grad[:2]):
-            ctx.tensors = (A, B)
-        else:
-            ctx.tensors = (None, None)
-
+    def forward(A, B, out=None, bias=None, state=None):
+        output = torch.nn.functional.linear(A, bbf.dequantize_4bit(B, state).to(A.dtype).t(), bias)
         return output
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        A, B, out, bias, state = inputs
+        ctx.is_empty = False
+        ctx.state = list(state)
+        ctx.dtype_A, ctx.dtype_B, ctx.dtype_bias = A.dtype, B.dtype, None if bias is None else bias.dtype
+        ctx.tensors = (A, B)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -250,6 +236,18 @@ class MatMul4BitNew(torch.autograd.Function):
 
         # not supported by PyTorch. TODO: create work-around
         #if req_gradB: grad_B = torch.matmul(grad_output.t(), A)
-        if req_gradA: grad_A = torch.matmul(grad_output, F.dequantize_4bit(B, ctx.state).to(grad_output.dtype).t())
+        if req_gradA: grad_A = torch.matmul(grad_output, bbf.dequantize_4bit(B, ctx.state).to(grad_output.dtype).t())
 
         return grad_A, grad_B, None, grad_bias, None
+
+    @staticmethod
+    def jvp(ctx, tangent_A, tangent_B, out_, tangent_bias, state_):
+        A, B = ctx.tensors
+        state = ctx.state
+        new_state = unwrap(state)
+        B = torch._C._functorch.get_unwrapped(B)
+        tangent_A = torch._C._functorch.get_unwrapped(tangent_A)
+        out = torch.matmul(tangent_A, bbf.dequantize_4bit(B, new_state).to(tangent_A.dtype))
+        if tangent_bias is not None:
+            out += tangent_bias
+        return out
