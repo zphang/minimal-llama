@@ -10,6 +10,9 @@ dequantize_blockwise_old = bbf.dequantize_blockwise
 dequantize_4bit_old = bbf.dequantize_4bit
 MatMul4BitOld = bbaf.MatMul4Bit
 
+import os
+
+
 
 def apply_changes():
     global IS_SWAPPED
@@ -165,7 +168,12 @@ def dequantize_4bit_new(A: Tensor,quant_state: Tuple[Tensor, Tensor] = None, abs
         offset, state2 = compressed_stats
         absmax = bbf.dequantize_blockwise(absmax, state2)
         absmax = unwrap(absmax + offset)
-        quant_state[0] = absmax
+        if os.environ["MODIFY_IN_PLACE"] == "1":
+            quant_state[0] = absmax
+        elif os.environ["MODIFY_IN_PLACE"] == "0":
+            pass
+        else:
+            raise ValueError(os.environ["MODIFY_IN_PLACE"])
         if absmax.dtype != torch.float32: absmax = absmax.float()
 
     if out is None:

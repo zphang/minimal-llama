@@ -1,4 +1,5 @@
 import dataclasses
+from typing import Optional
 
 import math
 import tqdm.auto as tqdm
@@ -8,7 +9,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import bitsandbytes as bnb
 from accelerate import init_empty_weights
-from flash_attn import flash_attn_func
 
 import minimal_llama.utils.io_utils as io_utils
 from transformers.utils.bitsandbytes import set_module_quantized_tensor_to_device
@@ -74,33 +74,45 @@ class LLaMAModel(nn.Module):
         self.model = LLaMAInnerModel(config)
         self.lm_head = NoInitLinear(config.dim, config.vocab_size, bias=False, dtype=config.dtype)
 
-    def forward(self,
-                input_ids,
-                embeds=None,
-                attention_mask=None):
+    def forward(
+        self,
+        input_ids,
+        attention_mask=None,
+        peft_params: Optional[dict] = None,
+    ):
         """Forward pass (with full decode sequence, intended for training or loss-scoring)
 
         :param input_ids: [batch_size, seq_len]
             - Always right-padded. Masks are generated based on padding tokens
-        :param embeds
         :param attention_mask
+        :param peft_params
         :return: logits [batch_size, seq_len]
         """
-        # 1) Create masks
-        # decoder mask
-        # [batch_size, num_heads=1, q_len=seq_len, kv_len=seq_len]
-        rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
-        cos, sin = self.get_cos_sin(rope_embed_ids)
-
-        # 2) Forward pass
-        # [batch_size, seq_len, hidden_dim]
-        model_out = self.model(
-            input_ids,
-            cos=cos, sin=sin,
-            embeds=embeds,
-            use_kv_cache=False,
-            attention_mask=attention_mask,
-        )
+        if dict_get(peft_params, "prefix"):
+            # [batch_size, num_heads=1, q_len=seq_len, kv_len=seq_len]
+            prefix_length = peft_params["prefix"][0]["key"].shape[2]
+            rope_embed_ids = create_rope_embed_ids(input_ids=input_ids) + prefix_length
+            cos, sin = self.get_cos_sin(rope_embed_ids)
+            attention_mask = create_prefix_train_attention_mask(input_ids, prefix_length)
+            # [batch_size, seq_len, hidden_dim]
+            model_out = self.model(
+                input_ids,
+                cos=cos, sin=sin,
+                use_kv_cache=True,
+                kv_cache=peft_params["prefix"],
+                attention_mask=attention_mask,
+                peft_params=peft_params,
+            )
+        else:
+            rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
+            cos, sin = self.get_cos_sin(rope_embed_ids)
+            model_out = self.model(
+                input_ids,
+                cos=cos, sin=sin,
+                use_kv_cache=False,
+                attention_mask=attention_mask,
+                peft_params=peft_params,
+            )
         # [batch_size, seq_len, vocab_size]
         logits = self.lm_head(model_out["hidden_states"])
         return logits
@@ -263,11 +275,11 @@ class LLaMAInnerModel(nn.Module):
         self,
         input_ids,
         cos, sin,
-        embeds=None,
         use_kv_cache=False,
         kv_cache=None,
         num_valid_tokens=None,
         attention_mask=None,
+        peft_params: Optional[dict] = None,
     ):
         """
         :param input_ids: [batch_size, seq_len]
@@ -283,9 +295,10 @@ class LLaMAInnerModel(nn.Module):
         :param num_valid_tokens: [batch_size]
             Only used for decoding
         :param attention_mask: [batch_size, num_heads, q_len, kv_len]
+        :param peft_params
         """
-        if embeds is not None:
-            hidden_states = embeds
+        if dict_get(peft_params, "embeds") is not None:
+            hidden_states = dict_get(peft_params, "embeds")
         else:
             hidden_states = self.embed_tokens(input_ids)
 
@@ -322,6 +335,7 @@ class LLaMAInnerModel(nn.Module):
                     kv_cache=layer_kv_cache,
                     num_valid_tokens=num_valid_tokens,
                     attention_mask=attention_mask,
+                    peft_params=dict_get(peft_params, f"layer_{layer_i}"),
                 )
 
             hidden_states = layer_out["hidden_states"]
@@ -353,6 +367,7 @@ class LLaMALayer(nn.Module):
         kv_cache=None,
         num_valid_tokens=None,
         attention_mask=None,
+        peft_params: Optional[dict] = None,
         offload_to_cpu=False,  # Needed for activation checkpointing? idk
     ):
         # 1) Self-attention
@@ -373,13 +388,17 @@ class LLaMALayer(nn.Module):
             kv_cache=kv_cache,
             num_valid_tokens=num_valid_tokens,
             attention_mask=attention_mask,
+            peft_params=dict_get(peft_params, "self_attn"),
         )
         # [batch_size, seq_len, hidden_dim]
         hidden_states = hidden_states + raw_self_attn_output["attn_output"]
         check_nan(hidden_states)
         # 2) FFN
         # [batch_size, seq_len, hidden_dim]
-        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+        hidden_states = hidden_states + self.mlp(
+            self.post_attention_layernorm(hidden_states),
+            peft_params=dict_get(peft_params, "mlp"),
+        )
         check_nan(hidden_states)
         if kv_cache:
             return {
@@ -408,8 +427,12 @@ class MLP(nn.Module):
         self.up_proj = create_linear(dim, hidden_dim, bias=False, dtype=config.dtype, use_4bit=config.use_4bit)
         self.down_proj = create_linear(hidden_dim, dim, bias=False, dtype=config.dtype, use_4bit=config.use_4bit)
 
-    def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+    def forward(self, x, peft_params: Optional[dict] = None):
+        return self.down_proj(
+            F.silu(self.gate_proj(x, lora=dict_get(peft_params, "gate_proj")))
+            * self.up_proj(x, lora=dict_get(peft_params, "up_proj")),
+            lora=dict_get(peft_params, "down_proj"),
+        )
 
 
 class RMSNorm(torch.nn.Module):
@@ -442,11 +465,14 @@ class Attention(nn.Module):
         self.o_proj = create_linear(config.dim, config.dim, bias=False, dtype=config.dtype, use_4bit=config.use_4bit)
         self.rotary_emb = RotaryEmbedding(dim=self.head_dim, max_position_embeddings=config.max_seq_length)
 
-    def forward(self, hidden_states, cos, sin,
-                use_kv_cache=False,
-                kv_cache=None,
-                num_valid_tokens=None,
-                attention_mask=None,):
+    def forward(
+        self, hidden_states, cos, sin,
+        use_kv_cache=False,
+        kv_cache=None,
+        num_valid_tokens=None,
+        attention_mask=None,
+        peft_params: Optional[dict] = None,
+    ):
         """
         :param hidden_states: [batch_size, seq_len, hidden_dim]
         :param cos:
@@ -459,16 +485,17 @@ class Attention(nn.Module):
         :param num_valid_tokens: [batch_size]
             Only used for decoding
         :param attention_mask: [batch_size, num_heads, q_len, kv_len]
+        :param peft_params:
         :return:
         """
         batch_size, q_seq_len, hidden_dim = hidden_states.size()
 
         # (batch_size, num_heads, q_seq_len, head_dim)
-        query_states = self.q_proj(hidden_states).view(
+        query_states = self.q_proj(hidden_states, lora=dict_get(peft_params, "q")).view(
             batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(
+        key_states = self.k_proj(hidden_states, lora=dict_get(peft_params, "k")).view(
             batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(
+        value_states = self.v_proj(hidden_states, lora=dict_get(peft_params, "v")).view(
             batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos=cos, sin=sin)
         if use_kv_cache:
@@ -527,7 +554,7 @@ class Attention(nn.Module):
         attn_output = attn_output.transpose(1, 2).contiguous().view(
             batch_size, q_seq_len, hidden_dim,
         )
-        attn_output = self.o_proj(attn_output)
+        attn_output = self.o_proj(attn_output, lora=dict_get(peft_params, "o"))
         check_nan(attn_output)
         if use_kv_cache:
             new_kv_cache = {"key": key_states, "value": value_states}
@@ -603,12 +630,30 @@ class NoInitLinear(nn.Linear):
     def reset_parameters(self) -> None:
         pass
 
+    def forward(self, x: torch.Tensor, lora: Optional[dict] = None) -> torch.Tensor:
+        out = super().forward(x)
+        if lora:
+            return out + lora["scaling"] * (
+                F.linear(F.linear(x, lora["a"]), lora["b"])
+            )
+        else:
+            return out
+
 
 class NoInit4bitLinear(bnb.nn.Linear4bit):
     source_cls = nn.Linear
 
     def reset_parameters(self) -> None:
         pass
+
+    def forward(self, x: torch.Tensor, lora: Optional[dict] = None) -> torch.Tensor:
+        out = super().forward(x)
+        if lora:
+            return out + lora["scaling"] * (
+                F.linear(F.linear(x, lora["a"]), lora["b"])
+            )
+        else:
+            return out
 
 
 def create_linear(in_features: int, out_features: int, bias: bool, dtype: torch.Type,
@@ -694,3 +739,24 @@ def create_causal_attention_mask(seq_len, device):
     # noinspection PyTypeChecker
     attn_mask = torch.tril(torch.ones([seq_len, seq_len], dtype=bool))[None, None, :, :]
     return attn_mask.to(device=device)
+
+
+def dict_get(d: Optional[dict], key: str):
+    if d is None:
+        return None
+    return d.get(key)
+
+
+def create_prefix_train_attention_mask(input_ids, prefix_length):
+    """Create attention mask for prefix training
+
+    :param input_ids: input ids
+    :param prefix_length:
+    :return:
+    """
+    batch_size, seq_len = input_ids.shape
+    input_mask = torch.ones([seq_len, seq_len], dtype=torch.bool)
+    input_mask.tril_()
+    prefix_mask = torch.ones([seq_len, prefix_length], dtype=torch.bool)
+    full_mask = torch.cat([prefix_mask, input_mask], dim=1)
+    return full_mask[None, None, :, :].to(input_ids.device)
