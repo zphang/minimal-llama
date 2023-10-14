@@ -107,6 +107,10 @@ class LLaMAModel(nn.Module):
         if self.prefix_config.prefix_mode in (PREFIX_MODE_PREFIX, PREFIX_MODE_LM_ADAPTER_H):
             # [batch_size, num_heads=1, q_len=seq_len, kv_len=seq_len]
             prefix_length = prefixes[0]["key"].shape[-2]
+            if self.prefix_config.prefix_mode == PREFIX_MODE_PREFIX_H:
+                kv_cache = self.init_kv_cache_from_prefix(prefixes)
+            else:
+                kv_cache = prefixes
             rope_embed_ids = create_rope_embed_ids(input_ids=input_ids) + prefix_length
             cos, sin = self.get_cos_sin(rope_embed_ids)
             attention_mask = create_prefix_train_attention_mask(input_ids, prefix_length)
@@ -115,7 +119,7 @@ class LLaMAModel(nn.Module):
                 input_ids,
                 cos=cos, sin=sin,
                 use_kv_cache=True,
-                kv_cache=prefixes,
+                kv_cache=kv_cache,
                 attention_mask=attention_mask,
                 prefixes=None,
             )
