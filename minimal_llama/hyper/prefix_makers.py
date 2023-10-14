@@ -75,6 +75,51 @@ class PrefixMLPWrapper(nn.Module):
         return prefixes
 
 
+class HiddenStateMLPWrapper(nn.Module):
+    def __init__(self, num_tokens, num_layers, num_heads, head_dim,
+                 include_gates: bool = False,
+                 apply_internal_gates: bool = False,
+                 intermediate_size=1024,
+                 dtype=torch.bfloat16):
+        super().__init__()
+        self.num_tokens = num_tokens
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.hidden_dim = num_heads * head_dim
+        self.include_gates = include_gates
+        self.apply_internal_gates = apply_internal_gates
+        hidden_dim = num_heads * head_dim
+        self.params = nn.Parameter(torch.empty([num_tokens, hidden_dim], dtype=dtype))
+        self.f1 = nn.Linear(hidden_dim, intermediate_size, dtype=dtype)
+        self.f2 = nn.Linear(intermediate_size, num_layers * hidden_dim, dtype=dtype)
+        torch.nn.init.normal_(self.params)
+
+        if self.include_gates:
+            self.gates = nn.Parameter(torch.zeros([num_layers, num_heads], dtype=dtype))
+            torch.nn.init.zeros_(self.gates)
+
+    def forward(self, batch_size):
+        prefixes = []
+        # num_tokens, num_layers, hidden_dim
+        params = self.f2(F.tanh(self.f1(self.params)))
+        # num_layers, num_heads, num_tokens, head_dim
+        params = params.view(
+            self.num_tokens, self.num_layers, self.hidden_dim
+        ).permute(1, 0, 2)
+        for layer_i in range(self.num_layers):
+            layer_prefix = {
+                "hidden_states": params[layer_i][None].expand(batch_size, -1, -1),
+            }
+            if self.include_gates:
+                if self.apply_internal_gates:
+                    layer_prefix = layer_prefix["hidden_states"] * self.gates[layer_i]
+                else:
+                    layer_prefix["gate"] = self.gates[layer_i]
+            prefixes.append(layer_prefix)
+        return prefixes
+
+
 class GistMLPWrapper(nn.Module):
     def __init__(self, num_tokens, num_layers, num_heads, head_dim,
                  include_gates: bool = False,
@@ -191,7 +236,7 @@ class HiddenStateWrapper(nn.Module):
 
 
 def create_prefix_maker(num_tokens: int, config: prefix_llama.LLaMAConfig, prefix_type: str = "mlp",
-                        include_gates: bool = False, model=None):
+                        include_gates: bool = False, internal_gates: bool = False, model=None):
     if prefix_type == "plain":
         return PrefixWrapper(
             num_tokens=num_tokens,
@@ -215,6 +260,15 @@ def create_prefix_maker(num_tokens: int, config: prefix_llama.LLaMAConfig, prefi
             num_heads=config.n_heads,
             head_dim=config.head_dim,
             include_gates=include_gates,
+        )
+    elif prefix_type == "hidden_states_mlp":
+        return HiddenStateMLPWrapper(
+            num_tokens=num_tokens,
+            num_layers=config.n_layers,
+            num_heads=config.n_heads,
+            head_dim=config.head_dim,
+            include_gates=include_gates,
+            apply_internal_gates=internal_gates,
         )
     elif prefix_type == "gist":
         return GistMLPWrapper(

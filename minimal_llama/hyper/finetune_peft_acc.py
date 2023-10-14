@@ -28,6 +28,7 @@ def run():
     parser.add_argument("--prefix_mode", type=str, default=prefix_llama.PREFIX_MODE_PREFIX)
     parser.add_argument("--prefix_maker_mode", type=str, default="mlp")
     parser.add_argument("--prefix_include_gates", action="store_true", default=False)
+    parser.add_argument("--prefix_internal_gates", action="store_true", default=False)
     parser.add_argument("--lora_rank", type=int, default=8)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--grad_accum_steps", type=int, default=1)
@@ -39,7 +40,6 @@ def run():
     parser.add_argument("--lr_scheduler", action="store_true")
     parser.add_argument("--no_wandb", action="store_true", default=False)
     args = parser.parse_args()
-    assert args.prefix_maker_mode in ["plain", "mlp", "hidden_states"]
     torch.manual_seed(0)
 
     # Initialize Accelerate
@@ -93,6 +93,7 @@ def run():
             config=config,
             prefix_type=args.prefix_maker_mode,
             include_gates=args.prefix_include_gates,
+            internal_gates=args.prefix_internal_gates,
         ).to(device)
         # optimizer = bitsandbytes.optim.AdamW(prefix_maker.parameters(), lr=args.lr, is_paged=True, optim_bits=32)
         optimizer = torch.optim.Adam(prefix_maker.parameters(), lr=args.lr, betas=(0.9, 0.99))

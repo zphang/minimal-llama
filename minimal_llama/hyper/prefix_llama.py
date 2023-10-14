@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import bitsandbytes as bnb
 from accelerate import init_empty_weights
+from flash_attn import flash_attn_func
 
 import minimal_llama.utils.io_utils as io_utils
 from transformers.utils.bitsandbytes import set_module_quantized_tensor_to_device
@@ -104,9 +105,9 @@ class LLaMAModel(nn.Module):
         :return: logits [batch_size, seq_len]
         """
         assert attention_mask is None
-        if self.prefix_config.prefix_mode in (PREFIX_MODE_PREFIX, PREFIX_MODE_LM_ADAPTER_H):
+        if self.prefix_config.prefix_mode in (PREFIX_MODE_PREFIX, PREFIX_MODE_PREFIX_H):
             # [batch_size, num_heads=1, q_len=seq_len, kv_len=seq_len]
-            prefix_length = prefixes[0]["key"].shape[-2]
+            prefix_length = self.get_prefix_len(prefixes)
             if self.prefix_config.prefix_mode == PREFIX_MODE_PREFIX_H:
                 kv_cache = self.init_kv_cache_from_prefix(prefixes)
             else:
@@ -177,12 +178,23 @@ class LLaMAModel(nn.Module):
         kv_cache = []
         for i, h in enumerate(prefix_h):
             layer = self.model.layers[i]
-            h = layer.input_layernor(h)
+            h = layer.input_layernorm(h["hidden_states"])
+            batch_size, seq_len, _ = h.shape
             kv_cache.append({
-                "key": layer.self_attn.key_proj(h),
-                "value": layer.self_attn.key_proj(h),
+                "key": layer.self_attn.k_proj(h).view(
+                    batch_size, seq_len, self.config.n_heads, self.config.head_dim).transpose(1, 2),
+                "value": layer.self_attn.v_proj(h).view(
+                    batch_size, seq_len, self.config.n_heads, self.config.head_dim).transpose(1, 2),
             })
         return kv_cache
+
+    def get_prefix_len(self, prefixes):
+        if self.prefix_config.prefix_mode == PREFIX_MODE_PREFIX:
+            return prefixes[0]["key"].shape[2]
+        elif self.prefix_config.prefix_mode == PREFIX_MODE_PREFIX_H:
+            return prefixes[0]["hidden_states"].shape[1]
+        else:
+            raise KeyError(self.prefix_config.prefix_mode)
 
     def generate(self, input_ids, generation_length: int = 20,
                  return_output_only=True, prefixes=None, stop_on_eos=True):
@@ -234,7 +246,7 @@ class LLaMAModel(nn.Module):
         #   )]
         # )
         if self.prefix_config.prefix_mode in (PREFIX_MODE_PREFIX, PREFIX_MODE_PREFIX_H):
-            prefix_length = prefixes[0]["key"].shape[-2]
+            prefix_length = self.get_prefix_len(prefixes)
             rope_embed_ids = create_rope_embed_ids(input_ids=input_ids) + prefix_length
             attention_mask = create_prefix_train_attention_mask(input_ids, prefix_length)
         elif self.prefix_config.prefix_mode in (PREFIX_MODE_NONE, PREFIX_MODE_LM_ADAPTER, PREFIX_MODE_LM_ADAPTER_H):
@@ -281,7 +293,7 @@ class LLaMAModel(nn.Module):
             #   )]
             # )
             if self.prefix_config.prefix_mode in (PREFIX_MODE_PREFIX, PREFIX_MODE_PREFIX_H):
-                prefix_length = prefixes[0]["key"].shape[-2]
+                prefix_length = self.get_prefix_len(prefixes)
                 rope_embed_ids = create_rope_embed_ids(
                     input_ids=input_ids, pad_token_id=self.config.pad_token_id) + prefix_length
                 decoding_attention_mask = create_decoding_mask(
@@ -586,16 +598,12 @@ class Attention(nn.Module):
         if q_seq_len == key_states.shape[2]:
 
             if attention_mask is None:
-                # noinspection PyUnresolvedReferences
-                with torch.backends.cuda.sdp_kernel(
-                    enable_math=False, enable_flash=True, enable_mem_efficient=False,
-                ):
-                    attn_output = torch.nn.functional.scaled_dot_product_attention(
-                        query=query_states,
-                        key=key_states,
-                        value=value_states,
-                        is_causal=True,
-                    )
+                attn_output = flash_attn_func(
+                    q=query_states.transpose(1, 2),
+                    k=key_states.transpose(1, 2),
+                    v=value_states.transpose(1, 2),
+                    causal=True,
+                ).transpose(1, 2)
             else:
                 # noinspection PyUnresolvedReferences
                 with torch.backends.cuda.sdp_kernel(

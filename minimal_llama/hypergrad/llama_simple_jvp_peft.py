@@ -74,6 +74,17 @@ class LLaMAModel(nn.Module):
         self.model = LLaMAInnerModel(config)
         self.lm_head = NoInitLinear(config.dim, config.vocab_size, bias=False, dtype=config.dtype)
 
+    def init_kv_cache_from_prefix(self, prefix_h):
+        kv_cache = []
+        for i, h in enumerate(prefix_h):
+            layer = self.model.layers[i]
+            h = layer.input_layernor(h)
+            kv_cache.append({
+                "key": layer.self_attn.key_proj(h),
+                "value": layer.self_attn.key_proj(h),
+            })
+        return kv_cache
+
     def forward(
         self,
         input_ids,
@@ -100,6 +111,22 @@ class LLaMAModel(nn.Module):
                 cos=cos, sin=sin,
                 use_kv_cache=True,
                 kv_cache=peft_params["prefix"],
+                attention_mask=attention_mask,
+                peft_params=peft_params,
+            )
+        elif dict_get(peft_params, "prefix_h"):
+            # [batch_size, num_heads=1, q_len=seq_len, kv_len=seq_len]
+            prefix_length = peft_params["prefix_h"][0]["key"].shape[1]
+            kv_cache = self.init_kv_cache_from_prefix(peft_params["prefix_h"])
+            rope_embed_ids = create_rope_embed_ids(input_ids=input_ids) + prefix_length
+            cos, sin = self.get_cos_sin(rope_embed_ids)
+            attention_mask = create_prefix_train_attention_mask(input_ids, prefix_length)
+            # [batch_size, seq_len, hidden_dim]
+            model_out = self.model(
+                input_ids,
+                cos=cos, sin=sin,
+                use_kv_cache=True,
+                kv_cache=kv_cache,
                 attention_mask=attention_mask,
                 peft_params=peft_params,
             )
@@ -144,9 +171,6 @@ class LLaMAModel(nn.Module):
     def generate(self, input_ids, generation_length: int = 20,
                  return_output_only=True):
         """Generate tokens with efficient caching of KV.
-
-        TODO: Add stopping conditions
-        TODO: Add sampling capabilities
 
         :param input_ids: [batch_size, input_seq_len]
             - Always right-padded. Masks are generated based on padding tokens
