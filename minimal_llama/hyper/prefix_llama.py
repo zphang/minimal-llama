@@ -49,6 +49,7 @@ class LLaMAConfig:
 
 
 PREFIX_MODE_PREFIX = "prefix"
+PREFIX_MODE_PREFIX_H = "prefix_h"
 PREFIX_MODE_NONE = "none"
 PREFIX_MODE_LM_ADAPTER = "lm_adapter"
 PREFIX_MODE_LM_ADAPTER_H = "lm_adapter_h"
@@ -103,9 +104,9 @@ class LLaMAModel(nn.Module):
         :return: logits [batch_size, seq_len]
         """
         assert attention_mask is None
-        if self.prefix_config.prefix_mode == PREFIX_MODE_PREFIX:
+        if self.prefix_config.prefix_mode in (PREFIX_MODE_PREFIX, PREFIX_MODE_LM_ADAPTER_H):
             # [batch_size, num_heads=1, q_len=seq_len, kv_len=seq_len]
-            prefix_length = prefixes[0]["key"].shape[2]
+            prefix_length = prefixes[0]["key"].shape[-2]
             rope_embed_ids = create_rope_embed_ids(input_ids=input_ids) + prefix_length
             cos, sin = self.get_cos_sin(rope_embed_ids)
             attention_mask = create_prefix_train_attention_mask(input_ids, prefix_length)
@@ -168,6 +169,17 @@ class LLaMAModel(nn.Module):
             })
         return kv_cache
 
+    def init_kv_cache_from_prefix(self, prefix_h):
+        kv_cache = []
+        for i, h in enumerate(prefix_h):
+            layer = self.model.layers[i]
+            h = layer.input_layernor(h)
+            kv_cache.append({
+                "key": layer.self_attn.key_proj(h),
+                "value": layer.self_attn.key_proj(h),
+            })
+        return kv_cache
+
     def generate(self, input_ids, generation_length: int = 20,
                  return_output_only=True, prefixes=None, stop_on_eos=True):
         """Generate tokens with efficient caching of KV.
@@ -201,6 +213,8 @@ class LLaMAModel(nn.Module):
             kv_cache = prefixes
         elif self.prefix_config.prefix_mode in (PREFIX_MODE_NONE, PREFIX_MODE_LM_ADAPTER, PREFIX_MODE_LM_ADAPTER_H):
             kv_cache = self.init_kv_cache(batch_size)
+        elif self.prefix_config.prefix_mode == PREFIX_MODE_PREFIX_H:
+            kv_cache = self.init_kv_cache_from_prefix(prefixes)
         else:
             raise KeyError(self.prefix_config.prefix_mode)
         generated_token_ids_list = [original_input_ids]
@@ -215,8 +229,8 @@ class LLaMAModel(nn.Module):
         #     value = [batch_size, num_heads, kv_seq_len=decode_step+1, head_dim]
         #   )]
         # )
-        if self.prefix_config.prefix_mode == PREFIX_MODE_PREFIX:
-            prefix_length = prefixes[0]["key"].shape[2]
+        if self.prefix_config.prefix_mode in (PREFIX_MODE_PREFIX, PREFIX_MODE_PREFIX_H):
+            prefix_length = prefixes[0]["key"].shape[-2]
             rope_embed_ids = create_rope_embed_ids(input_ids=input_ids) + prefix_length
             attention_mask = create_prefix_train_attention_mask(input_ids, prefix_length)
         elif self.prefix_config.prefix_mode in (PREFIX_MODE_NONE, PREFIX_MODE_LM_ADAPTER, PREFIX_MODE_LM_ADAPTER_H):
@@ -262,8 +276,8 @@ class LLaMAModel(nn.Module):
             #     value = [batch_size, num_heads, kv_seq_len=decode_step+1, head_dim]
             #   )]
             # )
-            if self.prefix_config.prefix_mode == PREFIX_MODE_PREFIX:
-                prefix_length = prefixes[0]["key"].shape[2]
+            if self.prefix_config.prefix_mode in (PREFIX_MODE_PREFIX, PREFIX_MODE_PREFIX_H):
+                prefix_length = prefixes[0]["key"].shape[-2]
                 rope_embed_ids = create_rope_embed_ids(
                     input_ids=input_ids, pad_token_id=self.config.pad_token_id) + prefix_length
                 decoding_attention_mask = create_decoding_mask(
@@ -607,7 +621,7 @@ class Attention(nn.Module):
                 prefix_seq_len = layer_prefixes["hidden_states"].size(1)
                 adapter_key = self.k_proj(layer_prefixes["hidden_states"]).view(
                     batch_size, prefix_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-                adapter_value = self.k_proj(layer_prefixes["hidden_states"]).view(
+                adapter_value = self.v_proj(layer_prefixes["hidden_states"]).view(
                     batch_size, prefix_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
             else:
                 raise KeyError(self.prefix_config.prefix_mode)
