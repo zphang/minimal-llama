@@ -96,7 +96,7 @@ class HiddenStateMLPWrapper(nn.Module):
         torch.nn.init.normal_(self.params)
 
         if self.include_gates:
-            self.gates = nn.Parameter(torch.zeros([num_layers, num_heads], dtype=dtype))
+            self.gates = nn.Parameter(torch.empty([num_layers], dtype=dtype))
             torch.nn.init.zeros_(self.gates)
 
     def forward(self, batch_size):
@@ -113,7 +113,7 @@ class HiddenStateMLPWrapper(nn.Module):
             }
             if self.include_gates:
                 if self.apply_internal_gates:
-                    layer_prefix = layer_prefix["hidden_states"] * self.gates[layer_i]
+                    layer_prefix["hidden_states"] = layer_prefix["hidden_states"] * self.gates[layer_i]
                 else:
                     layer_prefix["gate"] = self.gates[layer_i]
             prefixes.append(layer_prefix)
