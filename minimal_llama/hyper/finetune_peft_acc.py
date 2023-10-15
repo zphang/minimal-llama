@@ -98,12 +98,6 @@ def run():
         # optimizer = bitsandbytes.optim.AdamW(prefix_maker.parameters(), lr=args.lr, is_paged=True, optim_bits=32)
         optimizer = torch.optim.Adam(prefix_maker.parameters(), lr=args.lr, betas=(0.9, 0.99))
         save_model = prefix_maker
-
-        if accelerator.process_index == 0:
-            for k, v in prefix_maker.state_dict().items():
-                print(k, tuple(v.shape))
-        import time
-        time.sleep(10)
     elif args.peft_type == "lora":
         config = lora_llama.LLAMA_CONFIG_DICT[args.model_size]
         config.dtype = torch.bfloat16
@@ -139,7 +133,7 @@ def run():
         completed_steps = train_state["completed_steps"]
         load_path = os.path.join(args.save_dir, f"checkpoint_{completed_steps:05d}.pt")
         print0("Resuming from", load_path)
-        loaded = torch.load(load_path)
+        loaded = torch.load(load_path, map_location="cpu")
         if args.peft_type == "prefix":
             # noinspection PyUnboundLocalVariable
             prefix_maker.load_state_dict(loaded["model"])
