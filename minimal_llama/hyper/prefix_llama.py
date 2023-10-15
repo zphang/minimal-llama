@@ -813,7 +813,7 @@ def create_decoding_mask(orig_num_valid_tokens, max_seq_len, initial_max_len):
     mask = torch.ones([batch_size, 1, max_seq_len])
     for i, nvt in enumerate(orig_num_valid_tokens):
         mask[i, :, nvt:initial_max_len] = 0
-    return mask[:, None, -1:, ].bool()
+    return mask[:, None, :, :].bool()
 
 
 def create_prefix_train_attention_mask(input_ids, prefix_length):

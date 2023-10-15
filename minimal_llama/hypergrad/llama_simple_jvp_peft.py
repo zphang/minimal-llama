@@ -76,12 +76,18 @@ class LLaMAModel(nn.Module):
 
     def init_kv_cache_from_prefix(self, prefix_h):
         kv_cache = []
-        for i, h in enumerate(prefix_h):
+        for i, layer_h in enumerate(prefix_h):
+            h = layer_h["hidden_states"]
+            if "scaler" in layer_h:
+                h = h * layer_h["scaler"][:, None, None]
             layer = self.model.layers[i]
-            h = layer.input_layernor(h)
+            h = layer.input_layernorm(h)
+            batch_size, seq_len, _ = h.shape
             kv_cache.append({
-                "key": layer.self_attn.key_proj(h),
-                "value": layer.self_attn.key_proj(h),
+                "key": layer.self_attn.k_proj(h).view(
+                    batch_size, seq_len, self.config.n_heads, self.config.head_dim).transpose(1, 2),
+                "value": layer.self_attn.v_proj(h).view(
+                    batch_size, seq_len, self.config.n_heads, self.config.head_dim).transpose(1, 2),
             })
         return kv_cache
 
@@ -90,6 +96,8 @@ class LLaMAModel(nn.Module):
         input_ids,
         attention_mask=None,
         peft_params: Optional[dict] = None,
+        return_hidden_states: Optional[list] = None,
+        return_logits: bool = True,
     ):
         """Forward pass (with full decode sequence, intended for training or loss-scoring)
 
@@ -97,6 +105,8 @@ class LLaMAModel(nn.Module):
             - Always right-padded. Masks are generated based on padding tokens
         :param attention_mask
         :param peft_params
+        :param return_hidden_states
+        :param return_logits
         :return: logits [batch_size, seq_len]
         """
         if dict_get(peft_params, "prefix"):
@@ -113,10 +123,11 @@ class LLaMAModel(nn.Module):
                 kv_cache=peft_params["prefix"],
                 attention_mask=attention_mask,
                 peft_params=peft_params,
+                return_hidden_states=return_hidden_states,
             )
         elif dict_get(peft_params, "prefix_h"):
             # [batch_size, num_heads=1, q_len=seq_len, kv_len=seq_len]
-            prefix_length = peft_params["prefix_h"][0]["key"].shape[1]
+            prefix_length = peft_params["prefix_h"][0]["hidden_states"].shape[1]
             kv_cache = self.init_kv_cache_from_prefix(peft_params["prefix_h"])
             rope_embed_ids = create_rope_embed_ids(input_ids=input_ids) + prefix_length
             cos, sin = self.get_cos_sin(rope_embed_ids)
@@ -129,6 +140,7 @@ class LLaMAModel(nn.Module):
                 kv_cache=kv_cache,
                 attention_mask=attention_mask,
                 peft_params=peft_params,
+                return_hidden_states=return_hidden_states,
             )
         else:
             rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
@@ -139,10 +151,12 @@ class LLaMAModel(nn.Module):
                 use_kv_cache=False,
                 attention_mask=attention_mask,
                 peft_params=peft_params,
+                return_hidden_states=return_hidden_states,
             )
         # [batch_size, seq_len, vocab_size]
-        logits = self.lm_head(model_out["hidden_states"])
-        return logits
+        if return_logits:
+            model_out["logits"] = self.lm_head(model_out["hidden_states"])
+        return model_out
 
     def init_kv_cache(self, batch_size):
         # noinspection GrazieInspection
@@ -304,6 +318,7 @@ class LLaMAInnerModel(nn.Module):
         num_valid_tokens=None,
         attention_mask=None,
         peft_params: Optional[dict] = None,
+        return_hidden_states: Optional[list] = None,
     ):
         """
         :param input_ids: [batch_size, seq_len]
@@ -320,6 +335,7 @@ class LLaMAInnerModel(nn.Module):
             Only used for decoding
         :param attention_mask: [batch_size, num_heads, q_len, kv_len]
         :param peft_params
+        :param return_hidden_states
         """
         if dict_get(peft_params, "embeds") is not None:
             hidden_states = dict_get(peft_params, "embeds")
@@ -328,8 +344,16 @@ class LLaMAInnerModel(nn.Module):
 
         hidden_states = hidden_states.to(self.config.dtype)
 
+        if return_hidden_states:
+            max_layer = max(return_hidden_states)
+        else:
+            max_layer = self.config.n_layers
+
         new_kv_cache = []
+        hidden_states_dict = {}
         for layer_i, layer in enumerate(self.layers):
+            if layer_i > max_layer:
+                break
             if kv_cache:
                 # dict(
                 #   key = [batch_size, num_heads, kv_seq_len=decode_step+1, head_dim]
@@ -363,11 +387,14 @@ class LLaMAInnerModel(nn.Module):
                 )
 
             hidden_states = layer_out["hidden_states"]
+            if return_hidden_states and layer_i in return_hidden_states:
+                hidden_states_dict[layer_i] = hidden_states
             if kv_cache:
                 new_kv_cache.append(layer_out["kv_cache"])
         hidden_states = self.norm(hidden_states)
         output = {
-            "hidden_states": hidden_states
+            "hidden_states": hidden_states,
+            "layer_hidden_states": hidden_states_dict,
         }
         if kv_cache:
             output["kv_cache"] = new_kv_cache
